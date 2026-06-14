@@ -76,6 +76,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--crypto-jumps", action="store_true",
                    help="Use the crypto Merton jump preset (more, larger jumps).")
 
+    # Heston / GARCH / Kou parameters.
+    p.add_argument("--heston-kappa", type=float, default=1.5)
+    p.add_argument("--heston-theta", type=float, default=None)
+    p.add_argument("--heston-xi", type=float, default=0.3)
+    p.add_argument("--heston-rho", type=float, default=-0.7)
+    p.add_argument("--heston-v0", type=float, default=None)
+    p.add_argument("--garch-omega", type=float, default=None)
+    p.add_argument("--garch-alpha", type=float, default=0.08)
+    p.add_argument("--garch-beta", type=float, default=0.90)
+    p.add_argument("--kou-intensity", type=float, default=1.0)
+    p.add_argument("--kou-p-up", type=float, default=0.4)
+    p.add_argument("--kou-eta-up", type=float, default=25.0)
+    p.add_argument("--kou-eta-down", type=float, default=15.0)
+
+    # Variance reduction & risk.
+    p.add_argument("--variance-reduction", default=mc_core.VR_NONE,
+                   choices=list(mc_core.VARIANCE_REDUCTION_METHODS),
+                   help="Variance reduction method (default: none).")
+    p.add_argument("--ruin-threshold", type=float, default=0.50,
+                   help="Ruin if price ever falls below this * S0 (default: 0.5).")
+    p.add_argument("--evt", action="store_true",
+                   help="Include EVT tail-risk analysis in exports.")
+
     # ---- Stress overlay -----------------------------------------------
     p.add_argument("--stress", action="store_true",
                    help="Enable the deterministic stress overlay.")
@@ -251,6 +274,20 @@ def run(argv: Optional[list] = None) -> int:
         jump_mean=jump_mean,
         jump_vol=jump_vol,
         regime_preset=args.regime_preset,
+        heston_kappa=args.heston_kappa,
+        heston_theta=args.heston_theta,
+        heston_xi=args.heston_xi,
+        heston_rho=args.heston_rho,
+        heston_v0=args.heston_v0,
+        garch_omega=args.garch_omega,
+        garch_alpha=args.garch_alpha,
+        garch_beta=args.garch_beta,
+        kou_intensity=args.kou_intensity,
+        kou_p_up=args.kou_p_up,
+        kou_eta_up=args.kou_eta_up,
+        kou_eta_down=args.kou_eta_down,
+        variance_reduction=args.variance_reduction,
+        ruin_threshold=args.ruin_threshold,
         stress_enabled=args.stress,
         stress_crash_pct=args.stress_crash,
         stress_vol_multiplier=args.stress_vol_mult,
@@ -261,11 +298,25 @@ def run(argv: Optional[list] = None) -> int:
     _print_summary(result, market)
     _print_model_block(result)
 
+    evt = mc_core.evt_from_result(result) if args.evt else None
+    if evt is not None:
+        print(" EVT tail risk (loss vs S0)")
+        if evt.get("error"):
+            print(f"   {evt['error']}")
+        else:
+            for key in ("95", "99", "99.5", "99.9"):
+                if key in evt["var"]:
+                    print(f"   EVT VaR {key:>5}% : {evt['var'][key]:.4f}  "
+                          f"ES {evt['es'][key]:.4f}")
+            if evt.get("warning"):
+                print(f"   {evt['warning']}")
+        print("=" * 64)
+
     if args.export_csv:
         mc_core.write_csv(result, args.export_csv)
         print(f"[csv exported] {args.export_csv}")
     if args.export_json:
-        mc_core.write_json(result, args.export_json, market)
+        mc_core.write_json(result, args.export_json, market, evt=evt)
         print(f"[json exported] {args.export_json}")
 
     _maybe_chart(result, args)
