@@ -112,6 +112,40 @@ chunk size, seed, and transaction cost. Results include headline metrics, a
 VaR/Expected Shortfall table, a percentile table, sample-path and ending-value
 charts, a convergence chart, runtime/memory status, and CSV/JSON download buttons.
 
+## Simulation models
+
+Beyond the GBM baseline, the engine (`mc_core.py`) supports several more
+realistic models, all sharing the same chunk-safe execution:
+
+| Model | Description | Key inputs |
+| --- | --- | --- |
+| **GBM Normal** | Classic geometric Brownian motion (normal shocks). | — |
+| **Student-t GBM** | GBM with fat-tailed Student-t shocks (variance-normalized). | degrees of freedom |
+| **Historical Bootstrap** | Samples empirical daily returns with replacement. | history |
+| **Block Bootstrap** | Samples consecutive blocks to keep volatility clustering. | block length (default 20) |
+| **Merton Jump-Diffusion** | GBM plus Poisson jumps (crypto preset is jump-heavy). | intensity, jump mean/vol |
+| **Regime Switching** | Normal / high-vol / crash regimes via a transition matrix. | stock or crypto preset |
+
+**Conservative drift mode**: choose Historical, Half historical, Zero, or Manual
+drift. **Stress overlay** (optional, works on top of any model): a one-day crash
+%, a volatility multiplier, and a drift haircut.
+
+Extra output metrics include P(ending > +20%), P(ending < -10%),
+P(ending < -20%), probability of a 50% drawdown, and the worst-1% average ending
+value. CSV/JSON exports carry the model type, all model parameters, drift mode,
+stress settings, probability buckets, and memory/chunk-safety info.
+
+Examples:
+
+```powershell
+# Student-t fat tails, conservative (zero) drift
+python monte_carlo_gbm.py AAPL --model "Student-t GBM" --t-df 4 --drift-mode "Zero drift" --no-chart
+
+# Crypto-style jump diffusion with a stress overlay
+python monte_carlo_gbm.py BTC-USD --model "Merton Jump-Diffusion" --crypto-jumps `
+  --stress --stress-crash 0.2 --stress-vol-mult 1.5 --no-chart
+```
+
 ## Memory safety notes
 
 - Default **Serious-mode chunk size is 25,000–50,000 paths**, which bounds peak
