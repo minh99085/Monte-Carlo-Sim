@@ -52,6 +52,40 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Proportional transaction cost / slippage (e.g. 0.001).")
     p.add_argument("--sample-paths", type=int, default=50,
                    help="Number of full sample trajectories retained (default: 50).")
+
+    # ---- Model selection & realism ------------------------------------
+    p.add_argument("--model", default=mc_core.MODEL_GBM, choices=list(mc_core.MODELS),
+                   help="Simulation model (default: 'GBM Normal').")
+    p.add_argument("--drift-mode", default=mc_core.DRIFT_HISTORICAL,
+                   choices=list(mc_core.DRIFT_MODES),
+                   help="Conservative drift mode (default: historical drift).")
+    p.add_argument("--manual-drift", type=float, default=None,
+                   help="Manual annualized drift (used with --drift-mode 'Manual drift').")
+    p.add_argument("--t-df", type=float, default=5.0,
+                   help="Student-t degrees of freedom (default: 5).")
+    p.add_argument("--block-length", type=int, default=20,
+                   help="Block bootstrap block length in days (default: 20).")
+    p.add_argument("--jump-intensity", type=float, default=1.0,
+                   help="Merton jumps per year (default: 1).")
+    p.add_argument("--jump-mean", type=float, default=-0.02,
+                   help="Merton jump mean in log space (default: -0.02).")
+    p.add_argument("--jump-vol", type=float, default=0.05,
+                   help="Merton jump volatility in log space (default: 0.05).")
+    p.add_argument("--regime-preset", default="stock", choices=list(mc_core.REGIME_PRESETS),
+                   help="Regime-switching preset (default: stock).")
+    p.add_argument("--crypto-jumps", action="store_true",
+                   help="Use the crypto Merton jump preset (more, larger jumps).")
+
+    # ---- Stress overlay -----------------------------------------------
+    p.add_argument("--stress", action="store_true",
+                   help="Enable the deterministic stress overlay.")
+    p.add_argument("--stress-crash", type=float, default=0.0,
+                   help="One-day crash fraction applied on day 1 (e.g. 0.2).")
+    p.add_argument("--stress-vol-mult", type=float, default=1.0,
+                   help="Volatility multiplier under stress (default: 1).")
+    p.add_argument("--stress-drift-haircut", type=float, default=0.0,
+                   help="Fraction of drift removed under stress [0, 1].")
+
     p.add_argument("--export-csv", default=None,
                    help="Write a CSV summary to this path.")
     p.add_argument("--export-json", default=None,
@@ -104,6 +138,12 @@ def _print_summary(result: mc_core.SimulationResult, market: mc_core.MarketParam
     print(f" Min / Max             : {money(s['min_value'])} / {money(s['max_value'])}")
     print(f" Probability of profit : {s['prob_profit']:.2%}")
     print(f" Probability of loss   : {s['prob_loss']:.2%}")
+    print(f" P(ending > +20%)      : {s['prob_gain_20']:.2%}")
+    print(f" P(ending < -10%)      : {s['prob_loss_10']:.2%}")
+    print(f" P(ending < -20%)      : {s['prob_loss_20']:.2%}")
+    print(f" P({int(s['drawdown_threshold']*100)}% drawdown)       : "
+          f"{s.get('prob_drawdown', float('nan')):.2%}")
+    print(f" Worst 1% avg value    : {money(s['worst_1pct_avg_value'])}")
     print("-" * 64)
     print(" Value at Risk (loss vs S0)")
     for level in mc_core.RISK_LEVELS:
@@ -123,6 +163,21 @@ def _print_summary(result: mc_core.SimulationResult, market: mc_core.MarketParam
     print(f" Runtime           : {result.runtime_seconds:.3f} s "
           f"({s.get('paths_per_second', 0):,.0f} paths/s)")
     print(f" Memory safety     : {result.memory.status()}")
+    print("=" * 64)
+
+
+def _print_model_block(result: mc_core.SimulationResult) -> None:
+    a = mc_core.model_assumptions(result.config)
+    print(" Model & assumptions")
+    print(f"   Model            : {a['model']}")
+    print(f"   Drift mode       : {a['drift_mode']}")
+    print(f"   Volatility source: {a['volatility_source']}")
+    print(f"   Effective mu/sig : {a['effective_mu_annual']:.4%} / "
+          f"{a['effective_sigma_annual']:.4%}")
+    if a["stress"]["enabled"]:
+        st = a["stress"]
+        print(f"   Stress           : crash={st['one_day_crash_pct']:.1%}, "
+              f"vol x{st['vol_multiplier']:g}, drift haircut={st['drift_haircut']:.0%}")
     print("=" * 64)
 
 
@@ -168,6 +223,13 @@ def run(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
     market = _resolve_market(args)
 
+    jump_intensity = args.jump_intensity
+    jump_mean = args.jump_mean
+    jump_vol = args.jump_vol
+    if args.crypto_jumps:
+        preset = mc_core.JUMP_PRESETS["crypto"]
+        jump_intensity, jump_mean, jump_vol = preset["intensity"], preset["mean"], preset["vol"]
+
     config = mc_core.SimulationConfig(
         ticker=args.ticker,
         s0=market.s0,
@@ -179,10 +241,25 @@ def run(argv: Optional[list] = None) -> int:
         seed=args.seed,
         cost=args.cost,
         sample_paths=args.sample_paths,
+        model=args.model,
+        drift_mode=args.drift_mode,
+        manual_drift=args.manual_drift,
+        t_df=args.t_df,
+        historical_returns=market.daily_log_returns,
+        block_length=args.block_length,
+        jump_intensity=jump_intensity,
+        jump_mean=jump_mean,
+        jump_vol=jump_vol,
+        regime_preset=args.regime_preset,
+        stress_enabled=args.stress,
+        stress_crash_pct=args.stress_crash,
+        stress_vol_multiplier=args.stress_vol_mult,
+        stress_drift_haircut=args.stress_drift_haircut,
     )
 
     result = mc_core.simulate(config)
     _print_summary(result, market)
+    _print_model_block(result)
 
     if args.export_csv:
         mc_core.write_csv(result, args.export_csv)
