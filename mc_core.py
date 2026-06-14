@@ -39,16 +39,15 @@ import numpy as np
 
 TRADING_DAYS_PER_YEAR = 252
 
-# Path-mode presets exposed by the GUI/CLI.  ``None`` means "user supplied"
-# (``Custom`` picks 1,000-1,000,000; ``Tail-risk (advanced)`` picks
-# 2,000,000-5,000,000).
-PATH_MODES: Dict[str, Optional[int]] = {
-    "Preview": 10_000,
-    "Standard": 100_000,
-    "Serious": 1_000_000,
-    "Custom": None,
-    "Tail-risk (advanced)": None,
-}
+# ---------------------------------------------------------------------------
+# Path-mode constants -- the single source of truth shared by the CLI and GUI.
+# app.py must only reference constants defined here.
+# ---------------------------------------------------------------------------
+
+# Preset path counts.
+PREVIEW_PATHS = 10_000
+STANDARD_PATHS = 100_000
+SERIOUS_PATHS = 1_000_000
 
 # Custom mode bounds (inclusive): any safe path count up to the serious preset.
 CUSTOM_MIN_PATHS = 1_000
@@ -60,7 +59,20 @@ TAIL_RISK_MAX_PATHS = 5_000_000
 
 # Default chunk size for the heavy "Serious" mode.  Keeping this in the
 # 25,000-50,000 range bounds peak memory regardless of total path count.
-DEFAULT_SERIOUS_CHUNK = 50_000
+DEFAULT_SERIOUS_CHUNK_SIZE = 50_000
+# Backwards-compatible alias (older callers used this name).
+DEFAULT_SERIOUS_CHUNK = DEFAULT_SERIOUS_CHUNK_SIZE
+
+# Path-mode presets exposed by the GUI/CLI.  ``None`` means "user supplied"
+# (``Custom`` picks 1,000-1,000,000; ``Tail-risk (advanced)`` picks
+# 2,000,000-5,000,000).  Built from the constants above so the two never drift.
+PATH_MODES: Dict[str, Optional[int]] = {
+    "Preview": PREVIEW_PATHS,
+    "Standard": STANDARD_PATHS,
+    "Serious": SERIOUS_PATHS,
+    "Custom": None,
+    "Tail-risk (advanced)": None,
+}
 
 # Confidence levels (percent) used for VaR / Expected Shortfall.
 RISK_LEVELS = (95.0, 99.0, 99.9)

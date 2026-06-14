@@ -190,7 +190,7 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
             "Horizon (trading-day steps)", min_value=1, max_value=2520,
             value=252, step=1,
         )
-        default_chunk = min(mc_core.DEFAULT_SERIOUS_CHUNK, int(paths))
+        default_chunk = min(mc_core.DEFAULT_SERIOUS_CHUNK_SIZE, int(paths))
         chunk_size = st.number_input(
             "Chunk size (paths per chunk)",
             min_value=1_000, max_value=200_000, value=default_chunk, step=5_000,
