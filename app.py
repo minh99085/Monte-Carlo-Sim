@@ -305,53 +305,69 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
     st.info(preview_mem.status())
 
     # ------------------------------------------------------------------
-    # Run only when the button is clicked; persist the result in
-    # session_state so later reruns (e.g. clicking a download button) keep
-    # showing the results instead of resetting to the initial screen.
+    # Two modes: single-model analysis and side-by-side model comparison.
     # ------------------------------------------------------------------
-    if run_clicked:
-        with st.spinner(f"Fetching parameters for {ticker}..."):
-            market = mc_core.estimate_parameters_from_history(
-                ticker, years=years,
-                s0_override=(s0_override if s0_override > 0 else None),
-            )
-        mu = float(mu_override) if mu_override.strip() else market.mu
-        sigma = float(sigma_override) if sigma_override.strip() else market.sigma
+    shared = dict(
+        ticker=ticker, years=years, s0_override=s0_override,
+        paths=int(paths), horizon=int(horizon), chunk_size=int(chunk_size),
+        seed=seed, cost=cost, drift_mode=drift_mode, manual_drift=manual_drift,
+        mu_override=mu_override, sigma_override=sigma_override,
+        stress_enabled=stress_enabled, stress_crash=stress_crash,
+        stress_vol_mult=stress_vol_mult, stress_haircut=stress_haircut,
+    )
 
-        try:
-            config = build_config_from_inputs(
-                ticker=ticker, s0=market.s0, paths=int(paths), horizon=int(horizon),
-                mu=mu, sigma=sigma, chunk_size=int(chunk_size), seed=seed, cost=cost,
-                drift_mode=drift_mode, manual_drift=manual_drift,
-                historical_returns=market.daily_log_returns,
-                stress_enabled=stress_enabled,
-                stress_crash_pct=stress_crash,
-                stress_vol_multiplier=stress_vol_mult,
-                stress_drift_haircut=stress_haircut,
-                **model_inputs,
-            )
-        except ValueError as exc:
-            st.error(f"Invalid configuration: {exc}")
-            st.stop()
+    tab_single, tab_compare = st.tabs(["Single model", "Model comparison"])
 
-        with st.spinner(f"Running {config.model} on {paths:,} paths "
-                        f"in chunks of {chunk_size:,}..."):
-            result = mc_core.simulate(config)
+    with tab_single:
+        # Run only when the button is clicked; persist the result in
+        # session_state so later reruns (e.g. clicking a download button) keep
+        # showing the results instead of resetting to the initial screen.
+        if run_clicked:
+            with st.spinner(f"Fetching parameters for {ticker}..."):
+                market = mc_core.estimate_parameters_from_history(
+                    ticker, years=years,
+                    s0_override=(s0_override if s0_override > 0 else None),
+                )
+            mu = float(mu_override) if mu_override.strip() else market.mu
+            sigma = float(sigma_override) if sigma_override.strip() else market.sigma
+            try:
+                config = build_config_from_inputs(
+                    ticker=ticker, s0=market.s0, paths=int(paths), horizon=int(horizon),
+                    mu=mu, sigma=sigma, chunk_size=int(chunk_size), seed=seed, cost=cost,
+                    drift_mode=drift_mode, manual_drift=manual_drift,
+                    historical_returns=market.daily_log_returns,
+                    stress_enabled=stress_enabled,
+                    stress_crash_pct=stress_crash,
+                    stress_vol_multiplier=stress_vol_mult,
+                    stress_drift_haircut=stress_haircut,
+                    **model_inputs,
+                )
+            except ValueError as exc:
+                st.error(f"Invalid configuration: {exc}")
+                st.stop()
+            with st.spinner(f"Running {config.model} on {paths:,} paths "
+                            f"in chunks of {chunk_size:,}..."):
+                result = mc_core.simulate(config)
+            st.session_state["mc_result"] = result
+            st.session_state["mc_market"] = market
 
-        st.session_state["mc_result"] = result
-        st.session_state["mc_market"] = market
+        result = st.session_state.get("mc_result")
+        market = st.session_state.get("mc_market")
+        if result is None:
+            st.write("Configure inputs in the sidebar and click **Run simulation**.")
+        else:
+            _render_single_model(st, pd, plt, result, market)
 
-    # Render from the stored result so downloads/reruns never lose it.
-    result = st.session_state.get("mc_result")
-    market = st.session_state.get("mc_market")
-    if result is None:
-        st.write("Configure inputs in the sidebar and click **Run simulation**.")
-        return
+    with tab_compare:
+        _render_comparison(st, pd, shared)
 
+
+def _render_single_model(st, pd, plt, result, market) -> None:
+    """Render the full single-model output panel from a stored result."""
     config = result.config
     s = result.stats
+    ticker = config.ticker
     paths = config.paths
-    chunk_size = config.chunk_size
 
     # ---------------------- Data source notice ----------------------
     if market is not None:
@@ -471,6 +487,119 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
     e2.download_button(
         "Download JSON report", data=json_text,
         file_name=f"{ticker}_mc_report.json", mime="application/json",
+    )
+
+
+COMPARISON_DISPLAY_NAMES = {
+    "model": "Model",
+    "expected_ending_value": "Expected",
+    "median_ending_value": "Median",
+    "prob_profit": "P(profit)",
+    "prob_loss": "P(loss)",
+    "prob_gain_20": "P(gain>20%)",
+    "prob_loss_10": "P(loss>10%)",
+    "prob_loss_20": "P(loss>20%)",
+    "prob_drawdown_50": "P(50% DD)",
+    "percentile_5": "P5",
+    "percentile_95": "P95",
+    "var_99": "VaR 99%",
+    "es_99": "ES 99%",
+    "runtime_seconds": "Runtime (s)",
+    "chunk_safe": "Chunk-safe",
+}
+
+
+def _render_comparison(st, pd, shared: dict) -> None:
+    """Render the Model Comparison tab: pick models, run, compare, export."""
+    st.subheader("Model comparison")
+    st.caption(
+        "Run several models on identical ticker/paths/horizon/chunk/seed/drift "
+        "settings and compare their risk profiles side-by-side. Each model uses "
+        "the same chunk-safe engine (no full path x step matrix)."
+    )
+
+    selected = st.multiselect(
+        "Models to compare", list(mc_core.MODELS), default=list(mc_core.MODELS),
+        help="All six models are selected by default.",
+    )
+    run_compare = st.button("Run comparison", type="primary", key="run_comparison")
+
+    if run_compare:
+        if not selected:
+            st.error("Select at least one model to compare.")
+            st.stop()
+        with st.spinner(f"Fetching parameters for {shared['ticker']}..."):
+            market = mc_core.estimate_parameters_from_history(
+                shared["ticker"], years=shared["years"],
+                s0_override=(shared["s0_override"] if shared["s0_override"] > 0 else None),
+            )
+        mu = float(shared["mu_override"]) if shared["mu_override"].strip() else market.mu
+        sigma = float(shared["sigma_override"]) if shared["sigma_override"].strip() else market.sigma
+        try:
+            base_config = build_config_from_inputs(
+                ticker=shared["ticker"], s0=market.s0, paths=shared["paths"],
+                horizon=shared["horizon"], mu=mu, sigma=sigma,
+                chunk_size=shared["chunk_size"], seed=shared["seed"], cost=shared["cost"],
+                drift_mode=shared["drift_mode"], manual_drift=shared["manual_drift"],
+                historical_returns=market.daily_log_returns,
+                stress_enabled=shared["stress_enabled"],
+                stress_crash_pct=shared["stress_crash"],
+                stress_vol_multiplier=shared["stress_vol_mult"],
+                stress_drift_haircut=shared["stress_haircut"],
+                model=mc_core.MODEL_GBM,
+            )
+        except ValueError as exc:
+            st.error(f"Invalid configuration: {exc}")
+            st.stop()
+        with st.spinner(
+            f"Comparing {len(selected)} models on {shared['paths']:,} paths each..."
+        ):
+            report = mc_core.compare_models(base_config, models=selected, market=market)
+        st.session_state["mc_comparison"] = report
+        st.session_state["mc_comp_market"] = market
+
+    report = st.session_state.get("mc_comparison")
+    if report is None:
+        st.write("Pick models and click **Run comparison**.")
+        return
+
+    cfg = report.base_config
+    market = st.session_state.get("mc_comp_market")
+    if market is not None and market.source == "fallback":
+        st.warning(f"Market data unavailable; using fallback parameters. {market.note}")
+    st.caption(
+        f"Ticker {cfg.ticker} | {cfg.paths:,} paths | horizon {cfg.horizon} | "
+        f"chunk {cfg.chunk_size:,} | seed {cfg.seed} | drift {cfg.drift_mode}"
+    )
+
+    # Comparison table.
+    df = pd.DataFrame(report.rows).rename(columns=COMPARISON_DISPLAY_NAMES)
+    st.dataframe(df, hide_index=True, use_container_width=True)
+
+    # Most-conservative headline.
+    if report.most_conservative:
+        st.success(
+            f"Most conservative model: **{report.most_conservative}** "
+            "(highest probability of a >20% loss and highest 99% Expected Shortfall)."
+        )
+
+    if report.all_chunk_safe:
+        st.info("All compared models ran chunk-safe (no full path x step matrix).")
+    else:
+        st.error("One or more models were NOT chunk-safe.")
+
+    # Exports.
+    st.subheader("Export comparison")
+    csv_text = mc_core.comparison_to_csv(report)
+    json_text = mc_core.comparison_to_json(report)
+    e1, e2 = st.columns(2)
+    e1.download_button(
+        "Download CSV comparison", data=csv_text,
+        file_name=f"{cfg.ticker}_model_comparison.csv", mime="text/csv",
+    )
+    e2.download_button(
+        "Download JSON comparison", data=json_text,
+        file_name=f"{cfg.ticker}_model_comparison.json", mime="application/json",
     )
 
 
