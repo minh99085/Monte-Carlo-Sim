@@ -52,6 +52,31 @@ def test_path_mode_presets():
     assert mc_core.resolve_path_mode("Serious") == 1_000_000
 
 
+def test_custom_mode_bounds():
+    # Custom mode lets the user type any safe count from 1,000 to 1,000,000.
+    assert mc_core.resolve_path_mode("Custom", 250_000) == 250_000
+    assert mc_core.resolve_path_mode("Custom", mc_core.CUSTOM_MIN_PATHS) == 1_000
+    assert mc_core.resolve_path_mode("Custom", mc_core.CUSTOM_MAX_PATHS) == 1_000_000
+    with pytest.raises(ValueError):
+        mc_core.resolve_path_mode("Custom", 500)
+    with pytest.raises(ValueError):
+        mc_core.resolve_path_mode("Custom", 2_000_000)
+    with pytest.raises(ValueError):
+        mc_core.resolve_path_mode("Custom", None)
+
+
+def test_custom_mode_250k_simulation_is_chunk_safe():
+    paths = mc_core.resolve_path_mode("Custom", 250_000)
+    cfg = mc_core.SimulationConfig(
+        ticker="CUSTOM", s0=100.0, paths=paths, horizon=10,
+        mu=0.05, sigma=0.2, chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK, seed=4,
+    )
+    result = mc_core.simulate(cfg)
+    assert result.final_values.shape == (250_000,)
+    assert result.memory.is_chunk_safe
+    assert result.memory.peak_vector_elements <= cfg.chunk_size
+
+
 def test_tail_risk_mode_bounds():
     assert mc_core.resolve_path_mode("Tail-risk (advanced)", 2_000_000) == 2_000_000
     assert mc_core.resolve_path_mode("Tail-risk (advanced)", 5_000_000) == 5_000_000
@@ -119,6 +144,25 @@ def test_serious_1m_is_chunk_safe():
     assert mem.peak_matrix_elements == 50 * (10 + 1)
     assert mem.peak_matrix_elements < full
     # Working buffers are bounded by the chunk size, not the path count.
+    assert mem.peak_vector_elements <= cfg.chunk_size
+    assert mem.peak_vector_elements < cfg.paths
+    assert mem.is_chunk_safe
+
+
+def test_tail_risk_2m_allows_paths_but_still_chunks():
+    """Tail-risk mode allows 2,000,000 paths and stays chunk-safe."""
+    paths = mc_core.resolve_path_mode("Tail-risk (advanced)", 2_000_000)
+    assert paths == 2_000_000
+    cfg = mc_core.SimulationConfig(
+        ticker="TAIL", s0=100.0, paths=paths, horizon=5,
+        mu=0.05, sigma=0.2, chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK, seed=5,
+        sample_paths=50,
+    )
+    result = mc_core.simulate(cfg)
+    mem = result.memory
+    assert result.final_values.shape == (2_000_000,)
+    # Full matrix would be 2,000,000 * (5 + 1) elements; we must never build it.
+    assert mem.peak_matrix_elements < mem.full_matrix_elements
     assert mem.peak_vector_elements <= cfg.chunk_size
     assert mem.peak_vector_elements < cfg.paths
     assert mem.is_chunk_safe
@@ -293,6 +337,18 @@ def test_build_config_from_inputs():
     assert cfg.paths == 10_000
     result = mc_core.simulate(cfg)
     assert result.final_values.shape == (10_000,)
+
+
+def test_build_config_accepts_explicit_paths():
+    import app
+
+    # An explicitly edited "Number of paths" value flows straight through.
+    for explicit in (1_000, 250_000, 1_000_000):
+        cfg = app.build_config_from_inputs(
+            ticker="TST", s0=100.0, paths=explicit, horizon=10, mu=0.05,
+            sigma=0.2, chunk_size=50_000, seed=1, cost=0.0,
+        )
+        assert cfg.paths == explicit
 
 
 # ---------------------------------------------------------------------------
