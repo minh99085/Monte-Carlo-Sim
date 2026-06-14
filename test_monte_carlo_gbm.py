@@ -686,6 +686,144 @@ def test_exports_include_model_metadata():
 
 
 # ---------------------------------------------------------------------------
+# Model comparison dashboard / batch export
+# ---------------------------------------------------------------------------
+
+
+def _comparison_base_config(**overrides):
+    base = dict(
+        ticker="AAPL", s0=100.0, paths=3_000, horizon=20, mu=0.10, sigma=0.30,
+        chunk_size=1_000, seed=7, historical_returns=_hist_returns(),
+    )
+    base.update(overrides)
+    return mc_core.SimulationConfig(**base)
+
+
+def test_compare_models_runs_all_six():
+    report = mc_core.compare_models(_comparison_base_config())
+    assert report.models == list(mc_core.MODELS)
+    assert len(report.rows) == len(mc_core.MODELS)
+    # Every row exposes the same comparable columns.
+    for row in report.rows:
+        assert set(row.keys()) == set(mc_core.COMPARISON_COLUMNS)
+        assert row["model"] in mc_core.MODELS
+        assert np.isfinite(row["expected_ending_value"])
+        assert 0.0 <= row["prob_loss_20"] <= 1.0
+
+
+def test_compare_models_subset_and_order_preserved():
+    models = [mc_core.MODEL_GBM, mc_core.MODEL_REGIME, mc_core.MODEL_MERTON]
+    report = mc_core.compare_models(_comparison_base_config(), models=models)
+    assert report.models == models
+
+
+def test_compare_models_is_chunk_safe():
+    report = mc_core.compare_models(_comparison_base_config(chunk_size=500))
+    assert report.all_chunk_safe
+    for model, info in report.per_model.items():
+        assert info["memory"]["is_chunk_safe"] is True
+        assert info["memory"]["peak_matrix_elements"] < info["memory"]["full_matrix_elements"]
+
+
+def test_compare_models_million_paths_chunk_safe_without_running():
+    """A 1,000,000-path comparison config stays chunk-safe per model (no run)."""
+    for model in mc_core.MODELS:
+        cfg = mc_core.SimulationConfig(
+            ticker="AAPL", s0=100.0, paths=1_000_000, horizon=252,
+            chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK_SIZE, model=model,
+            historical_returns=_hist_returns(), sample_paths=100,
+        )
+        mem = mc_core.predict_memory(cfg)
+        assert mem.is_chunk_safe
+        assert mem.peak_matrix_elements < mem.full_matrix_elements
+
+
+def _rows_without_runtime(rows):
+    return [{k: v for k, v in row.items() if k != "runtime_seconds"} for row in rows]
+
+
+def test_compare_models_reproducible_with_seed():
+    cfg = _comparison_base_config(seed=2025)
+    r1 = mc_core.compare_models(cfg)
+    r2 = mc_core.compare_models(cfg)
+    # Everything except the measured wall-clock runtime must be identical.
+    assert _rows_without_runtime(r1.rows) == _rows_without_runtime(r2.rows)
+    assert r1.most_conservative == r2.most_conservative
+
+
+def test_compare_models_does_not_mutate_caller_config():
+    cfg = _comparison_base_config(model=mc_core.MODEL_GBM)
+    mc_core.compare_models(cfg, models=[mc_core.MODEL_REGIME, mc_core.MODEL_MERTON])
+    assert cfg.model == mc_core.MODEL_GBM
+
+
+def test_most_conservative_model_selection():
+    # Highest P(loss>20%) wins; ES_99 breaks ties.
+    rows = [
+        {"model": "A", "prob_loss_20": 0.10, "es_99": 30.0},
+        {"model": "B", "prob_loss_20": 0.25, "es_99": 40.0},
+        {"model": "C", "prob_loss_20": 0.25, "es_99": 55.0},
+    ]
+    assert mc_core.most_conservative_model(rows) == "C"
+    assert mc_core.most_conservative_model([]) is None
+
+
+def test_comparison_csv_export_includes_metadata():
+    report = mc_core.compare_models(_comparison_base_config())
+    csv_text = mc_core.comparison_to_csv(report)
+    # Header carries every comparison column.
+    for col in mc_core.COMPARISON_COLUMNS:
+        assert col in csv_text
+    # Each model appears as a row, plus shared context + headline.
+    for model in mc_core.MODELS:
+        assert model in csv_text
+    assert "most_conservative_model" in csv_text
+    assert "all_chunk_safe" in csv_text
+    assert "drift_mode" in csv_text
+
+
+def test_comparison_json_export_includes_per_model_metadata():
+    report = mc_core.compare_models(_comparison_base_config())
+    data = json.loads(mc_core.comparison_to_json(report))
+    assert set(data.keys()) == {"comparison", "table", "per_model"}
+    assert data["comparison"]["ticker"] == "AAPL"
+    assert data["comparison"]["models"] == list(mc_core.MODELS)
+    assert data["comparison"]["most_conservative_model"] in mc_core.MODELS
+    assert data["comparison"]["all_chunk_safe"] is True
+    assert len(data["table"]) == len(mc_core.MODELS)
+    # Per-model metadata must carry the real model assumptions + memory info.
+    for model in mc_core.MODELS:
+        assert model in data["per_model"]
+        meta = data["per_model"][model]
+        assert meta["assumptions"]["model"] == model
+        assert "drift_mode" in meta["assumptions"]
+        assert meta["memory"]["is_chunk_safe"] is True
+        assert "prob_gain_20" in meta["statistics"]
+
+
+def test_comparison_export_files(tmp_path):
+    report = mc_core.compare_models(_comparison_base_config())
+    csv_path = tmp_path / "cmp.csv"
+    json_path = tmp_path / "cmp.json"
+    mc_core.write_comparison_csv(report, str(csv_path))
+    mc_core.write_comparison_json(report, str(json_path))
+    assert csv_path.stat().st_size > 0
+    parsed = json.loads(json_path.read_text())
+    assert parsed["comparison"]["paths"] == 3_000
+
+
+def test_app_exposes_comparison_helpers():
+    import inspect
+    import app
+
+    assert callable(app._render_comparison)
+    src = inspect.getsource(app.main)
+    # The GUI wires a real comparison tab.
+    assert "Model comparison" in src
+    assert "_render_comparison" in src
+
+
+# ---------------------------------------------------------------------------
 # Parameter estimation (annualized mu / sigma)
 # ---------------------------------------------------------------------------
 
