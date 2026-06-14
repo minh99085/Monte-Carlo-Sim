@@ -96,6 +96,9 @@ MODEL_HIST_BOOTSTRAP = "Historical Bootstrap"
 MODEL_BLOCK_BOOTSTRAP = "Block Bootstrap"
 MODEL_MERTON = "Merton Jump-Diffusion"
 MODEL_REGIME = "Regime Switching"
+MODEL_HESTON = "Heston Stochastic Volatility"
+MODEL_GARCH = "GARCH(1,1)"
+MODEL_KOU = "Kou Jump-Diffusion"
 
 MODELS = (
     MODEL_GBM,
@@ -104,10 +107,26 @@ MODELS = (
     MODEL_BLOCK_BOOTSTRAP,
     MODEL_MERTON,
     MODEL_REGIME,
+    MODEL_HESTON,
+    MODEL_GARCH,
+    MODEL_KOU,
 )
 
 # Models that need a historical daily-return series to run.
 BOOTSTRAP_MODELS = (MODEL_HIST_BOOTSTRAP, MODEL_BLOCK_BOOTSTRAP)
+
+# Version stamp for the maths layer (bumped when models/metrics change shape).
+MATH_MODEL_VERSION = "2.0"
+
+# ---------------------------------------------------------------------------
+# Variance-reduction methods
+# ---------------------------------------------------------------------------
+
+VR_NONE = "none"
+VR_ANTITHETIC = "antithetic"
+VR_SOBOL = "sobol"
+VR_CONTROL = "control_variate"
+VARIANCE_REDUCTION_METHODS = (VR_NONE, VR_ANTITHETIC, VR_SOBOL, VR_CONTROL)
 
 # ---------------------------------------------------------------------------
 # Conservative drift modes
@@ -207,6 +226,30 @@ class SimulationConfig:
     # Regime switching.
     regime_preset: str = "stock"
 
+    # Heston stochastic volatility (theta/v0 default to sigma^2 when None).
+    heston_kappa: float = 1.5
+    heston_theta: Optional[float] = None
+    heston_xi: float = 0.3
+    heston_rho: float = -0.7
+    heston_v0: Optional[float] = None
+
+    # GARCH(1,1) (omega defaults so long-run variance == sigma^2 when None).
+    garch_omega: Optional[float] = None
+    garch_alpha: float = 0.08
+    garch_beta: float = 0.90
+
+    # Kou double-exponential jump diffusion.
+    kou_intensity: float = 1.0      # jumps per year
+    kou_p_up: float = 0.4           # probability a jump is positive
+    kou_eta_up: float = 25.0        # up-jump rate (mean up-jump = 1/eta_up)
+    kou_eta_down: float = 15.0      # down-jump rate (mean down-jump = 1/eta_down)
+
+    # Variance reduction.
+    variance_reduction: str = VR_NONE
+
+    # Risk-of-ruin threshold (ruin if price ever falls below this * s0).
+    ruin_threshold: float = 0.50
+
     # Deterministic stress overlay (applied on top of any model).
     stress_enabled: bool = False
     stress_crash_pct: float = 0.0             # one-day crash, e.g. 0.20 == -20%
@@ -250,6 +293,28 @@ class SimulationConfig:
             raise ValueError("jump_intensity must be >= 0")
         if self.model == MODEL_REGIME and self.regime_preset not in REGIME_PRESETS:
             raise ValueError(f"Unknown regime_preset: {self.regime_preset!r}")
+        if self.model == MODEL_HESTON:
+            if self.heston_kappa < 0 or self.heston_xi < 0:
+                raise ValueError("Heston kappa and xi must be >= 0")
+            if not (-1.0 <= self.heston_rho <= 1.0):
+                raise ValueError("Heston rho must be in [-1, 1]")
+        if self.model == MODEL_GARCH:
+            if self.garch_alpha < 0 or self.garch_beta < 0:
+                raise ValueError("GARCH alpha and beta must be >= 0")
+            if self.garch_alpha + self.garch_beta >= 1.0:
+                raise ValueError("GARCH requires alpha + beta < 1 for stationarity")
+        if self.model == MODEL_KOU:
+            if self.kou_intensity < 0:
+                raise ValueError("kou_intensity must be >= 0")
+            if not (0.0 <= self.kou_p_up <= 1.0):
+                raise ValueError("kou_p_up must be in [0, 1]")
+            if self.kou_eta_up <= 1.0 or self.kou_eta_down <= 0.0:
+                # eta_up > 1 keeps E[e^{up jump}] finite.
+                raise ValueError("kou_eta_up must be > 1 and kou_eta_down > 0")
+        if self.variance_reduction not in VARIANCE_REDUCTION_METHODS:
+            raise ValueError(f"Unknown variance_reduction: {self.variance_reduction!r}")
+        if not (0.0 < self.ruin_threshold < 1.0):
+            raise ValueError("ruin_threshold must be in (0, 1)")
         if not (0.0 <= self.stress_crash_pct < 1.0):
             raise ValueError("stress_crash_pct must be in [0, 1)")
         if self.stress_vol_multiplier <= 0:
@@ -516,6 +581,18 @@ def _bootstrap_daily_drift(cfg: SimulationConfig, emp_mean: float) -> float:
     return d
 
 
+def _draw_gauss(rng, n: int, antithetic: bool) -> np.ndarray:
+    """Standard normal draws, optionally antithetic across the two chunk halves."""
+    if not antithetic:
+        return rng.standard_normal(n)
+    half = (n + 1) // 2
+    z = rng.standard_normal(half)
+    out = np.empty(n, dtype=np.float64)
+    out[:half] = z
+    out[half:] = -z[: n - half]
+    return out
+
+
 def _build_step_engine(cfg: SimulationConfig):
     """Return ``(init_chunk, step)`` closures implementing the selected model.
 
@@ -532,13 +609,17 @@ def _build_step_engine(cfg: SimulationConfig):
     diff_drift = (mu - 0.5 * sigma ** 2) * dt
     diff_vol = sigma * sqrt_dt
     model = cfg.model
+    antithetic = cfg.variance_reduction == VR_ANTITHETIC
+
+    def gauss(rng, n):
+        return _draw_gauss(rng, n, antithetic)
 
     if model == MODEL_GBM:
         def init_chunk(rng, n):
             return None
 
         def step(rng, n, state, i):
-            return diff_drift + diff_vol * rng.standard_normal(n)
+            return diff_drift + diff_vol * gauss(rng, n)
         return init_chunk, step
 
     if model == MODEL_STUDENT_T:
@@ -634,6 +715,89 @@ def _build_step_engine(cfg: SimulationConfig):
             return regime_drift[new_reg] + regime_vol[new_reg] * z
         return init_chunk, step
 
+    if model == MODEL_HESTON:
+        kappa = float(cfg.heston_kappa)
+        theta = float(cfg.heston_theta) if cfg.heston_theta is not None else sigma ** 2
+        xi = float(cfg.heston_xi)
+        rho = float(cfg.heston_rho)
+        v0 = float(cfg.heston_v0) if cfg.heston_v0 is not None else sigma ** 2
+        rho_c = math.sqrt(max(0.0, 1.0 - rho ** 2))
+
+        def init_chunk(rng, n):
+            return {"v": np.full(n, v0, dtype=np.float64)}
+
+        def step(rng, n, state, i):
+            v = state["v"]
+            # Full-truncation: use max(v, 0) wherever variance enters.
+            v_pos = np.maximum(v, 0.0)
+            sqrt_v = np.sqrt(v_pos)
+            z1 = gauss(rng, n)
+            z2 = rng.standard_normal(n)
+            zv = rho * z1 + rho_c * z2  # correlated shock for the variance SDE
+            # Variance update (full-truncation Euler) -- never stays negative.
+            v_new = (v + kappa * (theta - v_pos) * dt
+                     + xi * sqrt_v * sqrt_dt * zv)
+            state["v"] = np.maximum(v_new, 0.0)
+            # Log-price increment uses the (truncated) current variance.
+            return (mu - 0.5 * v_pos) * dt + sqrt_v * sqrt_dt * z1
+        return init_chunk, step
+
+    if model == MODEL_GARCH:
+        alpha = float(cfg.garch_alpha)
+        beta = float(cfg.garch_beta)
+        sigma_daily2 = (sigma ** 2) * dt  # long-run per-step variance target
+        if cfg.garch_omega is not None:
+            omega = float(cfg.garch_omega)
+        else:
+            omega = sigma_daily2 * (1.0 - alpha - beta)
+        mu_step = mu * dt
+
+        def init_chunk(rng, n):
+            return {"var": np.full(n, sigma_daily2, dtype=np.float64)}
+
+        def step(rng, n, state, i):
+            var = state["var"]                       # current per-step variance
+            var = np.maximum(var, 1e-300)            # keep strictly positive
+            vol = np.sqrt(var)
+            z = gauss(rng, n)
+            shock = vol * z                          # mean-zero return shock
+            log_ret = mu_step - 0.5 * var + shock
+            # GARCH(1,1) recursion on the realized shock.
+            state["var"] = omega + alpha * shock ** 2 + beta * var
+            return log_ret
+        return init_chunk, step
+
+    if model == MODEL_KOU:
+        lam_dt = cfg.kou_intensity * dt
+        p_up = float(cfg.kou_p_up)
+        eta_up = float(cfg.kou_eta_up)
+        eta_down = float(cfg.kou_eta_down)
+        # Compensator E[e^J - 1] for the double-exponential jump.
+        k = (p_up * eta_up / (eta_up - 1.0)
+             + (1.0 - p_up) * eta_down / (eta_down + 1.0)) - 1.0
+        comp_drift = (mu - 0.5 * sigma ** 2 - cfg.kou_intensity * k) * dt
+
+        def init_chunk(rng, n):
+            return None
+
+        def step(rng, n, state, i):
+            z = gauss(rng, n)
+            n_jumps = rng.poisson(lam_dt, size=n)
+            total = int(n_jumps.sum())
+            jump = np.zeros(n, dtype=np.float64)
+            if total > 0:
+                # One double-exponential draw per individual jump, summed per path.
+                up_mask = rng.random(total) < p_up
+                mags = np.empty(total, dtype=np.float64)
+                mags[up_mask] = rng.exponential(1.0 / eta_up, size=int(up_mask.sum()))
+                down = ~up_mask
+                mags[down] = -rng.exponential(1.0 / eta_down, size=int(down.sum()))
+                # Scatter-add each jump back to its path.
+                path_idx = np.repeat(np.arange(n), n_jumps)
+                np.add.at(jump, path_idx, mags)
+            return comp_drift + diff_vol * z + jump
+        return init_chunk, step
+
     raise ValueError(f"Unsupported model: {model!r}")
 
 
@@ -660,7 +824,11 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         else 0.0
     )
     dd_threshold = cfg.drawdown_threshold
+    ruin_level = cfg.ruin_threshold * cfg.s0
     drawdown_hits = 0
+    ruin_hits = 0
+    dd_duration_sum = 0.0       # sum over paths of each path's longest underwater run
+    dd_depth_sum = 0.0          # sum over paths of each path's max drawdown fraction
 
     final_values = np.empty(cfg.paths, dtype=np.float64)
 
@@ -684,9 +852,13 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         prices = np.full(this_chunk, cfg.s0, dtype=np.float64)
         memory.peak_vector_elements = max(memory.peak_vector_elements, prices.size)
 
-        # Running peak per path -> lets us flag large drawdowns memory-safely.
+        # Per-path running peak, max drawdown depth, drawdown-duration tracking
+        # and ruin flag -- all length n (chunk), so memory stays bounded.
         running_max = prices.copy()
-        dd_hit = np.zeros(this_chunk, dtype=bool)
+        max_dd = np.zeros(this_chunk, dtype=np.float64)
+        cur_uw = np.zeros(this_chunk, dtype=np.int64)   # current underwater length
+        max_uw = np.zeros(this_chunk, dtype=np.int64)   # longest underwater length
+        ruin_hit = prices <= ruin_level
 
         # Per-chunk model state (bounded by chunk size).
         state = init_chunk(rng, this_chunk)
@@ -701,14 +873,23 @@ def simulate(config: SimulationConfig) -> SimulationResult:
             prices *= np.exp(log_ret)
 
             np.maximum(running_max, prices, out=running_max)
-            dd_hit |= (prices <= running_max * (1.0 - dd_threshold))
+            dd = 1.0 - prices / running_max
+            np.maximum(max_dd, dd, out=max_dd)
+            ruin_hit |= prices <= ruin_level
+
+            underwater = prices < running_max
+            cur_uw = np.where(underwater, cur_uw + 1, 0)
+            np.maximum(max_uw, cur_uw, out=max_uw)
 
             if sample_in_chunk:
                 sample_trajectories[produced:produced + sample_in_chunk, step] = (
                     prices[:sample_in_chunk]
                 )
 
-        drawdown_hits += int(dd_hit.sum())
+        drawdown_hits += int(np.count_nonzero(max_dd >= dd_threshold))
+        ruin_hits += int(np.count_nonzero(ruin_hit))
+        dd_duration_sum += float(max_uw.sum())
+        dd_depth_sum += float(max_dd.sum())
         gross = prices
         net = apply_costs(gross, cfg.s0, cfg.cost)
         final_values[produced:produced + this_chunk] = net
@@ -726,6 +907,13 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     )
     stats["model"] = cfg.model
     stats["drift_mode"] = cfg.drift_mode
+    stats["variance_reduction"] = cfg.variance_reduction
+    # Path-based risk metrics (averaged over paths).
+    stats["mean_max_drawdown"] = dd_depth_sum / cfg.paths
+    stats["mean_drawdown_duration"] = dd_duration_sum / cfg.paths
+    stats["prob_ruin"] = ruin_hits / cfg.paths
+    stats["ruin_threshold"] = cfg.ruin_threshold
+    _augment_risk_metrics(stats, cfg)
 
     return SimulationResult(
         config=cfg,
@@ -793,6 +981,32 @@ def expected_shortfall(pnl: np.ndarray, confidence: float) -> float:
     return float(-np.mean(tail))
 
 
+KELLY_WARNING = (
+    "Kelly fraction is a theoretical estimate only; it assumes the simulated "
+    "return distribution is exactly correct and ignores estimation error. Do "
+    "NOT use it directly for position sizing."
+)
+
+
+def _augment_risk_metrics(stats: Dict[str, Any], cfg: "SimulationConfig") -> None:
+    """Annualize ratios and add Calmar using the horizon length from ``cfg``."""
+    years = cfg.horizon * cfg.dt
+    ann = math.sqrt(1.0 / years) if years > 0 else 0.0
+    stats["sharpe_annual"] = stats.get("sharpe", 0.0) * ann
+    stats["sortino_annual"] = stats.get("sortino", 0.0) * ann
+
+    exp_ret = stats.get("expected_return", 0.0)
+    if years > 0 and (1.0 + exp_ret) > 0:
+        annualized_return = (1.0 + exp_ret) ** (1.0 / years) - 1.0
+    else:
+        annualized_return = exp_ret
+    stats["annualized_return"] = annualized_return
+
+    mdd = stats.get("mean_max_drawdown", 0.0)
+    stats["calmar"] = (annualized_return / mdd) if mdd > 0 else 0.0
+    stats["kelly_warning"] = KELLY_WARNING
+
+
 def compute_statistics(
     final_values: np.ndarray,
     s0: float,
@@ -836,6 +1050,15 @@ def compute_statistics(
         str(p): float(np.percentile(fv, p)) for p in REPORT_PERCENTILES
     }
 
+    # Return-distribution risk ratios (over the whole horizon period).
+    ret_mean = float(np.mean(returns))
+    ret_std = float(np.std(returns, ddof=1)) if n > 1 else 0.0
+    downside = returns[returns < 0.0]
+    downside_std = float(np.sqrt(np.mean(downside ** 2))) if downside.size else 0.0
+    sharpe = ret_mean / ret_std if ret_std > 0 else 0.0
+    sortino = ret_mean / downside_std if downside_std > 0 else 0.0
+    kelly = ret_mean / (ret_std ** 2) if ret_std > 0 else 0.0
+
     stats: Dict[str, Any] = {
         "paths": int(n),
         "s0": float(s0),
@@ -852,7 +1075,12 @@ def compute_statistics(
         "prob_loss_20": prob_loss_20,
         "worst_1pct_avg_value": worst_1pct_avg,
         "drawdown_threshold": float(drawdown_threshold),
-        "mean_return": float(np.mean(returns)),
+        "mean_return": ret_mean,
+        "return_std": ret_std,
+        "downside_std": downside_std,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "kelly_fraction": kelly,
         "var": var,
         "expected_shortfall": es,
         "percentiles": percentiles,
@@ -914,6 +1142,29 @@ def model_assumptions(cfg: SimulationConfig,
         a["jump_vol"] = cfg.jump_vol
     if cfg.model == MODEL_REGIME:
         a["regime_preset"] = cfg.regime_preset
+    if cfg.model == MODEL_HESTON:
+        a["heston"] = {
+            "kappa": cfg.heston_kappa,
+            "theta": cfg.heston_theta if cfg.heston_theta is not None else cfg.effective_sigma() ** 2,
+            "xi": cfg.heston_xi,
+            "rho": cfg.heston_rho,
+            "v0": cfg.heston_v0 if cfg.heston_v0 is not None else cfg.effective_sigma() ** 2,
+        }
+    if cfg.model == MODEL_GARCH:
+        a["garch"] = {
+            "omega": cfg.garch_omega,
+            "alpha": cfg.garch_alpha,
+            "beta": cfg.garch_beta,
+        }
+    if cfg.model == MODEL_KOU:
+        a["kou"] = {
+            "intensity": cfg.kou_intensity,
+            "p_up": cfg.kou_p_up,
+            "eta_up": cfg.kou_eta_up,
+            "eta_down": cfg.kou_eta_down,
+        }
+    a["variance_reduction"] = cfg.variance_reduction
+    a["math_model_version"] = MATH_MODEL_VERSION
     a["stress"] = {
         "enabled": cfg.stress_enabled,
         "one_day_crash_pct": cfg.stress_crash_pct,
@@ -925,11 +1176,26 @@ def model_assumptions(cfg: SimulationConfig,
     return a
 
 
-def build_report(result: SimulationResult, market: Optional[MarketParameters] = None) -> Dict[str, Any]:
-    """Assemble a serialisable report dict from a simulation result."""
+def build_report(
+    result: SimulationResult,
+    market: Optional[MarketParameters] = None,
+    *,
+    evt: Optional[Dict[str, Any]] = None,
+    portfolio: Optional[Dict[str, Any]] = None,
+    backtest: Optional[Dict[str, Any]] = None,
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Assemble a serialisable report dict from a simulation result.
+
+    Optional ``evt``, ``portfolio``, ``backtest`` and ``warnings`` sections are
+    included when supplied so exports carry the full risk-lab metadata.
+    """
 
     cfg = result.config
+    if warnings is None:
+        warnings = collect_warnings(cfg, market, evt=evt, backtest=backtest)
     report: Dict[str, Any] = {
+        "math_model_version": MATH_MODEL_VERSION,
         "config": {
             "ticker": cfg.ticker,
             "s0": cfg.s0,
@@ -943,9 +1209,13 @@ def build_report(result: SimulationResult, market: Optional[MarketParameters] = 
             "cost": cfg.cost,
             "model": cfg.model,
             "drift_mode": cfg.drift_mode,
+            "variance_reduction": cfg.variance_reduction,
+            "ruin_threshold": cfg.ruin_threshold,
         },
         "model": model_assumptions(cfg, market),
+        "variance_reduction_method": cfg.variance_reduction,
         "statistics": result.stats,
+        "warnings": warnings,
         "memory": {
             "paths": result.memory.paths,
             "horizon": result.memory.horizon,
@@ -961,17 +1231,22 @@ def build_report(result: SimulationResult, market: Optional[MarketParameters] = 
         "runtime_seconds": result.runtime_seconds,
     }
     if market is not None:
-        report["market"] = {
-            "source": market.source,
-            "note": market.note,
-        }
+        report["market"] = {"source": market.source, "note": market.note}
+    if evt is not None:
+        report["evt"] = evt
+    if portfolio is not None:
+        report["portfolio"] = {k: v for k, v in portfolio.items()
+                               if k != "portfolio_values"}
+    if backtest is not None:
+        report["backtest"] = backtest
     return report
 
 
 def report_to_json(result: SimulationResult, market: Optional[MarketParameters] = None,
-                   *, indent: int = 2) -> str:
+                   *, indent: int = 2, **kwargs) -> str:
     """Serialise the full report to a JSON string."""
-    return json.dumps(build_report(result, market), indent=indent, default=_json_default)
+    return json.dumps(build_report(result, market, **kwargs),
+                      indent=indent, default=_json_default)
 
 
 def _json_default(obj):
@@ -996,7 +1271,9 @@ def summary_rows(result: SimulationResult) -> List[List[Any]]:
         ["paths", cfg.paths],
         ["horizon_steps", cfg.horizon],
         ["model", cfg.model],
+        ["math_model_version", MATH_MODEL_VERSION],
         ["drift_mode", cfg.drift_mode],
+        ["variance_reduction_method", cfg.variance_reduction],
         ["volatility_source", assumptions["volatility_source"]],
         ["effective_mu_annual", assumptions["effective_mu_annual"]],
         ["effective_sigma_annual", assumptions["effective_sigma_annual"]],
@@ -1012,6 +1289,19 @@ def summary_rows(result: SimulationResult) -> List[List[Any]]:
         ["jump_mean", cfg.jump_mean],
         ["jump_vol", cfg.jump_vol],
         ["regime_preset", cfg.regime_preset],
+        ["heston_kappa", cfg.heston_kappa],
+        ["heston_theta", cfg.heston_theta],
+        ["heston_xi", cfg.heston_xi],
+        ["heston_rho", cfg.heston_rho],
+        ["heston_v0", cfg.heston_v0],
+        ["garch_omega", cfg.garch_omega],
+        ["garch_alpha", cfg.garch_alpha],
+        ["garch_beta", cfg.garch_beta],
+        ["kou_intensity", cfg.kou_intensity],
+        ["kou_p_up", cfg.kou_p_up],
+        ["kou_eta_up", cfg.kou_eta_up],
+        ["kou_eta_down", cfg.kou_eta_down],
+        ["ruin_threshold", cfg.ruin_threshold],
         # Stress overlay.
         ["stress_enabled", cfg.stress_enabled],
         ["stress_one_day_crash_pct", cfg.stress_crash_pct],
@@ -1032,6 +1322,15 @@ def summary_rows(result: SimulationResult) -> List[List[Any]]:
         ["prob_loss_more_than_20pct", s["prob_loss_20"]],
         ["prob_drawdown_50pct", s.get("prob_drawdown", "")],
         ["worst_1pct_avg_ending_value", s["worst_1pct_avg_value"]],
+        # Advanced risk metrics.
+        ["mean_max_drawdown", s.get("mean_max_drawdown", "")],
+        ["mean_drawdown_duration", s.get("mean_drawdown_duration", "")],
+        ["prob_ruin", s.get("prob_ruin", "")],
+        ["sharpe_annual", s.get("sharpe_annual", "")],
+        ["sortino_annual", s.get("sortino_annual", "")],
+        ["calmar", s.get("calmar", "")],
+        ["annualized_return", s.get("annualized_return", "")],
+        ["kelly_fraction", s.get("kelly_fraction", "")],
     ]
     for level in RISK_LEVELS:
         key = _level_key(level)
@@ -1070,8 +1369,8 @@ def write_csv(result: SimulationResult, path: str) -> str:
 
 
 def write_json(result: SimulationResult, path: str,
-               market: Optional[MarketParameters] = None) -> str:
-    text = report_to_json(result, market)
+               market: Optional[MarketParameters] = None, **kwargs) -> str:
+    text = report_to_json(result, market, **kwargs)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(text)
     return path
@@ -1144,15 +1443,32 @@ COMPARISON_COLUMNS = (
     "percentile_95",
     "var_99",
     "es_99",
+    "evt_var_99",
+    "evt_es_99",
+    "max_drawdown_prob",
+    "prob_ruin",
+    "sharpe",
+    "sortino",
+    "disagreement_rank",
     "runtime_seconds",
     "chunk_safe",
 )
 
 
-def comparison_row(result: SimulationResult) -> Dict[str, Any]:
-    """Flatten a :class:`SimulationResult` into one comparison-table row."""
+def comparison_row(result: SimulationResult,
+                   evt: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Flatten a :class:`SimulationResult` into one comparison-table row.
+
+    ``disagreement_rank`` is filled in later by :func:`compare_models` once all
+    models are known.  ``evt`` (optional) supplies EVT 99% tail metrics.
+    """
 
     s = result.stats
+    evt_var_99 = float("nan")
+    evt_es_99 = float("nan")
+    if evt is not None and not evt.get("error"):
+        evt_var_99 = evt["var"].get("99", float("nan"))
+        evt_es_99 = evt["es"].get("99", float("nan"))
     return {
         "model": result.config.model,
         "expected_ending_value": s["expected_value"],
@@ -1167,6 +1483,13 @@ def comparison_row(result: SimulationResult) -> Dict[str, Any]:
         "percentile_95": s["percentiles"]["95"],
         "var_99": s["var"]["99"]["value"],
         "es_99": s["expected_shortfall"]["99"]["value"],
+        "evt_var_99": evt_var_99,
+        "evt_es_99": evt_es_99,
+        "max_drawdown_prob": s.get("prob_drawdown", float("nan")),
+        "prob_ruin": s.get("prob_ruin", float("nan")),
+        "sharpe": s.get("sharpe_annual", s.get("sharpe", float("nan"))),
+        "sortino": s.get("sortino_annual", s.get("sortino", float("nan"))),
+        "disagreement_rank": 0,
         "runtime_seconds": s.get("runtime_seconds", result.runtime_seconds),
         "chunk_safe": result.memory.is_chunk_safe,
     }
@@ -1204,11 +1527,37 @@ def most_conservative_model(rows: List[Dict[str, Any]]) -> Optional[str]:
     return best["model"]
 
 
+def _assign_disagreement_ranks(rows: List[Dict[str, Any]]) -> None:
+    """Rank models by how far they diverge from the cross-model consensus.
+
+    For a set of key metrics, each model's robust z-distance from the median is
+    averaged into a disagreement score; rank 1 == most divergent model.
+    """
+
+    if not rows:
+        return
+    metrics = ("expected_ending_value", "prob_loss_20", "es_99", "prob_drawdown_50")
+    scores = np.zeros(len(rows), dtype=float)
+    for metric in metrics:
+        vals = np.array([float(r.get(metric, np.nan)) for r in rows], dtype=float)
+        if not np.all(np.isfinite(vals)):
+            continue
+        med = np.median(vals)
+        mad = np.median(np.abs(vals - med))
+        scale = mad if mad > 1e-12 else (np.std(vals) if np.std(vals) > 1e-12 else 1.0)
+        scores += np.abs(vals - med) / scale
+    order = np.argsort(-scores)  # most divergent first
+    for rank, idx in enumerate(order, start=1):
+        rows[idx]["disagreement_rank"] = int(rank)
+        rows[idx]["disagreement_score"] = float(scores[idx])
+
+
 def compare_models(
     base_config: SimulationConfig,
     models: "Optional[List[str]]" = None,
     *,
     market: Optional[MarketParameters] = None,
+    evt: bool = False,
 ) -> ComparisonReport:
     """Run several models on identical settings and assemble a comparison.
 
@@ -1216,6 +1565,7 @@ def compare_models(
     allocates a full ``paths x steps`` matrix.  ``base_config`` supplies the
     shared ticker/paths/horizon/chunk/seed/drift settings; only ``model`` (and
     its model-specific knobs already present on the config) varies per run.
+    When ``evt`` is true an EVT tail-risk fit is added per model.
     """
 
     if models is None:
@@ -1232,10 +1582,12 @@ def compare_models(
             raise ValueError(f"Unknown model: {model!r}")
         cfg = replace(base, model=model)
         result = simulate(cfg)
-        rows.append(comparison_row(result))
+        evt_result = evt_from_result(result) if evt else None
+        rows.append(comparison_row(result, evt=evt_result))
         per_model[model] = {
             "assumptions": model_assumptions(cfg, market),
             "statistics": result.stats,
+            "evt": evt_result,
             "memory": {
                 "is_chunk_safe": result.memory.is_chunk_safe,
                 "peak_matrix_elements": result.memory.peak_matrix_elements,
@@ -1244,6 +1596,8 @@ def compare_models(
                 "status": result.memory.status(),
             },
         }
+
+    _assign_disagreement_ranks(rows)
 
     return ComparisonReport(
         base_config=base,
@@ -1309,3 +1663,470 @@ def write_comparison_json(report: ComparisonReport, path: str) -> str:
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(comparison_to_json(report))
     return path
+
+
+# ---------------------------------------------------------------------------
+# EVT tail-risk module (Generalized Pareto over threshold exceedances)
+# ---------------------------------------------------------------------------
+
+EVT_LEVELS = (95.0, 99.0, 99.5, 99.9)
+EVT_MIN_EXCEEDANCES = 50
+
+
+def gpd_fit_mom(exceedances: np.ndarray) -> "tuple[float, float]":
+    """Fit a Generalized Pareto Distribution by the method of moments.
+
+    Returns ``(shape_xi, scale_beta)``.  MoM is closed-form and dependency-free
+    (no scipy needed); valid for shape < 0.5.
+    """
+    y = np.asarray(exceedances, dtype=float)
+    m = float(np.mean(y))
+    v = float(np.var(y, ddof=1)) if y.size > 1 else 0.0
+    if v <= 0 or m <= 0:
+        return 0.0, max(m, 1e-12)
+    xi = 0.5 * (1.0 - (m * m) / v)
+    beta = m * (1.0 - xi)
+    if beta <= 0:
+        beta = max(m, 1e-12)
+    return float(xi), float(beta)
+
+
+def evt_tail_risk(
+    losses: np.ndarray,
+    *,
+    levels=EVT_LEVELS,
+    threshold_pct: float = 95.0,
+    min_exceedances: int = EVT_MIN_EXCEEDANCES,
+) -> Dict[str, Any]:
+    """Peaks-over-threshold EVT tail-risk estimate.
+
+    ``losses`` should be positive-is-bad (e.g. negative returns).  Fits a GPD to
+    exceedances over the ``threshold_pct`` percentile and returns POT VaR/ES at
+    each confidence level, the threshold, exceedance count, and a warning when
+    the sample is too small.
+    """
+    x = np.asarray(losses, dtype=float)
+    x = x[np.isfinite(x)]
+    n = x.size
+    result: Dict[str, Any] = {
+        "levels": list(levels),
+        "threshold_pct": float(threshold_pct),
+        "var": {},
+        "es": {},
+        "warning": None,
+        "error": None,
+    }
+    if n < 10:
+        result["error"] = "too few samples for EVT"
+        result["warning"] = f"EVT skipped: only {n} samples."
+        return result
+
+    u = float(np.percentile(x, threshold_pct))
+    exceed = x[x > u] - u
+    nu = exceed.size
+    result["threshold"] = u
+    result["n_exceedances"] = int(nu)
+
+    if nu < 2:
+        result["error"] = "no exceedances above threshold"
+        result["warning"] = "EVT: not enough exceedances above threshold."
+        return result
+
+    xi, beta = gpd_fit_mom(exceed)
+    result["shape_xi"] = xi
+    result["scale_beta"] = beta
+
+    rate = nu / n  # exceedance rate
+    for level in levels:
+        p = level / 100.0
+        tail = 1.0 - p
+        if abs(xi) < 1e-8:
+            var_l = u + beta * math.log(rate / tail) if tail > 0 else float("inf")
+        else:
+            var_l = u + (beta / xi) * ((tail / rate) ** (-xi) - 1.0)
+        result["var"][_level_key(level)] = float(var_l)
+        if xi < 1.0:
+            es_l = (var_l + beta - xi * u) / (1.0 - xi)
+        else:
+            es_l = float("inf")
+        result["es"][_level_key(level)] = float(es_l)
+
+    if nu < min_exceedances:
+        result["warning"] = (
+            f"EVT warning: only {nu} exceedances (< {min_exceedances}); "
+            "tail estimates are unreliable."
+        )
+    return result
+
+
+def evt_from_result(result: SimulationResult, **kwargs) -> Dict[str, Any]:
+    """EVT tail-risk from a simulation result's ending-value loss distribution."""
+    s0 = result.config.s0
+    returns = result.final_values / s0 - 1.0
+    losses = -returns  # positive == loss
+    return evt_tail_risk(losses, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Variance-reduction convergence diagnostics (GBM terminal expectation)
+# ---------------------------------------------------------------------------
+
+
+def variance_reduction_diagnostics(
+    config: SimulationConfig,
+    path_counts=(1_000, 2_000, 5_000, 10_000),
+) -> Dict[str, Any]:
+    """Compare plain MC vs antithetic vs control-variate for GBM E[S_T].
+
+    Uses the GBM terminal-price law directly (one normal per path), so it is
+    fast and never allocates a path x step matrix.  Reports, per path count, the
+    estimate and standard error for each method plus the analytic target.
+    """
+    cfg = config
+    mu = cfg.effective_mu()
+    sigma = cfg.effective_sigma()
+    T = cfg.horizon * cfg.dt
+    a = (mu - 0.5 * sigma ** 2) * T
+    b = sigma * math.sqrt(T)
+    analytic = cfg.s0 * math.exp(mu * T)
+    rng = np.random.default_rng(cfg.seed)
+
+    rows = []
+    for n in path_counts:
+        # Plain MC.
+        z = rng.standard_normal(n)
+        st = cfg.s0 * np.exp(a + b * z)
+        plain_mean = float(np.mean(st))
+        plain_se = float(np.std(st, ddof=1) / math.sqrt(n)) if n > 1 else 0.0
+
+        # Antithetic.
+        half = (n + 1) // 2
+        za = rng.standard_normal(half)
+        z_anti = np.concatenate([za, -za])[:n]
+        st_a = cfg.s0 * np.exp(a + b * z_anti)
+        anti_mean = float(np.mean(st_a))
+        anti_se = float(np.std(st_a, ddof=1) / math.sqrt(n)) if n > 1 else 0.0
+
+        # Control variate (control = z, known mean 0).
+        zc = rng.standard_normal(n)
+        st_c = cfg.s0 * np.exp(a + b * zc)
+        if n > 1 and np.var(zc) > 0:
+            beta = float(np.cov(st_c, zc, ddof=1)[0, 1] / np.var(zc, ddof=1))
+        else:
+            beta = 0.0
+        cv = st_c - beta * zc
+        cv_mean = float(np.mean(cv))
+        cv_se = float(np.std(cv, ddof=1) / math.sqrt(n)) if n > 1 else 0.0
+
+        rows.append({
+            "paths": int(n),
+            "analytic": analytic,
+            "plain_mean": plain_mean, "plain_se": plain_se,
+            "antithetic_mean": anti_mean, "antithetic_se": anti_se,
+            "control_variate_mean": cv_mean, "control_variate_se": cv_se,
+            "antithetic_se_ratio": (anti_se / plain_se) if plain_se > 0 else float("nan"),
+            "control_variate_se_ratio": (cv_se / plain_se) if plain_se > 0 else float("nan"),
+        })
+    return {"analytic_expected_value": analytic, "rows": rows}
+
+
+def sobol_available() -> bool:
+    """True when scipy's Sobol QMC engine is importable (optional dependency)."""
+    try:  # pragma: no cover - depends on environment
+        from scipy.stats import qmc  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Portfolio mode (laptop-safe correlated multi-asset simulation)
+# ---------------------------------------------------------------------------
+
+
+def align_returns(returns_by_ticker: "Dict[str, np.ndarray]") -> "tuple[List[str], np.ndarray]":
+    """Tail-align per-ticker daily returns into a (T, k) matrix."""
+    tickers = list(returns_by_ticker.keys())
+    series = [np.asarray(returns_by_ticker[t], dtype=float).ravel() for t in tickers]
+    min_len = min(s.size for s in series)
+    if min_len < 2:
+        raise ValueError("need at least two aligned returns per ticker")
+    matrix = np.column_stack([s[-min_len:] for s in series])
+    return tickers, matrix
+
+
+def shrink_covariance(returns_matrix: np.ndarray) -> "tuple[np.ndarray, str]":
+    """Estimate a covariance matrix with shrinkage; returns (cov, method).
+
+    Uses scikit-learn's Ledoit-Wolf when available, otherwise a dependency-free
+    linear shrinkage toward the diagonal of sample variances.
+    """
+    X = np.asarray(returns_matrix, dtype=float)
+    try:  # pragma: no cover - optional dependency
+        from sklearn.covariance import LedoitWolf
+        cov = LedoitWolf().fit(X).covariance_
+        return np.asarray(cov, dtype=float), "ledoit_wolf"
+    except Exception:
+        sample = np.cov(X, rowvar=False, ddof=1)
+        sample = np.atleast_2d(sample)
+        target = np.diag(np.diag(sample))
+        k = sample.shape[0]
+        delta = min(1.0, max(0.0, k / max(X.shape[0], 1)))  # shrink more when T is small
+        delta = max(delta, 0.10)
+        cov = (1.0 - delta) * sample + delta * target
+        return cov, "diagonal_shrinkage"
+
+
+def cholesky_safe(cov: np.ndarray) -> "tuple[np.ndarray, bool]":
+    """Cholesky factor with PD repair; returns (L, jittered)."""
+    cov = np.atleast_2d(np.asarray(cov, dtype=float))
+    try:
+        return np.linalg.cholesky(cov), False
+    except np.linalg.LinAlgError:
+        # Repair: floor eigenvalues to a small positive value.
+        vals, vecs = np.linalg.eigh((cov + cov.T) / 2.0)
+        vals = np.clip(vals, 1e-10, None)
+        repaired = (vecs * vals) @ vecs.T
+        return np.linalg.cholesky(repaired), True
+
+
+def simulate_portfolio(
+    returns_by_ticker: "Dict[str, np.ndarray]",
+    *,
+    weights: "Optional[np.ndarray]" = None,
+    s0_by_ticker: "Optional[Dict[str, float]]" = None,
+    paths: int = 10_000,
+    horizon: int = 252,
+    dt: float = 1.0 / TRADING_DAYS_PER_YEAR,
+    chunk_size: int = DEFAULT_SERIOUS_CHUNK_SIZE,
+    seed: Optional[int] = None,
+    drift_mode: str = DRIFT_HISTORICAL,
+    manual_drift: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Chunk-safe correlated multi-asset GBM portfolio simulation.
+
+    Per chunk we hold an (n x k) price block (k assets, n = chunk paths) and
+    evolve it step by step.  We never allocate a paths x steps matrix.
+    """
+    tickers, R = align_returns(returns_by_ticker)
+    k = len(tickers)
+    T_hist = R.shape[0]
+
+    # Per-asset annualized parameters from each column's daily log returns.
+    mus = np.empty(k)
+    sigmas = np.empty(k)
+    for j in range(k):
+        daily_mu = float(np.mean(R[:, j]))
+        daily_sd = float(np.std(R[:, j], ddof=1)) if T_hist > 1 else 0.0
+        sigmas[j] = daily_sd * math.sqrt(TRADING_DAYS_PER_YEAR)
+        mus[j] = daily_mu * TRADING_DAYS_PER_YEAR + 0.5 * sigmas[j] ** 2
+
+    # Apply conservative drift mode per asset.
+    if drift_mode == DRIFT_HALF:
+        mus = 0.5 * mus
+    elif drift_mode == DRIFT_ZERO:
+        mus = np.zeros_like(mus)
+    elif drift_mode == DRIFT_MANUAL and manual_drift is not None:
+        mus = np.full_like(mus, float(manual_drift))
+
+    cov, shrink_method = shrink_covariance(R)
+    sd = np.sqrt(np.clip(np.diag(cov), 1e-16, None))
+    corr = cov / np.outer(sd, sd)
+    np.clip(corr, -1.0, 1.0, out=corr)
+    chol, jittered = cholesky_safe(corr)
+
+    if weights is None:
+        weights = np.full(k, 1.0 / k)
+    weights = np.asarray(weights, dtype=float).ravel()
+    if weights.size != k:
+        raise ValueError("weights length must match number of tickers")
+    weights = weights / weights.sum()
+
+    if s0_by_ticker is None:
+        s0_vec = np.full(k, 100.0)
+    else:
+        s0_vec = np.array([float(s0_by_ticker.get(t, 100.0)) for t in tickers])
+
+    sqrt_dt = math.sqrt(dt)
+    drift_step = (mus - 0.5 * sigmas ** 2) * dt
+    vol_step = sigmas * sqrt_dt
+    rng = np.random.default_rng(seed)
+
+    portfolio_values = np.empty(paths, dtype=np.float64)
+    per_asset_final_sum = np.zeros(k)
+    peak_block = 0
+    produced = 0
+    while produced < paths:
+        n = min(chunk_size, paths - produced)
+        prices = np.tile(s0_vec, (n, 1)).astype(np.float64)  # (n, k) block
+        peak_block = max(peak_block, prices.size)
+        for _ in range(horizon):
+            z = rng.standard_normal((n, k))
+            corr_shock = z @ chol.T
+            prices *= np.exp(drift_step + vol_step * corr_shock)
+        # Portfolio ending value: weighted sum of per-asset gross returns.
+        rel = prices / s0_vec
+        portfolio_values[produced:produced + n] = (rel * weights).sum(axis=1)
+        per_asset_final_sum += rel.sum(axis=0)
+        produced += n
+
+    port_stats = compute_statistics(portfolio_values, 1.0)
+    per_asset = {
+        tickers[j]: {
+            "mean_gross_return": float(per_asset_final_sum[j] / paths),
+            "annual_mu": float(mus[j]),
+            "annual_sigma": float(sigmas[j]),
+            "weight": float(weights[j]),
+        }
+        for j in range(k)
+    }
+    full_block = paths * k
+    return {
+        "tickers": tickers,
+        "weights": weights.tolist(),
+        "paths": int(paths),
+        "horizon": int(horizon),
+        "portfolio_values": portfolio_values,   # length == paths (relative to 1.0)
+        "statistics": port_stats,
+        "per_asset": per_asset,
+        "correlation_matrix": corr.tolist(),
+        "covariance_method": shrink_method,
+        "cholesky_jittered": bool(jittered),
+        "chunk_safe": peak_block < full_block,
+        "peak_block_elements": int(peak_block),
+        "full_block_elements": int(full_block),
+    }
+
+
+def portfolio_correlation_csv(portfolio: Dict[str, Any]) -> str:
+    """Correlation matrix as CSV (first column = ticker labels)."""
+    tickers = portfolio["tickers"]
+    corr = portfolio["correlation_matrix"]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow([""] + list(tickers))
+    for i, t in enumerate(tickers):
+        writer.writerow([t] + [f"{c:.6f}" for c in corr[i]])
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Model validation / historical backtest
+# ---------------------------------------------------------------------------
+
+HIGH_DRIFT_WARNING_LEVEL = 0.50    # annualized effective drift above this -> warn
+SHORT_HISTORY_MIN = TRADING_DAYS_PER_YEAR  # < 1y of data -> warn
+
+
+def backtest_percentile_bands(
+    prices: np.ndarray,
+    horizon: int,
+    *,
+    window: int = TRADING_DAYS_PER_YEAR,
+    dt: float = 1.0 / TRADING_DAYS_PER_YEAR,
+    lower: float = 5.0,
+    upper: float = 95.0,
+) -> Dict[str, Any]:
+    """Rolling GBM backtest: do realized forward returns fall in the model band?
+
+    For each rolling estimation window we fit GBM (mu, sigma) and form analytic
+    5th/50th/95th percentile bands for the ``horizon``-step forward return, then
+    check whether the realized forward return lands inside the band.  Reports the
+    empirical coverage (ideally ~0.90 for a 5-95 band).
+    """
+    p = np.asarray(prices, dtype=float).ravel()
+    n = p.size
+    result: Dict[str, Any] = {
+        "window": int(window), "horizon": int(horizon),
+        "n_windows": 0, "coverage": float("nan"),
+        "band": [lower, upper], "warning": None,
+    }
+    if n < window + horizon + 2:
+        result["warning"] = "Not enough history for a rolling backtest."
+        return result
+
+    from math import sqrt as _sqrt
+    inside = 0
+    total = 0
+    z_lo = _norm_ppf(lower / 100.0)
+    z_hi = _norm_ppf(upper / 100.0)
+    starts = range(0, n - window - horizon, max(1, horizon))
+    for t in starts:
+        win = p[t:t + window]
+        mu, sigma = annualized_parameters(win)
+        T = horizon * dt
+        center = (mu - 0.5 * sigma ** 2) * T
+        spread = sigma * _sqrt(T)
+        lo = math.exp(center + z_lo * spread) - 1.0
+        hi = math.exp(center + z_hi * spread) - 1.0
+        realized = p[t + window + horizon - 1] / p[t + window - 1] - 1.0
+        inside += int(lo <= realized <= hi)
+        total += 1
+    result["n_windows"] = total
+    result["coverage"] = (inside / total) if total else float("nan")
+    if total < 10:
+        result["warning"] = f"Only {total} backtest windows; coverage is noisy."
+    return result
+
+
+def _norm_ppf(p: float) -> float:
+    """Inverse standard-normal CDF (Acklam's rational approximation, no scipy)."""
+    if p <= 0.0:
+        return -math.inf
+    if p >= 1.0:
+        return math.inf
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5
+    r = q * q
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+
+
+def collect_warnings(
+    config: SimulationConfig,
+    market: Optional[MarketParameters] = None,
+    *,
+    evt: Optional[Dict[str, Any]] = None,
+    backtest: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Assemble model-validation warnings for the report."""
+    warnings: List[str] = []
+    eff_mu = config.effective_mu()
+    if eff_mu > HIGH_DRIFT_WARNING_LEVEL:
+        warnings.append(
+            f"Calibration warning: effective annual drift {eff_mu:.1%} is very high; "
+            "results may be over-optimistic. Consider a conservative drift mode."
+        )
+    if market is not None and market.daily_log_returns is not None:
+        n_hist = int(np.asarray(market.daily_log_returns).size)
+        if n_hist < SHORT_HISTORY_MIN:
+            warnings.append(
+                f"Short-history warning: only {n_hist} daily returns "
+                f"(< {SHORT_HISTORY_MIN}); parameter estimates are unreliable."
+            )
+    if market is not None and market.source == "fallback":
+        warnings.append("Data warning: using offline fallback parameters (no live data).")
+    if evt is not None:
+        if evt.get("error"):
+            warnings.append(f"EVT warning: {evt['error']}.")
+        elif evt.get("warning"):
+            warnings.append(evt["warning"])
+    if backtest is not None and backtest.get("warning"):
+        warnings.append(f"Backtest warning: {backtest['warning']}")
+    return warnings
