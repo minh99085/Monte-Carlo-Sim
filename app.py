@@ -36,8 +36,14 @@ def build_config_from_inputs(
     seed: Optional[int],
     cost: float,
     sample_paths: int = 50,
+    **model_kwargs,
 ) -> mc_core.SimulationConfig:
-    """Assemble a validated :class:`mc_core.SimulationConfig` from GUI inputs."""
+    """Assemble a validated :class:`mc_core.SimulationConfig` from GUI inputs.
+
+    Extra ``model_kwargs`` (model, drift_mode, t_df, historical_returns,
+    block_length, jump_*, regime_preset, stress_*) are passed straight through to
+    :class:`mc_core.SimulationConfig`.
+    """
 
     return mc_core.SimulationConfig(
         ticker=ticker or "ASSET",
@@ -50,6 +56,7 @@ def build_config_from_inputs(
         seed=seed,
         cost=float(cost),
         sample_paths=int(sample_paths),
+        **model_kwargs,
     ).validate()
 
 
@@ -202,6 +209,83 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
             min_value=0.0, max_value=0.5, value=0.0, step=0.0005, format="%.4f",
         )
 
+        # ---------------------- Model selection ----------------------
+        st.subheader("Model")
+        model = st.selectbox(
+            "Simulation model", list(mc_core.MODELS), index=0,
+            help="Choose the stochastic model used to generate price paths.",
+        )
+
+        model_inputs: dict = {"model": model}
+        if model == mc_core.MODEL_STUDENT_T:
+            model_inputs["t_df"] = st.number_input(
+                "Student-t degrees of freedom", min_value=2.5, max_value=100.0,
+                value=5.0, step=0.5,
+                help="Lower = fatter tails. Shocks are standardized to unit variance.",
+            )
+        elif model == mc_core.MODEL_BLOCK_BOOTSTRAP:
+            model_inputs["block_length"] = st.number_input(
+                "Block length (days)", min_value=1, max_value=120, value=20, step=1,
+                help="Preserves short-term volatility clustering.",
+            )
+        elif model == mc_core.MODEL_MERTON:
+            jump_preset = st.selectbox("Jump preset", ["stock", "crypto", "custom"], index=0)
+            base = mc_core.JUMP_PRESETS.get(
+                jump_preset, mc_core.JUMP_PRESETS["stock"]
+            )
+            disabled = jump_preset != "custom"
+            model_inputs["jump_intensity"] = st.number_input(
+                "Jump intensity (per year)", min_value=0.0, max_value=100.0,
+                value=float(base["intensity"]), step=0.5, disabled=disabled,
+            )
+            model_inputs["jump_mean"] = st.number_input(
+                "Jump mean (log)", min_value=-1.0, max_value=1.0,
+                value=float(base["mean"]), step=0.01, format="%.3f", disabled=disabled,
+            )
+            model_inputs["jump_vol"] = st.number_input(
+                "Jump volatility (log)", min_value=0.0, max_value=1.0,
+                value=float(base["vol"]), step=0.01, format="%.3f", disabled=disabled,
+            )
+        elif model == mc_core.MODEL_REGIME:
+            model_inputs["regime_preset"] = st.selectbox(
+                "Regime preset", list(mc_core.REGIME_PRESETS), index=0,
+                help="Crypto preset spends more time in high-vol/crash regimes.",
+            )
+        elif model in mc_core.BOOTSTRAP_MODELS:
+            st.caption("Uses empirical daily returns sampled from history.")
+
+        # ---------------------- Conservative drift mode ----------------------
+        st.subheader("Drift mode")
+        drift_mode = st.selectbox(
+            "Conservative drift mode", list(mc_core.DRIFT_MODES), index=0,
+            help="Reduce reliance on historical drift for more conservative outlooks.",
+        )
+        manual_drift = None
+        if drift_mode == mc_core.DRIFT_MANUAL:
+            manual_drift = st.number_input(
+                "Manual annual drift", min_value=-1.0, max_value=2.0,
+                value=0.0, step=0.01, format="%.3f",
+            )
+
+        # ---------------------- Stress overlay ----------------------
+        st.subheader("Stress overlay")
+        stress_enabled = st.checkbox("Enable deterministic stress overlay", value=False)
+        stress_crash = stress_vol_mult = stress_haircut = 0.0
+        stress_vol_mult = 1.0
+        if stress_enabled:
+            stress_crash = st.number_input(
+                "One-day crash on day 1 (fraction)", min_value=0.0, max_value=0.95,
+                value=0.0, step=0.05,
+            )
+            stress_vol_mult = st.number_input(
+                "Volatility multiplier", min_value=0.1, max_value=10.0,
+                value=1.0, step=0.1,
+            )
+            stress_haircut = st.number_input(
+                "Drift haircut (fraction removed)", min_value=0.0, max_value=1.0,
+                value=0.0, step=0.05,
+            )
+
         with st.expander("Advanced parameter overrides"):
             mu_override = st.text_input("mu override (annual, blank = estimate)", value="")
             sigma_override = st.text_input("sigma override (annual, blank = estimate)", value="")
@@ -238,16 +322,42 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
             f"mu={mu:.2%}, sigma={sigma:.2%}"
         )
 
-    config = build_config_from_inputs(
-        ticker=ticker, s0=market.s0, paths=int(paths), horizon=int(horizon),
-        mu=mu, sigma=sigma, chunk_size=int(chunk_size), seed=seed, cost=cost,
-    )
+    try:
+        config = build_config_from_inputs(
+            ticker=ticker, s0=market.s0, paths=int(paths), horizon=int(horizon),
+            mu=mu, sigma=sigma, chunk_size=int(chunk_size), seed=seed, cost=cost,
+            drift_mode=drift_mode, manual_drift=manual_drift,
+            historical_returns=market.daily_log_returns,
+            stress_enabled=stress_enabled,
+            stress_crash_pct=stress_crash,
+            stress_vol_multiplier=stress_vol_mult,
+            stress_drift_haircut=stress_haircut,
+            **model_inputs,
+        )
+    except ValueError as exc:
+        st.error(f"Invalid configuration: {exc}")
+        st.stop()
 
     # ---------------------- Run ----------------------
-    with st.spinner(f"Simulating {paths:,} paths in chunks of {chunk_size:,}..."):
+    with st.spinner(f"Running {config.model} on {paths:,} paths "
+                    f"in chunks of {chunk_size:,}..."):
         result = mc_core.simulate(config)
 
     s = result.stats
+
+    # ---------------------- Selected model & assumptions ----------------------
+    assumptions = mc_core.model_assumptions(config, market)
+    st.subheader("Selected model & assumptions")
+    st.info(
+        f"**Model:** {assumptions['model']}  |  **Drift mode:** {assumptions['drift_mode']}  "
+        f"|  **Volatility source:** {assumptions['volatility_source']}  |  "
+        f"**Effective mu/sigma:** {assumptions['effective_mu_annual']:.2%} / "
+        f"{assumptions['effective_sigma_annual']:.2%}"
+        + (f"  |  **Stress:** crash {assumptions['stress']['one_day_crash_pct']:.0%}, "
+           f"vol x{assumptions['stress']['vol_multiplier']:g}, "
+           f"drift haircut {assumptions['stress']['drift_haircut']:.0%}"
+           if assumptions["stress"]["enabled"] else "")
+    )
 
     # ---------------------- Headline metrics ----------------------
     c1, c2, c3, c4 = st.columns(4)
@@ -256,6 +366,16 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
     c2.metric("Median ending value", f"{s['median_value']:,.2f}")
     c3.metric("Probability of profit", f"{s['prob_profit']:.2%}")
     c4.metric("Probability of loss", f"{s['prob_loss']:.2%}")
+
+    # ---------------------- Probability buckets ----------------------
+    st.subheader("Probability buckets")
+    b1, b2, b3, b4, b5 = st.columns(5)
+    b1.metric("P(ending > +20%)", f"{s['prob_gain_20']:.2%}")
+    b2.metric("P(ending < -10%)", f"{s['prob_loss_10']:.2%}")
+    b3.metric("P(ending < -20%)", f"{s['prob_loss_20']:.2%}")
+    b4.metric(f"P({int(s['drawdown_threshold']*100)}% drawdown)",
+              f"{s.get('prob_drawdown', float('nan')):.2%}")
+    b5.metric("Worst 1% avg value", f"{s['worst_1pct_avg_value']:,.2f}")
 
     # ---------------------- Risk tables ----------------------
     st.subheader("Risk metrics (loss relative to starting price)")
