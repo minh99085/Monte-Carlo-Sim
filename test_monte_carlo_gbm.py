@@ -471,3 +471,126 @@ def test_invalid_config_raises(kwargs):
     base.update(kwargs)
     with pytest.raises(ValueError):
         mc_core.SimulationConfig(**base).validate()
+
+
+# ---------------------------------------------------------------------------
+# Parameter estimation (annualized mu / sigma)
+# ---------------------------------------------------------------------------
+
+
+def test_annualized_parameters_constant_growth():
+    # A series with constant daily growth g has zero volatility and a drift of
+    # ln(1 + g) * 252 (the 0.5*sigma^2 correction vanishes when sigma == 0).
+    g = 0.001
+    n = 600
+    prices = 100.0 * (1.0 + g) ** np.arange(n)
+    mu, sigma = mc_core.annualized_parameters(prices)
+    assert sigma == pytest.approx(0.0, abs=1e-9)
+    assert mu == pytest.approx(np.log(1.0 + g) * 252, rel=1e-6)
+
+
+def test_annualized_parameters_volatility_ordering():
+    rng = np.random.default_rng(0)
+    base = rng.normal(0.0, 0.01, size=2_000)
+    calm = 100.0 * np.exp(np.cumsum(base))
+    wild = 100.0 * np.exp(np.cumsum(base * 3.0))
+    _, sigma_calm = mc_core.annualized_parameters(calm)
+    _, sigma_wild = mc_core.annualized_parameters(wild)
+    assert sigma_wild > sigma_calm > 0
+
+
+def test_annualized_parameters_rejects_bad_input():
+    with pytest.raises(ValueError):
+        mc_core.annualized_parameters([100.0])
+    with pytest.raises(ValueError):
+        mc_core.annualized_parameters([100.0, -5.0, 110.0])
+
+
+# ---------------------------------------------------------------------------
+# Standalone million-path runner (run_gbm_million.py)
+# ---------------------------------------------------------------------------
+
+
+def test_run_gbm_million_imports():
+    import run_gbm_million  # noqa: F401
+
+    assert callable(run_gbm_million.run)
+    assert callable(run_gbm_million.build_config)
+    assert callable(run_gbm_million.summarize)
+
+
+def test_million_config_is_chunk_safe_without_running():
+    """A 1,000,000 x 252 run must never materialize the full matrix."""
+    import run_gbm_million as r
+
+    cfg = r.build_config(
+        ticker="AAPL", s0=100.0, mu=0.1, sigma=0.25,
+        paths=1_000_000, horizon=252, seed=42,
+        chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK_SIZE,
+    )
+    assert cfg.paths == 1_000_000
+    assert cfg.sample_paths <= r.MAX_SAMPLE_PATHS_ON_CHART
+
+    mem = mc_core.predict_memory(cfg)
+    assert mem.full_matrix_elements == 1_000_000 * (252 + 1)
+    assert mem.peak_matrix_elements == cfg.sample_paths * (252 + 1)
+    assert mem.peak_matrix_elements < mem.full_matrix_elements
+    assert mem.peak_vector_elements == cfg.chunk_size
+    assert mem.peak_vector_elements < cfg.paths
+    assert mem.is_chunk_safe
+
+
+def test_probability_buckets():
+    import run_gbm_million as r
+
+    s0 = 100.0
+    # 10 values: which exceed +20% (>120) and which fall below -10% (<90)?
+    fv = np.array([80.0, 85.0, 89.0, 95.0, 100.0, 110.0, 121.0, 130.0, 150.0, 200.0])
+    # > 120: 121, 130, 150, 200 -> 4/10
+    assert r.probability_gain(fv, s0, 0.20) == pytest.approx(0.4)
+    # < 90: 80, 85, 89 -> 3/10
+    assert r.probability_drop(fv, s0, 0.10) == pytest.approx(0.3)
+    # A gain bucket plus a loss bucket are mutually exclusive and <= 1.
+    assert r.probability_gain(fv, s0, 0.20) + r.probability_drop(fv, s0, 0.10) <= 1.0
+
+
+def test_summarize_has_required_fields():
+    import run_gbm_million as r
+
+    cfg = r.build_config(
+        ticker="TST", s0=100.0, mu=0.08, sigma=0.2,
+        paths=20_000, horizon=21, seed=7, chunk_size=10_000,
+    )
+    result = mc_core.simulate(cfg)
+    summary = r.summarize(result)
+    for field in (
+        "average_ending_price", "median_ending_price",
+        "percentile_1", "percentile_5", "percentile_95", "percentile_99",
+        "prob_gain_more_than_20pct", "prob_drop_more_than_10pct",
+        "chunk_safe",
+    ):
+        assert field in summary
+    assert summary["chunk_safe"] is True
+    assert 0.0 <= summary["prob_gain_more_than_20pct"] <= 1.0
+    assert 0.0 <= summary["prob_drop_more_than_10pct"] <= 1.0
+
+
+def test_write_outputs_creates_csv_json_png(tmp_path):
+    import run_gbm_million as r
+
+    cfg = r.build_config(
+        ticker="OUT", s0=100.0, mu=0.05, sigma=0.2,
+        paths=5_000, horizon=10, seed=3, chunk_size=2_500,
+    )
+    result = mc_core.simulate(cfg)
+    summary = r.summarize(result)
+    written = r.write_outputs(result, summary, outdir=str(tmp_path), make_chart=True)
+
+    assert set(written) == {"csv", "json", "png"}
+    for path in written.values():
+        assert __import__("os").path.exists(path)
+        assert __import__("os").path.getsize(path) > 0
+
+    parsed = json.loads(open(written["json"]).read())
+    assert parsed["ticker"] == "OUT"
+    assert "prob_gain_more_than_20pct" in parsed
