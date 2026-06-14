@@ -52,6 +52,54 @@ def test_path_mode_presets():
     assert mc_core.resolve_path_mode("Serious") == 1_000_000
 
 
+def test_app_resolve_path_count_defaults():
+    """The GUI helper resolves preset modes to their default path counts."""
+    import app
+
+    assert app.resolve_path_count("Preview") == 10_000
+    assert app.resolve_path_count("Standard") == 100_000
+    assert app.resolve_path_count("Serious") == 1_000_000
+
+
+def test_app_resolve_path_count_accepts_explicit_paths():
+    """The GUI helper accepts an explicitly edited path count."""
+    import app
+
+    # Preset modes remain editable across the safe range.
+    assert app.resolve_path_count("Preview", 12_345) == 12_345
+    assert app.resolve_path_count("Standard", 500_000) == 500_000
+    # Custom mode can configure 250,000 paths.
+    assert app.resolve_path_count("Custom", 250_000) == 250_000
+    # Tail-risk advanced accepts 2,000,000-5,000,000.
+    assert app.resolve_path_count("Tail-risk (advanced)", 2_000_000) == 2_000_000
+
+
+def test_app_resolve_path_count_enforces_bounds():
+    import app
+
+    with pytest.raises(ValueError):
+        app.resolve_path_count("Custom", 500)            # below custom min
+    with pytest.raises(ValueError):
+        app.resolve_path_count("Custom", 2_000_000)      # above custom max
+    with pytest.raises(ValueError):
+        app.resolve_path_count("Tail-risk (advanced)", 1_000_000)  # below tail min
+    with pytest.raises(ValueError):
+        app.resolve_path_count("Tail-risk (advanced)", 6_000_000)  # above tail max
+
+
+def test_app_path_mode_settings():
+    import app
+
+    for mode in ("Preview", "Standard", "Custom"):
+        lo, hi, default, step = app.path_mode_settings(mode)
+        assert lo == mc_core.CUSTOM_MIN_PATHS
+        assert hi == mc_core.CUSTOM_MAX_PATHS
+    lo, hi, default, step = app.path_mode_settings("Tail-risk (advanced)")
+    assert (lo, hi) == (mc_core.TAIL_RISK_MIN_PATHS, mc_core.TAIL_RISK_MAX_PATHS)
+    assert app.path_mode_settings("Preview")[2] == 10_000
+    assert app.path_mode_settings("Serious")[2] == 1_000_000
+
+
 def test_custom_mode_bounds():
     # Custom mode lets the user type any safe count from 1,000 to 1,000,000.
     assert mc_core.resolve_path_mode("Custom", 250_000) == 250_000
@@ -149,23 +197,42 @@ def test_serious_1m_is_chunk_safe():
     assert mem.is_chunk_safe
 
 
-def test_tail_risk_2m_allows_paths_but_still_chunks():
-    """Tail-risk mode allows 2,000,000 paths and stays chunk-safe."""
-    paths = mc_core.resolve_path_mode("Tail-risk (advanced)", 2_000_000)
+def test_tail_risk_2m_routes_through_chunking_without_running():
+    """Tail-risk configures 2,000,000 paths and stays chunk-safe.
+
+    Memory safety is asserted via ``predict_memory`` so the test stays fast and
+    never actually simulates 2,000,000 paths.
+    """
+    import app
+
+    paths = app.resolve_path_count("Tail-risk (advanced)", 2_000_000)
     assert paths == 2_000_000
+
     cfg = mc_core.SimulationConfig(
-        ticker="TAIL", s0=100.0, paths=paths, horizon=5,
-        mu=0.05, sigma=0.2, chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK, seed=5,
+        ticker="TAIL", s0=100.0, paths=paths, horizon=252,
+        mu=0.05, sigma=0.2, chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK,
         sample_paths=50,
     )
-    result = mc_core.simulate(cfg)
-    mem = result.memory
-    assert result.final_values.shape == (2_000_000,)
-    # Full matrix would be 2,000,000 * (5 + 1) elements; we must never build it.
+    mem = mc_core.predict_memory(cfg)
+    # A full 2,000,000 x (252 + 1) matrix must never be allocated.
+    assert mem.full_matrix_elements == 2_000_000 * (252 + 1)
+    assert mem.peak_matrix_elements == 50 * (252 + 1)
     assert mem.peak_matrix_elements < mem.full_matrix_elements
-    assert mem.peak_vector_elements <= cfg.chunk_size
+    assert mem.peak_vector_elements == cfg.chunk_size
     assert mem.peak_vector_elements < cfg.paths
     assert mem.is_chunk_safe
+
+
+def test_predict_memory_matches_simulate():
+    """predict_memory must agree with the accounting done inside simulate."""
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=30_000, horizon=12, chunk_size=8_000, seed=1, sample_paths=40
+    )
+    predicted = mc_core.predict_memory(cfg)
+    actual = mc_core.simulate(cfg).memory
+    assert predicted.peak_matrix_elements == actual.peak_matrix_elements
+    assert predicted.peak_vector_elements == actual.peak_vector_elements
+    assert predicted.is_chunk_safe == actual.is_chunk_safe
 
 
 def test_serious_chunk_default_in_recommended_range():
