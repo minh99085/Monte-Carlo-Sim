@@ -686,6 +686,333 @@ def test_exports_include_model_metadata():
 
 
 # ---------------------------------------------------------------------------
+# Advanced models: Heston, GARCH(1,1), Kou
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model", [
+    mc_core.MODEL_HESTON, mc_core.MODEL_GARCH, mc_core.MODEL_KOU,
+])
+def test_advanced_models_run_small(model):
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=10_000, horizon=30, mu=0.10, sigma=0.30,
+        chunk_size=2_500, seed=11, model=model,
+    )
+    result = mc_core.simulate(cfg)
+    assert result.final_values.shape == (10_000,)
+    assert np.all(np.isfinite(result.final_values))
+    assert np.all(result.final_values > 0)
+    assert result.memory.is_chunk_safe
+    assert result.stats["model"] == model
+
+
+@pytest.mark.parametrize("model", [
+    mc_core.MODEL_HESTON, mc_core.MODEL_GARCH, mc_core.MODEL_KOU,
+])
+def test_advanced_models_reproducible(model):
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=5_000, horizon=20, mu=0.08, sigma=0.25,
+        chunk_size=2_000, seed=7, model=model,
+    )
+    r1 = mc_core.simulate(cfg)
+    r2 = mc_core.simulate(cfg)
+    assert np.array_equal(r1.final_values, r2.final_values)
+
+
+def test_heston_variance_never_negative():
+    # Aggressive params (high vol-of-vol, low kappa) stress the variance process.
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=4_000, horizon=60, mu=0.05, sigma=0.4,
+        chunk_size=1_000, seed=3, model=mc_core.MODEL_HESTON,
+        heston_kappa=0.5, heston_xi=2.0, heston_rho=-0.8,
+    )
+    init_chunk, step = mc_core._build_step_engine(cfg)
+    rng = np.random.default_rng(0)
+    n = 2_000
+    state = init_chunk(rng, n)
+    for i in range(1, 80):
+        step(rng, n, state, i)
+        assert np.all(state["v"] >= 0.0)  # full-truncation keeps variance >= 0
+
+
+def test_garch_variance_stays_positive():
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=2_000, horizon=40, mu=0.05, sigma=0.3,
+        chunk_size=1_000, seed=2, model=mc_core.MODEL_GARCH,
+        garch_alpha=0.1, garch_beta=0.88,
+    )
+    init_chunk, step = mc_core._build_step_engine(cfg)
+    rng = np.random.default_rng(0)
+    n = 1_500
+    state = init_chunk(rng, n)
+    for i in range(1, 60):
+        step(rng, n, state, i)
+        assert np.all(state["var"] > 0.0)
+
+
+def test_garch_requires_stationarity():
+    with pytest.raises(ValueError):
+        mc_core.SimulationConfig(
+            s0=100.0, paths=10, horizon=5, model=mc_core.MODEL_GARCH,
+            garch_alpha=0.5, garch_beta=0.6,
+        ).validate()
+
+
+def test_kou_asymmetric_jump_params_in_assumptions():
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=2_000, horizon=20, model=mc_core.MODEL_KOU,
+        kou_intensity=3.0, kou_p_up=0.3, kou_eta_up=20.0, kou_eta_down=10.0,
+    )
+    a = mc_core.model_assumptions(cfg)
+    assert a["kou"]["intensity"] == 3.0
+    assert a["kou"]["p_up"] == 0.3
+    assert a["kou"]["eta_up"] == 20.0
+    assert a["kou"]["eta_down"] == 10.0
+    # Asymmetry: up and down rates differ.
+    assert a["kou"]["eta_up"] != a["kou"]["eta_down"]
+
+
+def test_kou_validation():
+    with pytest.raises(ValueError):
+        mc_core.SimulationConfig(
+            s0=100.0, paths=10, horizon=5, model=mc_core.MODEL_KOU, kou_eta_up=0.5
+        ).validate()
+
+
+def test_new_models_million_path_chunk_safe_without_running():
+    for model in (mc_core.MODEL_HESTON, mc_core.MODEL_GARCH, mc_core.MODEL_KOU):
+        cfg = mc_core.SimulationConfig(
+            s0=100.0, paths=1_000_000, horizon=252,
+            chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK_SIZE, model=model,
+        )
+        mem = mc_core.predict_memory(cfg)
+        assert mem.is_chunk_safe
+        assert mem.peak_matrix_elements < mem.full_matrix_elements
+
+
+# ---------------------------------------------------------------------------
+# EVT tail-risk module
+# ---------------------------------------------------------------------------
+
+
+def test_evt_on_synthetic_fat_tails():
+    rng = np.random.default_rng(0)
+    losses = rng.standard_t(3, size=20_000)  # fat-tailed
+    evt = mc_core.evt_tail_risk(losses, threshold_pct=90.0)
+    assert evt["error"] is None
+    assert evt["n_exceedances"] > 0
+    for key in ("95", "99", "99.5", "99.9"):
+        assert key in evt["var"]
+        assert key in evt["es"]
+    # Tail loss grows with confidence; ES >= VaR at the same level.
+    assert evt["var"]["95"] < evt["var"]["99"] < evt["var"]["99.9"]
+    assert evt["es"]["99"] >= evt["var"]["99"]
+
+
+def test_evt_warns_when_too_few_exceedances():
+    rng = np.random.default_rng(1)
+    losses = rng.normal(0, 1, size=300)
+    evt = mc_core.evt_tail_risk(losses, threshold_pct=99.0, min_exceedances=50)
+    assert evt["warning"] is not None
+
+
+def test_gpd_fit_returns_finite_params():
+    rng = np.random.default_rng(2)
+    exceed = rng.exponential(1.0, size=1000)
+    xi, beta = mc_core.gpd_fit_mom(exceed)
+    assert np.isfinite(xi) and np.isfinite(beta)
+    assert beta > 0
+
+
+def test_evt_from_result():
+    cfg = mc_core.SimulationConfig(s0=100.0, paths=10_000, horizon=20, seed=5)
+    result = mc_core.simulate(cfg)
+    evt = mc_core.evt_from_result(result, threshold_pct=90.0)
+    assert "var" in evt and "es" in evt
+
+
+# ---------------------------------------------------------------------------
+# Variance reduction
+# ---------------------------------------------------------------------------
+
+
+def test_variance_reduction_method_recorded():
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=4_000, horizon=20, seed=1,
+        variance_reduction=mc_core.VR_ANTITHETIC,
+    )
+    result = mc_core.simulate(cfg)
+    assert result.stats["variance_reduction"] == mc_core.VR_ANTITHETIC
+    report = json.loads(mc_core.report_to_json(result))
+    assert report["variance_reduction_method"] == mc_core.VR_ANTITHETIC
+
+
+def test_variance_reduction_reproducible():
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=6_000, horizon=20, seed=42,
+        variance_reduction=mc_core.VR_ANTITHETIC,
+    )
+    r1 = mc_core.simulate(cfg)
+    r2 = mc_core.simulate(cfg)
+    assert np.array_equal(r1.final_values, r2.final_values)
+
+
+def test_variance_reduction_diagnostics_reduce_error():
+    cfg = mc_core.SimulationConfig(s0=100.0, horizon=252, mu=0.1, sigma=0.3, seed=1)
+    diag = mc_core.variance_reduction_diagnostics(cfg, path_counts=(2_000, 5_000))
+    assert diag["analytic_expected_value"] > 0
+    row = diag["rows"][0]
+    # Control variate should sharply cut the standard error vs plain MC.
+    assert row["control_variate_se_ratio"] < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Advanced risk metrics
+# ---------------------------------------------------------------------------
+
+
+def test_risk_metrics_present_and_sane():
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=10_000, horizon=60, mu=0.1, sigma=0.3, seed=4,
+        ruin_threshold=0.7,
+    )
+    s = mc_core.simulate(cfg).stats
+    for key in ("sharpe_annual", "sortino_annual", "calmar", "kelly_fraction",
+                "mean_max_drawdown", "mean_drawdown_duration", "prob_ruin",
+                "annualized_return", "kelly_warning"):
+        assert key in s
+    assert 0.0 <= s["prob_ruin"] <= 1.0
+    assert 0.0 <= s["mean_max_drawdown"] <= 1.0
+
+
+def test_prob_ruin_detects_guaranteed_ruin():
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=2_000, horizon=10, mu=0.0, sigma=0.1, seed=1,
+        ruin_threshold=0.6, stress_enabled=True, stress_crash_pct=0.5,
+    )
+    s = mc_core.simulate(cfg).stats
+    assert s["prob_ruin"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Portfolio mode
+# ---------------------------------------------------------------------------
+
+
+def test_portfolio_simulation_smoke():
+    rng = np.random.default_rng(0)
+    returns = {
+        "AAPL": rng.normal(0.0005, 0.02, 504),
+        "MSFT": rng.normal(0.0004, 0.018, 504),
+    }
+    s0 = {"AAPL": 190.0, "MSFT": 410.0}
+    pf = mc_core.simulate_portfolio(
+        returns, s0_by_ticker=s0, paths=10_000, horizon=60,
+        chunk_size=2_500, seed=2,
+    )
+    assert pf["tickers"] == ["AAPL", "MSFT"]
+    assert pf["portfolio_values"].shape == (10_000,)
+    assert np.all(pf["portfolio_values"] > 0)
+    assert pf["chunk_safe"]
+    assert pf["peak_block_elements"] < pf["full_block_elements"]
+    assert len(pf["correlation_matrix"]) == 2
+    # Equal-weight default.
+    assert pf["weights"] == pytest.approx([0.5, 0.5])
+    assert "var" in pf["statistics"]
+
+
+def test_portfolio_correlated_returns_have_expected_correlation():
+    rng = np.random.default_rng(0)
+    base = rng.normal(0.0003, 0.02, 1000)
+    returns = {"A": base + rng.normal(0, 0.002, 1000),
+               "B": base + rng.normal(0, 0.002, 1000)}  # strongly correlated
+    pf = mc_core.simulate_portfolio(returns, paths=2_000, horizon=20, seed=1)
+    assert pf["correlation_matrix"][0][1] > 0.5
+
+
+def test_cholesky_safe_repairs_non_pd():
+    # A non-PD "correlation" matrix should be repaired with jitter.
+    bad = np.array([[1.0, 1.2], [1.2, 1.0]])
+    L, jittered = mc_core.cholesky_safe(bad)
+    assert jittered
+    assert np.all(np.isfinite(L))
+
+
+def test_shrink_covariance_method_label():
+    rng = np.random.default_rng(0)
+    X = rng.normal(0, 0.02, size=(300, 3))
+    cov, method = mc_core.shrink_covariance(X)
+    assert cov.shape == (3, 3)
+    assert method in ("ledoit_wolf", "diagonal_shrinkage")
+
+
+# ---------------------------------------------------------------------------
+# Model validation / backtest + warnings
+# ---------------------------------------------------------------------------
+
+
+def test_backtest_percentile_bands_coverage():
+    rng = np.random.default_rng(0)
+    prices = 100.0 * np.exp(np.cumsum(rng.normal(0.0003, 0.02, 1500)))
+    bt = mc_core.backtest_percentile_bands(prices, horizon=21)
+    assert bt["n_windows"] > 0
+    assert 0.0 <= bt["coverage"] <= 1.0
+
+
+def test_warnings_flag_high_drift_and_short_history():
+    cfg = mc_core.SimulationConfig(s0=100.0, mu=2.0, sigma=0.3)  # 200% drift
+    short_market = mc_core.MarketParameters(
+        s0=100.0, mu=2.0, sigma=0.3, source="yfinance",
+        daily_log_returns=np.zeros(50),
+    )
+    warns = mc_core.collect_warnings(cfg, short_market)
+    text = " ".join(warns)
+    assert "drift" in text.lower()
+    assert "short-history" in text.lower() or "short history" in text.lower()
+
+
+# ---------------------------------------------------------------------------
+# Export metadata (math version, warnings, varred, EVT, new params)
+# ---------------------------------------------------------------------------
+
+
+def test_export_includes_math_version_and_metadata():
+    cfg = mc_core.SimulationConfig(
+        ticker="AAPL", s0=100.0, paths=5_000, horizon=20, seed=1,
+        model=mc_core.MODEL_HESTON, variance_reduction=mc_core.VR_ANTITHETIC,
+    )
+    result = mc_core.simulate(cfg)
+    evt = mc_core.evt_from_result(result)
+    report = json.loads(mc_core.report_to_json(result, evt=evt))
+    assert report["math_model_version"] == mc_core.MATH_MODEL_VERSION
+    assert report["variance_reduction_method"] == mc_core.VR_ANTITHETIC
+    assert "warnings" in report
+    assert "evt" in report
+    assert report["model"]["heston"]["kappa"] == cfg.heston_kappa
+
+    csv_text = mc_core.report_to_csv(result)
+    assert "math_model_version" in csv_text
+    assert "variance_reduction_method" in csv_text
+    assert "heston_kappa" in csv_text
+    assert "prob_ruin" in csv_text
+    assert "sharpe_annual" in csv_text
+
+
+def test_comparison_includes_new_models_and_columns():
+    cfg = _comparison_base_config()
+    models = [mc_core.MODEL_GBM, mc_core.MODEL_HESTON, mc_core.MODEL_KOU]
+    report = mc_core.compare_models(cfg, models=models, evt=True)
+    assert report.models == models
+    for row in report.rows:
+        for col in ("evt_var_99", "evt_es_99", "max_drawdown_prob", "prob_ruin",
+                    "sharpe", "sortino", "disagreement_rank"):
+            assert col in row
+    # Disagreement ranks are a permutation of 1..len(models).
+    ranks = sorted(r["disagreement_rank"] for r in report.rows)
+    assert ranks == list(range(1, len(models) + 1))
+
+
+# ---------------------------------------------------------------------------
 # Model comparison dashboard / batch export
 # ---------------------------------------------------------------------------
 
@@ -703,9 +1030,9 @@ def test_compare_models_runs_all_six():
     report = mc_core.compare_models(_comparison_base_config())
     assert report.models == list(mc_core.MODELS)
     assert len(report.rows) == len(mc_core.MODELS)
-    # Every row exposes the same comparable columns.
+    # Every row exposes (at least) the comparable columns.
     for row in report.rows:
-        assert set(row.keys()) == set(mc_core.COMPARISON_COLUMNS)
+        assert set(mc_core.COMPARISON_COLUMNS).issubset(row.keys())
         assert row["model"] in mc_core.MODELS
         assert np.isfinite(row["expected_ending_value"])
         assert 0.0 <= row["prob_loss_20"] <= 1.0
@@ -738,8 +1065,20 @@ def test_compare_models_million_paths_chunk_safe_without_running():
         assert mem.peak_matrix_elements < mem.full_matrix_elements
 
 
-def _rows_without_runtime(rows):
-    return [{k: v for k, v in row.items() if k != "runtime_seconds"} for row in rows]
+def _stable_rows(rows):
+    # Drop the measured runtime and NaN-valued (EVT-disabled) placeholders so the
+    # comparison is over deterministic fields only.
+    out = []
+    for row in rows:
+        clean = {}
+        for k, v in row.items():
+            if k == "runtime_seconds":
+                continue
+            if isinstance(v, float) and np.isnan(v):
+                continue
+            clean[k] = v
+        out.append(clean)
+    return out
 
 
 def test_compare_models_reproducible_with_seed():
@@ -747,7 +1086,7 @@ def test_compare_models_reproducible_with_seed():
     r1 = mc_core.compare_models(cfg)
     r2 = mc_core.compare_models(cfg)
     # Everything except the measured wall-clock runtime must be identical.
-    assert _rows_without_runtime(r1.rows) == _rows_without_runtime(r2.rows)
+    assert _stable_rows(r1.rows) == _stable_rows(r2.rows)
     assert r1.most_conservative == r2.most_conservative
 
 
