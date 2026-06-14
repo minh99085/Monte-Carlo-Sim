@@ -146,6 +146,19 @@ python monte_carlo_gbm.py BTC-USD --model "Merton Jump-Diffusion" --crypto-jumps
   --stress --stress-crash 0.2 --stress-vol-mult 1.5 --no-chart
 ```
 
+## Model comparison
+
+The GUI has a **Model comparison** tab: pick any subset of the six models (all
+selected by default) and run them on identical ticker/paths/horizon/chunk/seed/
+drift settings. The comparison table shows, per model, expected and median
+ending value, P(profit)/P(loss), P(gain > 20%), P(loss > 10%), P(loss > 20%),
+P(50% drawdown), the 5th/95th percentiles, 99% VaR and 99% Expected Shortfall,
+runtime, and chunk-safe status. It highlights the **most conservative model**
+(highest P(loss > 20%), then highest 99% Expected Shortfall) and exports the
+comparison as **CSV** and **JSON** (the JSON includes per-model assumptions and
+memory/chunk-safety metadata). Every comparison run uses the same chunk-safe
+engine, so no full path × step matrix is ever allocated.
+
 ## Memory safety notes
 
 - Default **Serious-mode chunk size is 25,000–50,000 paths**, which bounds peak
