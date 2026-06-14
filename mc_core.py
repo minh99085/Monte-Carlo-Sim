@@ -40,13 +40,19 @@ import numpy as np
 TRADING_DAYS_PER_YEAR = 252
 
 # Path-mode presets exposed by the GUI/CLI.  ``None`` means "user supplied"
-# (the tail-risk advanced mode where the caller picks 2,000,000-5,000,000).
+# (``Custom`` picks 1,000-1,000,000; ``Tail-risk (advanced)`` picks
+# 2,000,000-5,000,000).
 PATH_MODES: Dict[str, Optional[int]] = {
     "Preview": 10_000,
     "Standard": 100_000,
     "Serious": 1_000_000,
+    "Custom": None,
     "Tail-risk (advanced)": None,
 }
+
+# Custom mode bounds (inclusive): any safe path count up to the serious preset.
+CUSTOM_MIN_PATHS = 1_000
+CUSTOM_MAX_PATHS = 1_000_000
 
 # Advanced tail-risk mode bounds (inclusive).
 TAIL_RISK_MIN_PATHS = 2_000_000
@@ -594,22 +600,36 @@ def write_json(result: SimulationResult, path: str,
 # ---------------------------------------------------------------------------
 
 
-def resolve_path_mode(mode: str, advanced_paths: Optional[int] = None) -> int:
-    """Translate a path-mode label into a concrete path count."""
+def resolve_path_mode(mode: str, explicit_paths: Optional[int] = None) -> int:
+    """Translate a path-mode label into a concrete path count.
+
+    Preset modes (Preview/Standard/Serious) ignore ``explicit_paths`` unless
+    none of the presets apply.  ``Custom`` and ``Tail-risk (advanced)`` require
+    ``explicit_paths`` and validate it against their respective safe ranges.
+    """
 
     if mode not in PATH_MODES:
         raise ValueError(f"Unknown path mode: {mode!r}")
     preset = PATH_MODES[mode]
     if preset is not None:
         return preset
-    if advanced_paths is None:
-        raise ValueError("Tail-risk (advanced) mode requires an explicit path count")
-    if not (TAIL_RISK_MIN_PATHS <= advanced_paths <= TAIL_RISK_MAX_PATHS):
+    if explicit_paths is None:
+        raise ValueError(f"{mode} mode requires an explicit path count")
+    explicit_paths = int(explicit_paths)
+    if mode == "Custom":
+        if not (CUSTOM_MIN_PATHS <= explicit_paths <= CUSTOM_MAX_PATHS):
+            raise ValueError(
+                f"Custom paths must be between {CUSTOM_MIN_PATHS:,} and "
+                f"{CUSTOM_MAX_PATHS:,}"
+            )
+        return explicit_paths
+    # Tail-risk (advanced)
+    if not (TAIL_RISK_MIN_PATHS <= explicit_paths <= TAIL_RISK_MAX_PATHS):
         raise ValueError(
             f"Tail-risk paths must be between {TAIL_RISK_MIN_PATHS:,} and "
             f"{TAIL_RISK_MAX_PATHS:,}"
         )
-    return advanced_paths
+    return explicit_paths
 
 
 def tail_risk_warning(paths: int) -> Optional[str]:
