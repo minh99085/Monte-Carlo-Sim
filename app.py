@@ -301,49 +301,66 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
     preview_mem = mc_core.predict_memory(preview_cfg)
     st.info(preview_mem.status())
 
-    if not run_clicked:
+    # ------------------------------------------------------------------
+    # Run only when the button is clicked; persist the result in
+    # session_state so later reruns (e.g. clicking a download button) keep
+    # showing the results instead of resetting to the initial screen.
+    # ------------------------------------------------------------------
+    if run_clicked:
+        with st.spinner(f"Fetching parameters for {ticker}..."):
+            market = mc_core.estimate_parameters_from_history(
+                ticker, years=years,
+                s0_override=(s0_override if s0_override > 0 else None),
+            )
+        mu = float(mu_override) if mu_override.strip() else market.mu
+        sigma = float(sigma_override) if sigma_override.strip() else market.sigma
+
+        try:
+            config = build_config_from_inputs(
+                ticker=ticker, s0=market.s0, paths=int(paths), horizon=int(horizon),
+                mu=mu, sigma=sigma, chunk_size=int(chunk_size), seed=seed, cost=cost,
+                drift_mode=drift_mode, manual_drift=manual_drift,
+                historical_returns=market.daily_log_returns,
+                stress_enabled=stress_enabled,
+                stress_crash_pct=stress_crash,
+                stress_vol_multiplier=stress_vol_mult,
+                stress_drift_haircut=stress_haircut,
+                **model_inputs,
+            )
+        except ValueError as exc:
+            st.error(f"Invalid configuration: {exc}")
+            st.stop()
+
+        with st.spinner(f"Running {config.model} on {paths:,} paths "
+                        f"in chunks of {chunk_size:,}..."):
+            result = mc_core.simulate(config)
+
+        st.session_state["mc_result"] = result
+        st.session_state["mc_market"] = market
+
+    # Render from the stored result so downloads/reruns never lose it.
+    result = st.session_state.get("mc_result")
+    market = st.session_state.get("mc_market")
+    if result is None:
         st.write("Configure inputs in the sidebar and click **Run simulation**.")
         return
 
-    # ---------------------- Resolve market parameters ----------------------
-    with st.spinner(f"Fetching parameters for {ticker}..."):
-        market = mc_core.estimate_parameters_from_history(
-            ticker, years=years,
-            s0_override=(s0_override if s0_override > 0 else None),
-        )
-    mu = float(mu_override) if mu_override.strip() else market.mu
-    sigma = float(sigma_override) if sigma_override.strip() else market.sigma
-
-    if market.source == "fallback":
-        st.warning(f"Market data unavailable; using fallback parameters. {market.note}")
-    else:
-        st.success(
-            f"Estimated from {market.source}: S0={market.s0:,.2f}, "
-            f"mu={mu:.2%}, sigma={sigma:.2%}"
-        )
-
-    try:
-        config = build_config_from_inputs(
-            ticker=ticker, s0=market.s0, paths=int(paths), horizon=int(horizon),
-            mu=mu, sigma=sigma, chunk_size=int(chunk_size), seed=seed, cost=cost,
-            drift_mode=drift_mode, manual_drift=manual_drift,
-            historical_returns=market.daily_log_returns,
-            stress_enabled=stress_enabled,
-            stress_crash_pct=stress_crash,
-            stress_vol_multiplier=stress_vol_mult,
-            stress_drift_haircut=stress_haircut,
-            **model_inputs,
-        )
-    except ValueError as exc:
-        st.error(f"Invalid configuration: {exc}")
-        st.stop()
-
-    # ---------------------- Run ----------------------
-    with st.spinner(f"Running {config.model} on {paths:,} paths "
-                    f"in chunks of {chunk_size:,}..."):
-        result = mc_core.simulate(config)
-
+    config = result.config
     s = result.stats
+    paths = config.paths
+    chunk_size = config.chunk_size
+
+    # ---------------------- Data source notice ----------------------
+    if market is not None:
+        if market.source == "fallback":
+            st.warning(
+                f"Market data unavailable; using fallback parameters. {market.note}"
+            )
+        else:
+            st.success(
+                f"Estimated from {market.source}: S0={config.s0:,.2f}, "
+                f"mu={config.mu:.2%}, sigma={config.sigma:.2%}"
+            )
 
     # ---------------------- Selected model & assumptions ----------------------
     assumptions = mc_core.model_assumptions(config, market)
