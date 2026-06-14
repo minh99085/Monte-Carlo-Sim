@@ -90,26 +90,55 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
             min_value=0.0, value=0.0, step=1.0,
         )
 
-        st.subheader("Path mode")
-        mode = st.selectbox("Mode", list(mc_core.PATH_MODES.keys()), index=1)
-        advanced_paths = None
-        if mode == "Tail-risk (advanced)":
-            advanced_paths = st.number_input(
-                "Tail-risk paths (2,000,000 - 5,000,000)",
-                min_value=mc_core.TAIL_RISK_MIN_PATHS,
-                max_value=mc_core.TAIL_RISK_MAX_PATHS,
-                value=mc_core.TAIL_RISK_MIN_PATHS,
-                step=500_000,
-            )
-        try:
-            paths = mc_core.resolve_path_mode(mode, advanced_paths)
-        except ValueError as exc:
-            st.error(str(exc))
-            st.stop()
+        st.subheader("Paths")
+        mode = st.selectbox(
+            "Path mode", list(mc_core.PATH_MODES.keys()), index=1, key="path_mode",
+            help=(
+                "Preview/Standard/Serious prefill a preset you can still edit. "
+                "Custom: 1,000-1,000,000. Tail-risk advanced: 2,000,000-5,000,000."
+            ),
+        )
 
-        warn = mc_core.tail_risk_warning(paths)
-        if warn:
-            st.warning(warn)
+        # Per-mode editable range and the value to prefill when the mode changes.
+        if mode == "Tail-risk (advanced)":
+            min_paths, max_paths = mc_core.TAIL_RISK_MIN_PATHS, mc_core.TAIL_RISK_MAX_PATHS
+            default_paths = mc_core.TAIL_RISK_MIN_PATHS
+            path_step = 500_000
+        elif mode == "Custom":
+            min_paths, max_paths = mc_core.CUSTOM_MIN_PATHS, mc_core.CUSTOM_MAX_PATHS
+            default_paths = 250_000
+            path_step = 5_000
+        else:  # Preview / Standard / Serious presets
+            min_paths, max_paths = mc_core.CUSTOM_MIN_PATHS, mc_core.CUSTOM_MAX_PATHS
+            default_paths = mc_core.PATH_MODES[mode]
+            path_step = 1_000
+
+        # Snap the editable field to the mode's default whenever the mode changes,
+        # but otherwise preserve whatever the user typed.
+        if st.session_state.get("_last_path_mode") != mode:
+            st.session_state["num_paths"] = int(default_paths)
+            st.session_state["_last_path_mode"] = mode
+
+        paths = int(st.number_input(
+            "Number of paths",
+            min_value=int(min_paths),
+            max_value=int(max_paths),
+            step=int(path_step),
+            key="num_paths",
+            help="Type any value within the selected mode's safe range.",
+        ))
+        st.caption(f"Selected paths: {paths:,}")
+
+        if mode == "Tail-risk (advanced)":
+            st.warning(
+                "TAIL-RISK ADVANCED MODE: this allocates very large simulations "
+                "(2,000,000-5,000,000 paths). It is CPU/RAM intensive and slower. "
+                "Chunked execution keeps memory bounded, but expect a longer runtime."
+            )
+        else:
+            warn = mc_core.tail_risk_warning(paths)
+            if warn:
+                st.warning(warn)
 
         st.subheader("Simulation")
         horizon = st.number_input(
