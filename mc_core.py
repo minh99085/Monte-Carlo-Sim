@@ -87,6 +87,83 @@ FALLBACK_SIGMA = 0.20   # annualized volatility
 
 
 # ---------------------------------------------------------------------------
+# Model catalogue
+# ---------------------------------------------------------------------------
+
+MODEL_GBM = "GBM Normal"
+MODEL_STUDENT_T = "Student-t GBM"
+MODEL_HIST_BOOTSTRAP = "Historical Bootstrap"
+MODEL_BLOCK_BOOTSTRAP = "Block Bootstrap"
+MODEL_MERTON = "Merton Jump-Diffusion"
+MODEL_REGIME = "Regime Switching"
+
+MODELS = (
+    MODEL_GBM,
+    MODEL_STUDENT_T,
+    MODEL_HIST_BOOTSTRAP,
+    MODEL_BLOCK_BOOTSTRAP,
+    MODEL_MERTON,
+    MODEL_REGIME,
+)
+
+# Models that need a historical daily-return series to run.
+BOOTSTRAP_MODELS = (MODEL_HIST_BOOTSTRAP, MODEL_BLOCK_BOOTSTRAP)
+
+# ---------------------------------------------------------------------------
+# Conservative drift modes
+# ---------------------------------------------------------------------------
+
+DRIFT_HISTORICAL = "Historical drift"
+DRIFT_HALF = "Half historical drift"
+DRIFT_ZERO = "Zero drift"
+DRIFT_MANUAL = "Manual drift"
+
+DRIFT_MODES = (DRIFT_HISTORICAL, DRIFT_HALF, DRIFT_ZERO, DRIFT_MANUAL)
+
+# ---------------------------------------------------------------------------
+# Merton jump-diffusion presets (per-year jump intensity, mean, vol)
+# ---------------------------------------------------------------------------
+
+JUMP_PRESETS = {
+    "stock": {"intensity": 1.0, "mean": -0.02, "vol": 0.05},
+    "crypto": {"intensity": 6.0, "mean": -0.03, "vol": 0.12},
+}
+
+# ---------------------------------------------------------------------------
+# Regime-switching presets.  Each regime carries a drift multiplier and a
+# volatility multiplier applied to the base (mu, sigma); ``transition`` is a
+# row-stochastic matrix P[i, j] = P(next regime j | current regime i).
+# Regime order: 0 = normal, 1 = high-volatility, 2 = crash/bear.
+# ---------------------------------------------------------------------------
+
+REGIME_PRESETS = {
+    "stock": {
+        "names": ("normal", "high-vol", "crash"),
+        "mu_factors": (1.0, 0.3, -4.0),
+        "sigma_factors": (1.0, 1.8, 3.0),
+        "transition": (
+            (0.970, 0.027, 0.003),
+            (0.050, 0.930, 0.020),
+            (0.100, 0.200, 0.700),
+        ),
+    },
+    "crypto": {
+        "names": ("normal", "high-vol", "crash"),
+        "mu_factors": (1.0, 0.2, -5.0),
+        "sigma_factors": (1.3, 2.5, 4.0),
+        "transition": (
+            (0.940, 0.050, 0.010),
+            (0.060, 0.900, 0.040),
+            (0.080, 0.250, 0.670),
+        ),
+    },
+}
+
+# Default threshold for the "probability of a large drawdown" metric.
+DRAWDOWN_THRESHOLD = 0.50
+
+
+# ---------------------------------------------------------------------------
 # Configuration / result containers
 # ---------------------------------------------------------------------------
 
@@ -108,6 +185,37 @@ class SimulationConfig:
     sample_paths: int = 50             # full trajectories retained for plotting
     convergence_points: int = 200      # points sampled for the convergence curve
 
+    # ---- Model selection & realism knobs -------------------------------
+    model: str = MODEL_GBM
+
+    # Conservative drift mode.
+    drift_mode: str = DRIFT_HISTORICAL
+    manual_drift: Optional[float] = None      # used when drift_mode == DRIFT_MANUAL
+
+    # Student-t GBM.
+    t_df: float = 5.0                         # degrees of freedom (> 2)
+
+    # Bootstrap models (daily log returns sampled from history).
+    historical_returns: Optional[np.ndarray] = None
+    block_length: int = 20                    # block bootstrap block size (days)
+
+    # Merton jump-diffusion (annualized intensity; per-jump mean/vol in log space).
+    jump_intensity: float = 1.0
+    jump_mean: float = -0.02
+    jump_vol: float = 0.05
+
+    # Regime switching.
+    regime_preset: str = "stock"
+
+    # Deterministic stress overlay (applied on top of any model).
+    stress_enabled: bool = False
+    stress_crash_pct: float = 0.0             # one-day crash, e.g. 0.20 == -20%
+    stress_vol_multiplier: float = 1.0
+    stress_drift_haircut: float = 0.0         # fraction of drift removed [0, 1]
+
+    # Threshold (fraction) for the large-drawdown probability metric.
+    drawdown_threshold: float = DRAWDOWN_THRESHOLD
+
     def validate(self) -> "SimulationConfig":
         if self.paths < 1:
             raise ValueError("paths must be >= 1")
@@ -125,7 +233,52 @@ class SimulationConfig:
             raise ValueError("cost must be in [0, 1)")
         if self.sample_paths < 0:
             raise ValueError("sample_paths must be >= 0")
+        if self.model not in MODELS:
+            raise ValueError(f"Unknown model: {self.model!r}")
+        if self.drift_mode not in DRIFT_MODES:
+            raise ValueError(f"Unknown drift_mode: {self.drift_mode!r}")
+        if self.model == MODEL_STUDENT_T and self.t_df <= 2.0:
+            raise ValueError("Student-t degrees of freedom must be > 2")
+        if self.model in BOOTSTRAP_MODELS:
+            if self.historical_returns is None or np.asarray(self.historical_returns).size < 2:
+                raise ValueError(
+                    f"{self.model} requires historical_returns (>= 2 daily returns)"
+                )
+        if self.model == MODEL_BLOCK_BOOTSTRAP and self.block_length < 1:
+            raise ValueError("block_length must be >= 1")
+        if self.model == MODEL_MERTON and self.jump_intensity < 0:
+            raise ValueError("jump_intensity must be >= 0")
+        if self.model == MODEL_REGIME and self.regime_preset not in REGIME_PRESETS:
+            raise ValueError(f"Unknown regime_preset: {self.regime_preset!r}")
+        if not (0.0 <= self.stress_crash_pct < 1.0):
+            raise ValueError("stress_crash_pct must be in [0, 1)")
+        if self.stress_vol_multiplier <= 0:
+            raise ValueError("stress_vol_multiplier must be > 0")
+        if not (0.0 <= self.stress_drift_haircut <= 1.0):
+            raise ValueError("stress_drift_haircut must be in [0, 1]")
         return self
+
+    # ------------------------------------------------------------------
+    # Derived drift / volatility (drift mode + stress overlay applied)
+    # ------------------------------------------------------------------
+    def effective_mu(self) -> float:
+        if self.drift_mode == DRIFT_HISTORICAL:
+            base = self.mu
+        elif self.drift_mode == DRIFT_HALF:
+            base = 0.5 * self.mu
+        elif self.drift_mode == DRIFT_ZERO:
+            base = 0.0
+        else:  # DRIFT_MANUAL
+            base = self.mu if self.manual_drift is None else float(self.manual_drift)
+        if self.stress_enabled:
+            base *= (1.0 - self.stress_drift_haircut)
+        return base
+
+    def effective_sigma(self) -> float:
+        sigma = self.sigma
+        if self.stress_enabled:
+            sigma *= self.stress_vol_multiplier
+        return sigma
 
 
 @dataclass
@@ -217,6 +370,7 @@ class MarketParameters:
     sigma: float
     source: str          # "yfinance" or "fallback"
     note: str = ""
+    daily_log_returns: Optional[np.ndarray] = None  # for bootstrap models
 
 
 def annualized_parameters(prices) -> "tuple[float, float]":
@@ -285,13 +439,23 @@ def estimate_parameters_from_history(
             raise ValueError("insufficient price history")
 
         mu, sigma = annualized_parameters(prices)
+        log_ret = np.diff(np.log(prices))
         s0 = float(prices[-1]) if s0_override is None else float(s0_override)
-        return MarketParameters(s0=s0, mu=mu, sigma=sigma, source="yfinance", note=note)
+        return MarketParameters(
+            s0=s0, mu=mu, sigma=sigma, source="yfinance", note=note,
+            daily_log_returns=log_ret,
+        )
     except Exception as exc:  # noqa: BLE001 - any failure -> safe fallback
         note = f"Falling back to default parameters ({type(exc).__name__}: {exc})."
         s0 = FALLBACK_S0 if s0_override is None else float(s0_override)
+        # Synthesize a small pseudo-history so bootstrap models still function.
+        synth_rng = np.random.default_rng(0)
+        daily_sigma = FALLBACK_SIGMA / math.sqrt(TRADING_DAYS_PER_YEAR)
+        daily_mu = FALLBACK_MU / TRADING_DAYS_PER_YEAR - 0.5 * daily_sigma ** 2
+        synth_returns = synth_rng.normal(daily_mu, daily_sigma, size=504)
         return MarketParameters(
-            s0=s0, mu=FALLBACK_MU, sigma=FALLBACK_SIGMA, source="fallback", note=note
+            s0=s0, mu=FALLBACK_MU, sigma=FALLBACK_SIGMA, source="fallback", note=note,
+            daily_log_returns=synth_returns,
         )
 
 
@@ -336,20 +500,167 @@ def predict_memory(config: "SimulationConfig") -> MemoryInfo:
     return mem
 
 
+def _bootstrap_daily_drift(cfg: SimulationConfig, emp_mean: float) -> float:
+    """Target daily log-drift for bootstrap models given the drift mode."""
+    if cfg.drift_mode == DRIFT_HISTORICAL:
+        d = emp_mean
+    elif cfg.drift_mode == DRIFT_HALF:
+        d = 0.5 * emp_mean
+    elif cfg.drift_mode == DRIFT_ZERO:
+        d = 0.0
+    else:  # DRIFT_MANUAL
+        manual = cfg.mu if cfg.manual_drift is None else float(cfg.manual_drift)
+        d = manual / TRADING_DAYS_PER_YEAR
+    if cfg.stress_enabled:
+        d *= (1.0 - cfg.stress_drift_haircut)
+    return d
+
+
+def _build_step_engine(cfg: SimulationConfig):
+    """Return ``(init_chunk, step)`` closures implementing the selected model.
+
+    ``init_chunk(rng, n)`` builds any per-chunk per-path state (bounded by the
+    chunk size -- never by total paths).  ``step(rng, n, state, i)`` returns the
+    log-return for every path on step ``i`` (1-based).  All state and working
+    arrays are length ``n`` (the chunk), preserving chunk-safe memory use.
+    """
+
+    dt = cfg.dt
+    mu = cfg.effective_mu()
+    sigma = cfg.effective_sigma()
+    sqrt_dt = math.sqrt(dt)
+    diff_drift = (mu - 0.5 * sigma ** 2) * dt
+    diff_vol = sigma * sqrt_dt
+    model = cfg.model
+
+    if model == MODEL_GBM:
+        def init_chunk(rng, n):
+            return None
+
+        def step(rng, n, state, i):
+            return diff_drift + diff_vol * rng.standard_normal(n)
+        return init_chunk, step
+
+    if model == MODEL_STUDENT_T:
+        df = float(cfg.t_df)
+        scale = math.sqrt((df - 2.0) / df)  # standardize t to unit variance
+
+        def init_chunk(rng, n):
+            return None
+
+        def step(rng, n, state, i):
+            shock = rng.standard_t(df, size=n) * scale
+            return diff_drift + diff_vol * shock
+        return init_chunk, step
+
+    if model in BOOTSTRAP_MODELS:
+        r = np.asarray(cfg.historical_returns, dtype=np.float64).ravel()
+        emp_mean = float(np.mean(r))
+        centered = r - emp_mean
+        n_hist = centered.size
+        vol_mult = cfg.stress_vol_multiplier if cfg.stress_enabled else 1.0
+        target_daily = _bootstrap_daily_drift(cfg, emp_mean)
+
+        if model == MODEL_HIST_BOOTSTRAP:
+            def init_chunk(rng, n):
+                return None
+
+            def step(rng, n, state, i):
+                idx = rng.integers(0, n_hist, size=n)
+                return centered[idx] * vol_mult + target_daily
+            return init_chunk, step
+
+        block_len = int(cfg.block_length)
+
+        def init_chunk(rng, n):
+            return {
+                "cur": np.zeros(n, dtype=np.int64),
+                "rem": np.zeros(n, dtype=np.int64),
+            }
+
+        def step(rng, n, state, i):
+            cur = state["cur"]
+            rem = state["rem"]
+            new_mask = rem <= 0
+            if new_mask.any():
+                starts = rng.integers(0, n_hist, size=n)
+                cur[new_mask] = starts[new_mask]
+                rem[new_mask] = block_len
+            read = centered[cur % n_hist]
+            cur += 1
+            rem -= 1
+            return read * vol_mult + target_daily
+        return init_chunk, step
+
+    if model == MODEL_MERTON:
+        lam_dt = cfg.jump_intensity * dt
+        jm = float(cfg.jump_mean)
+        jv = float(cfg.jump_vol)
+        k = math.exp(jm + 0.5 * jv ** 2) - 1.0  # expected proportional jump
+        comp_drift = (mu - 0.5 * sigma ** 2 - cfg.jump_intensity * k) * dt
+
+        def init_chunk(rng, n):
+            return None
+
+        def step(rng, n, state, i):
+            z = rng.standard_normal(n)
+            n_jumps = rng.poisson(lam_dt, size=n)
+            # Sum of n_jumps iid N(jm, jv^2) ~ N(n_jumps*jm, n_jumps*jv^2).
+            jump = n_jumps * jm + jv * np.sqrt(n_jumps) * rng.standard_normal(n)
+            return comp_drift + diff_vol * z + jump
+        return init_chunk, step
+
+    if model == MODEL_REGIME:
+        preset = REGIME_PRESETS[cfg.regime_preset]
+        mu_f = np.asarray(preset["mu_factors"], dtype=np.float64)
+        sig_f = np.asarray(preset["sigma_factors"], dtype=np.float64)
+        cum_p = np.cumsum(np.asarray(preset["transition"], dtype=np.float64), axis=1)
+        n_regimes = cum_p.shape[0]
+        regime_mu = mu * mu_f
+        regime_sig = sigma * sig_f
+        regime_drift = (regime_mu - 0.5 * regime_sig ** 2) * dt
+        regime_vol = regime_sig * sqrt_dt
+
+        def init_chunk(rng, n):
+            return {"regime": np.zeros(n, dtype=np.int64)}  # start in "normal"
+
+        def step(rng, n, state, i):
+            reg = state["regime"]
+            u = rng.random(n)
+            new_reg = (u[:, None] >= cum_p[reg]).sum(axis=1)
+            np.clip(new_reg, 0, n_regimes - 1, out=new_reg)
+            state["regime"] = new_reg
+            z = rng.standard_normal(n)
+            return regime_drift[new_reg] + regime_vol[new_reg] * z
+        return init_chunk, step
+
+    raise ValueError(f"Unsupported model: {model!r}")
+
+
 def simulate(config: SimulationConfig) -> SimulationResult:
-    """Run a chunked GBM Monte Carlo simulation.
+    """Run a chunked Monte Carlo simulation for the configured model.
 
     The simulation evolves each chunk one step at a time, so the largest 2-D
     array ever allocated is the bounded sample-trajectory block -- never the full
-    ``paths x steps`` matrix.
+    ``paths x steps`` matrix.  This holds for every model (GBM, Student-t,
+    bootstrap, block bootstrap, Merton jumps, regime switching) because each
+    model's per-step state is bounded by the chunk size.
     """
 
     cfg = config.validate()
     rng = np.random.default_rng(cfg.seed)
 
     steps = cfg.horizon
-    drift = (cfg.mu - 0.5 * cfg.sigma ** 2) * cfg.dt
-    vol = cfg.sigma * math.sqrt(cfg.dt)
+    init_chunk, step_fn = _build_step_engine(cfg)
+
+    # Deterministic one-day crash applied on the first step (any model).
+    crash_log = (
+        math.log(1.0 - cfg.stress_crash_pct)
+        if cfg.stress_enabled and cfg.stress_crash_pct > 0
+        else 0.0
+    )
+    dd_threshold = cfg.drawdown_threshold
+    drawdown_hits = 0
 
     final_values = np.empty(cfg.paths, dtype=np.float64)
 
@@ -373,17 +684,31 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         prices = np.full(this_chunk, cfg.s0, dtype=np.float64)
         memory.peak_vector_elements = max(memory.peak_vector_elements, prices.size)
 
+        # Running peak per path -> lets us flag large drawdowns memory-safely.
+        running_max = prices.copy()
+        dd_hit = np.zeros(this_chunk, dtype=bool)
+
+        # Per-chunk model state (bounded by chunk size).
+        state = init_chunk(rng, this_chunk)
+
         # How many of this chunk's paths feed the global sample block.
         sample_in_chunk = max(0, min(n_sample - produced, this_chunk))
 
         for step in range(1, steps + 1):
-            z = rng.standard_normal(this_chunk)
-            prices *= np.exp(drift + vol * z)
+            log_ret = step_fn(rng, this_chunk, state, step)
+            if step == 1 and crash_log:
+                log_ret = log_ret + crash_log
+            prices *= np.exp(log_ret)
+
+            np.maximum(running_max, prices, out=running_max)
+            dd_hit |= (prices <= running_max * (1.0 - dd_threshold))
+
             if sample_in_chunk:
                 sample_trajectories[produced:produced + sample_in_chunk, step] = (
                     prices[:sample_in_chunk]
                 )
 
+        drawdown_hits += int(dd_hit.sum())
         gross = prices
         net = apply_costs(gross, cfg.s0, cfg.cost)
         final_values[produced:produced + this_chunk] = net
@@ -394,7 +719,13 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     convergence_paths, convergence_means = _convergence_curve(
         final_values, cfg.convergence_points
     )
-    stats = compute_statistics(final_values, cfg.s0, runtime=runtime)
+    stats = compute_statistics(
+        final_values, cfg.s0, runtime=runtime,
+        drawdown_prob=drawdown_hits / cfg.paths,
+        drawdown_threshold=dd_threshold,
+    )
+    stats["model"] = cfg.model
+    stats["drift_mode"] = cfg.drift_mode
 
     return SimulationResult(
         config=cfg,
@@ -467,6 +798,8 @@ def compute_statistics(
     s0: float,
     *,
     runtime: Optional[float] = None,
+    drawdown_prob: Optional[float] = None,
+    drawdown_threshold: float = DRAWDOWN_THRESHOLD,
 ) -> Dict[str, Any]:
     """Compute the full statistics bundle from net ending values."""
 
@@ -479,6 +812,16 @@ def compute_statistics(
     median_value = float(np.median(fv))
     prob_profit = float(np.mean(fv > s0))
     prob_loss = float(np.mean(fv < s0))
+
+    # Probability buckets relative to the starting price.
+    prob_gain_20 = float(np.mean(fv > s0 * 1.20))
+    prob_loss_10 = float(np.mean(fv < s0 * 0.90))
+    prob_loss_20 = float(np.mean(fv < s0 * 0.80))
+
+    # Worst 1% average ending value (mean of the lowest 1% of outcomes).
+    p1 = np.percentile(fv, 1)
+    worst_tail = fv[fv <= p1]
+    worst_1pct_avg = float(np.mean(worst_tail)) if worst_tail.size else float(np.min(fv))
 
     var = {}
     es = {}
@@ -504,11 +847,18 @@ def compute_statistics(
         "max_value": float(np.max(fv)),
         "prob_profit": prob_profit,
         "prob_loss": prob_loss,
+        "prob_gain_20": prob_gain_20,
+        "prob_loss_10": prob_loss_10,
+        "prob_loss_20": prob_loss_20,
+        "worst_1pct_avg_value": worst_1pct_avg,
+        "drawdown_threshold": float(drawdown_threshold),
         "mean_return": float(np.mean(returns)),
         "var": var,
         "expected_shortfall": es,
         "percentiles": percentiles,
     }
+    if drawdown_prob is not None:
+        stats["prob_drawdown"] = float(drawdown_prob)
     if runtime is not None:
         stats["runtime_seconds"] = float(runtime)
         stats["paths_per_second"] = float(n / runtime) if runtime > 0 else float("inf")
@@ -527,6 +877,54 @@ def _level_key(level: float) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _volatility_source(cfg: SimulationConfig) -> str:
+    if cfg.model in BOOTSTRAP_MODELS:
+        src = "empirical daily returns (bootstrap)"
+    else:
+        src = "annualized historical estimate"
+    if cfg.stress_enabled and cfg.stress_vol_multiplier != 1.0:
+        src += f" x{cfg.stress_vol_multiplier:g} stress"
+    return src
+
+
+def model_assumptions(cfg: SimulationConfig,
+                      market: Optional[MarketParameters] = None) -> Dict[str, Any]:
+    """Human/machine readable description of the selected model and its inputs."""
+
+    a: Dict[str, Any] = {
+        "model": cfg.model,
+        "drift_mode": cfg.drift_mode,
+        "effective_mu_annual": cfg.effective_mu(),
+        "effective_sigma_annual": cfg.effective_sigma(),
+        "volatility_source": _volatility_source(cfg),
+        "stress_enabled": cfg.stress_enabled,
+    }
+    if cfg.drift_mode == DRIFT_MANUAL:
+        a["manual_drift"] = cfg.manual_drift
+    if cfg.model == MODEL_STUDENT_T:
+        a["t_df"] = cfg.t_df
+    if cfg.model == MODEL_BLOCK_BOOTSTRAP:
+        a["block_length"] = cfg.block_length
+    if cfg.model in BOOTSTRAP_MODELS:
+        n = 0 if cfg.historical_returns is None else int(np.asarray(cfg.historical_returns).size)
+        a["historical_returns_count"] = n
+    if cfg.model == MODEL_MERTON:
+        a["jump_intensity"] = cfg.jump_intensity
+        a["jump_mean"] = cfg.jump_mean
+        a["jump_vol"] = cfg.jump_vol
+    if cfg.model == MODEL_REGIME:
+        a["regime_preset"] = cfg.regime_preset
+    a["stress"] = {
+        "enabled": cfg.stress_enabled,
+        "one_day_crash_pct": cfg.stress_crash_pct,
+        "vol_multiplier": cfg.stress_vol_multiplier,
+        "drift_haircut": cfg.stress_drift_haircut,
+    }
+    if market is not None:
+        a["data_source"] = market.source
+    return a
+
+
 def build_report(result: SimulationResult, market: Optional[MarketParameters] = None) -> Dict[str, Any]:
     """Assemble a serialisable report dict from a simulation result."""
 
@@ -543,7 +941,10 @@ def build_report(result: SimulationResult, market: Optional[MarketParameters] = 
             "chunk_size": cfg.chunk_size,
             "seed": cfg.seed,
             "cost": cfg.cost,
+            "model": cfg.model,
+            "drift_mode": cfg.drift_mode,
         },
+        "model": model_assumptions(cfg, market),
         "statistics": result.stats,
         "memory": {
             "paths": result.memory.paths,
@@ -588,16 +989,35 @@ def summary_rows(result: SimulationResult) -> List[List[Any]]:
 
     s = result.stats
     cfg = result.config
+    assumptions = model_assumptions(cfg)
     rows: List[List[Any]] = [
         ["ticker", cfg.ticker],
         ["starting_price", cfg.s0],
         ["paths", cfg.paths],
         ["horizon_steps", cfg.horizon],
+        ["model", cfg.model],
+        ["drift_mode", cfg.drift_mode],
+        ["volatility_source", assumptions["volatility_source"]],
+        ["effective_mu_annual", assumptions["effective_mu_annual"]],
+        ["effective_sigma_annual", assumptions["effective_sigma_annual"]],
         ["mu_annual", cfg.mu],
         ["sigma_annual", cfg.sigma],
         ["chunk_size", cfg.chunk_size],
         ["seed", cfg.seed],
         ["transaction_cost", cfg.cost],
+        # Model-specific parameters.
+        ["t_df", cfg.t_df],
+        ["block_length", cfg.block_length],
+        ["jump_intensity", cfg.jump_intensity],
+        ["jump_mean", cfg.jump_mean],
+        ["jump_vol", cfg.jump_vol],
+        ["regime_preset", cfg.regime_preset],
+        # Stress overlay.
+        ["stress_enabled", cfg.stress_enabled],
+        ["stress_one_day_crash_pct", cfg.stress_crash_pct],
+        ["stress_vol_multiplier", cfg.stress_vol_multiplier],
+        ["stress_drift_haircut", cfg.stress_drift_haircut],
+        # Core outcome metrics.
         ["expected_ending_value", s["expected_value"]],
         ["median_ending_value", s["median_value"]],
         ["expected_return", s["expected_return"]],
@@ -606,6 +1026,12 @@ def summary_rows(result: SimulationResult) -> List[List[Any]]:
         ["max_ending_value", s["max_value"]],
         ["prob_profit", s["prob_profit"]],
         ["prob_loss", s["prob_loss"]],
+        # Probability buckets.
+        ["prob_gain_more_than_20pct", s["prob_gain_20"]],
+        ["prob_loss_more_than_10pct", s["prob_loss_10"]],
+        ["prob_loss_more_than_20pct", s["prob_loss_20"]],
+        ["prob_drawdown_50pct", s.get("prob_drawdown", "")],
+        ["worst_1pct_avg_ending_value", s["worst_1pct_avg_value"]],
     ]
     for level in RISK_LEVELS:
         key = _level_key(level)
