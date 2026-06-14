@@ -52,6 +52,42 @@ def test_path_mode_presets():
     assert mc_core.resolve_path_mode("Serious") == 1_000_000
 
 
+def test_mc_core_defines_all_path_constants():
+    """Regression guard: every path-mode constant app.py needs must exist."""
+    assert mc_core.PREVIEW_PATHS == 10_000
+    assert mc_core.STANDARD_PATHS == 100_000
+    assert mc_core.SERIOUS_PATHS == 1_000_000
+    assert mc_core.CUSTOM_MIN_PATHS == 1_000
+    assert mc_core.CUSTOM_MAX_PATHS == 1_000_000
+    assert mc_core.TAIL_RISK_MIN_PATHS == 2_000_000
+    assert mc_core.TAIL_RISK_MAX_PATHS == 5_000_000
+    assert mc_core.DEFAULT_SERIOUS_CHUNK_SIZE in (25_000, 50_000)
+    # Backwards-compatible alias still resolves.
+    assert mc_core.DEFAULT_SERIOUS_CHUNK == mc_core.DEFAULT_SERIOUS_CHUNK_SIZE
+    # Presets are built from the constants, so they can never drift.
+    assert mc_core.PATH_MODES["Preview"] == mc_core.PREVIEW_PATHS
+    assert mc_core.PATH_MODES["Standard"] == mc_core.STANDARD_PATHS
+    assert mc_core.PATH_MODES["Serious"] == mc_core.SERIOUS_PATHS
+
+
+def test_app_path_mode_settings_all_modes_no_attribute_error():
+    """app.path_mode_settings must work for every mode (the crash repro)."""
+    import app
+
+    expected_defaults = {
+        "Preview": 10_000,
+        "Standard": 100_000,
+        "Serious": 1_000_000,
+        "Custom": 250_000,
+        "Tail-risk (advanced)": 2_000_000,
+    }
+    for mode, default in expected_defaults.items():
+        lo, hi, got_default, step = app.path_mode_settings(mode)
+        assert got_default == default
+        assert lo <= got_default <= hi
+        assert step > 0
+
+
 def test_app_resolve_path_count_defaults():
     """The GUI helper resolves preset modes to their default path counts."""
     import app
