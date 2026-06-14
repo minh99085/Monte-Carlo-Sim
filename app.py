@@ -182,6 +182,57 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
                 "Regime preset", list(mc_core.REGIME_PRESETS), index=0,
                 help="Crypto preset spends more time in high-vol/crash regimes.",
             )
+        elif model == mc_core.MODEL_HESTON:
+            model_inputs["heston_kappa"] = st.number_input(
+                "Heston kappa (mean reversion)", min_value=0.0, max_value=20.0,
+                value=1.5, step=0.1,
+            )
+            model_inputs["heston_theta"] = st.number_input(
+                "Heston theta (long-run var, 0 = use sigma^2)",
+                min_value=0.0, max_value=2.0, value=0.0, step=0.01, format="%.4f",
+            ) or None
+            model_inputs["heston_xi"] = st.number_input(
+                "Heston xi (vol-of-vol)", min_value=0.0, max_value=5.0,
+                value=0.3, step=0.05,
+            )
+            model_inputs["heston_rho"] = st.number_input(
+                "Heston rho (corr S,v)", min_value=-1.0, max_value=1.0,
+                value=-0.7, step=0.05,
+            )
+            model_inputs["heston_v0"] = st.number_input(
+                "Heston v0 (initial var, 0 = use sigma^2)",
+                min_value=0.0, max_value=2.0, value=0.0, step=0.01, format="%.4f",
+            ) or None
+        elif model == mc_core.MODEL_GARCH:
+            model_inputs["garch_alpha"] = st.number_input(
+                "GARCH alpha", min_value=0.0, max_value=0.99, value=0.08, step=0.01,
+            )
+            model_inputs["garch_beta"] = st.number_input(
+                "GARCH beta", min_value=0.0, max_value=0.99, value=0.90, step=0.01,
+            )
+            st.caption("Requires alpha + beta < 1 for stationarity.")
+        elif model == mc_core.MODEL_KOU:
+            kou_preset = st.selectbox("Kou preset", ["stock", "crypto", "custom"], index=0)
+            base = {"stock": dict(intensity=1.0, p_up=0.4, eta_up=25.0, eta_down=15.0),
+                    "crypto": dict(intensity=6.0, p_up=0.45, eta_up=12.0, eta_down=8.0)}.get(
+                        kou_preset, {})
+            disabled = kou_preset != "custom"
+            model_inputs["kou_intensity"] = st.number_input(
+                "Kou jump intensity (per year)", min_value=0.0, max_value=100.0,
+                value=float(base.get("intensity", 1.0)), step=0.5, disabled=disabled,
+            )
+            model_inputs["kou_p_up"] = st.number_input(
+                "Kou P(jump up)", min_value=0.0, max_value=1.0,
+                value=float(base.get("p_up", 0.4)), step=0.05, disabled=disabled,
+            )
+            model_inputs["kou_eta_up"] = st.number_input(
+                "Kou eta_up (up-jump rate)", min_value=1.1, max_value=100.0,
+                value=float(base.get("eta_up", 25.0)), step=1.0, disabled=disabled,
+            )
+            model_inputs["kou_eta_down"] = st.number_input(
+                "Kou eta_down (down-jump rate)", min_value=0.1, max_value=100.0,
+                value=float(base.get("eta_down", 15.0)), step=1.0, disabled=disabled,
+            )
         elif model in mc_core.BOOTSTRAP_MODELS:
             st.caption("Uses empirical daily returns sampled from history.")
 
@@ -289,6 +340,22 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
                 value=0.0, step=0.05,
             )
 
+        # ---------------------- Advanced Math panel ----------------------
+        st.subheader("Advanced math")
+        variance_reduction = st.selectbox(
+            "Variance reduction", list(mc_core.VARIANCE_REDUCTION_METHODS), index=0,
+            help="Antithetic and control-variate run on CPU; Sobol needs scipy.",
+        )
+        if variance_reduction == mc_core.VR_SOBOL and not mc_core.sobol_available():
+            st.caption("Sobol unavailable (scipy not installed); will fall back.")
+        evt_enabled = st.checkbox("EVT tail analysis", value=False,
+                                  help="Fit a Generalized Pareto tail to simulated losses.")
+        portfolio_enabled = st.checkbox("Portfolio mode (multi-asset)", value=False)
+        ruin_threshold = st.number_input(
+            "Risk-of-ruin threshold (fraction of S0)",
+            min_value=0.05, max_value=0.95, value=0.50, step=0.05,
+        )
+
         with st.expander("Advanced parameter overrides"):
             mu_override = st.text_input("mu override (annual, blank = estimate)", value="")
             sigma_override = st.text_input("sigma override (annual, blank = estimate)", value="")
@@ -296,6 +363,17 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
         run_clicked = st.button("Run simulation", type="primary")
 
     seed = int(seed_text) if seed_text.strip() else None
+
+    # Conservative-drift warning surfaced near the top of the main panel.
+    _eff_mu_preview = mc_core.SimulationConfig(
+        mu=(float(mu_override) if mu_override.strip() else mc_core.FALLBACK_MU),
+        drift_mode=drift_mode, manual_drift=manual_drift,
+    ).effective_mu()
+    if _eff_mu_preview > mc_core.HIGH_DRIFT_WARNING_LEVEL:
+        st.warning(
+            f"Conservative-drift warning: effective annual drift ~{_eff_mu_preview:.0%} "
+            "is very high. Consider Half/Zero drift for a less optimistic view."
+        )
 
     # ---------------------- Memory pre-flight ----------------------
     preview_cfg = mc_core.SimulationConfig(
@@ -314,9 +392,17 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
         mu_override=mu_override, sigma_override=sigma_override,
         stress_enabled=stress_enabled, stress_crash=stress_crash,
         stress_vol_mult=stress_vol_mult, stress_haircut=stress_haircut,
+        variance_reduction=variance_reduction, ruin_threshold=ruin_threshold,
+        evt_enabled=evt_enabled,
     )
 
-    tab_single, tab_compare = st.tabs(["Single model", "Model comparison"])
+    if portfolio_enabled:
+        tab_single, tab_compare, tab_portfolio = st.tabs(
+            ["Single model", "Model comparison", "Portfolio"]
+        )
+    else:
+        tab_single, tab_compare = st.tabs(["Single model", "Model comparison"])
+        tab_portfolio = None
 
     with tab_single:
         # Run only when the button is clicked; persist the result in
@@ -340,6 +426,8 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
                     stress_crash_pct=stress_crash,
                     stress_vol_multiplier=stress_vol_mult,
                     stress_drift_haircut=stress_haircut,
+                    variance_reduction=variance_reduction,
+                    ruin_threshold=ruin_threshold,
                     **model_inputs,
                 )
             except ValueError as exc:
@@ -350,19 +438,27 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
                 result = mc_core.simulate(config)
             st.session_state["mc_result"] = result
             st.session_state["mc_market"] = market
+            st.session_state["mc_evt"] = (
+                mc_core.evt_from_result(result) if evt_enabled else None
+            )
 
         result = st.session_state.get("mc_result")
         market = st.session_state.get("mc_market")
         if result is None:
             st.write("Configure inputs in the sidebar and click **Run simulation**.")
         else:
-            _render_single_model(st, pd, plt, result, market)
+            _render_single_model(st, pd, plt, result, market,
+                                 st.session_state.get("mc_evt"))
 
     with tab_compare:
         _render_comparison(st, pd, shared)
 
+    if tab_portfolio is not None:
+        with tab_portfolio:
+            _render_portfolio(st, pd, shared)
 
-def _render_single_model(st, pd, plt, result, market) -> None:
+
+def _render_single_model(st, pd, plt, result, market, evt=None) -> None:
     """Render the full single-model output panel from a stored result."""
     config = result.config
     s = result.stats
@@ -380,6 +476,11 @@ def _render_single_model(st, pd, plt, result, market) -> None:
                 f"Estimated from {market.source}: S0={config.s0:,.2f}, "
                 f"mu={config.mu:.2%}, sigma={config.sigma:.2%}"
             )
+
+    # ---------------------- Validation warnings ----------------------
+    warnings = mc_core.collect_warnings(config, market, evt=evt)
+    for w in warnings:
+        st.warning(w)
 
     # ---------------------- Selected model & assumptions ----------------------
     assumptions = mc_core.model_assumptions(config, market)
@@ -431,6 +532,44 @@ def _render_single_model(st, pd, plt, result, market) -> None:
     pct_df = pd.DataFrame(percentile_table_rows(result), columns=["Percentile", "Value"])
     st.dataframe(pct_df, hide_index=True, use_container_width=True)
 
+    # ---------------------- Advanced risk metrics ----------------------
+    st.subheader("Advanced risk metrics")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Sharpe (annual)", f"{s.get('sharpe_annual', 0):.2f}")
+    a2.metric("Sortino (annual)", f"{s.get('sortino_annual', 0):.2f}")
+    a3.metric("Calmar", f"{s.get('calmar', 0):.2f}")
+    a4.metric("Mean max drawdown", f"{s.get('mean_max_drawdown', 0):.2%}")
+    a5, a6, a7, a8 = st.columns(4)
+    a5.metric("Mean DD duration (steps)", f"{s.get('mean_drawdown_duration', 0):.1f}")
+    a6.metric(f"P(ruin < {int(config.ruin_threshold*100)}% S0)",
+              f"{s.get('prob_ruin', 0):.2%}")
+    a7.metric("Kelly fraction", f"{s.get('kelly_fraction', 0):.2f}")
+    a8.metric("Annualized return", f"{s.get('annualized_return', 0):+.2%}")
+    st.caption(f"Note: {mc_core.KELLY_WARNING}")
+
+    # ---------------------- EVT tail risk ----------------------
+    if evt is not None:
+        st.subheader("EVT tail risk (Generalized Pareto over loss exceedances)")
+        if evt.get("error"):
+            st.warning(f"EVT could not be computed: {evt['error']}")
+        else:
+            evt_rows = []
+            for key in ("95", "99", "99.5", "99.9"):
+                if key in evt["var"]:
+                    evt_rows.append({
+                        "Confidence": f"{key}%",
+                        "EVT tail loss (return)": evt["var"][key],
+                        "EVT Expected Shortfall": evt["es"][key],
+                    })
+            st.dataframe(pd.DataFrame(evt_rows), hide_index=True, use_container_width=True)
+            st.caption(
+                f"Threshold (loss): {evt.get('threshold', float('nan')):.4f} | "
+                f"exceedances: {evt.get('n_exceedances', 0)} | "
+                f"GPD shape xi: {evt.get('shape_xi', float('nan')):.3f}"
+            )
+            if evt.get("warning"):
+                st.warning(evt["warning"])
+
     # ---------------------- Charts ----------------------
     st.subheader("Charts")
     col_a, col_b = st.columns(2)
@@ -478,7 +617,7 @@ def _render_single_model(st, pd, plt, result, market) -> None:
     # ---------------------- Exports ----------------------
     st.subheader("Export")
     csv_text = mc_core.report_to_csv(result)
-    json_text = mc_core.report_to_json(result, market)
+    json_text = mc_core.report_to_json(result, market, evt=evt)
     e1, e2 = st.columns(2)
     e1.download_button(
         "Download CSV summary", data=csv_text,
@@ -504,6 +643,13 @@ COMPARISON_DISPLAY_NAMES = {
     "percentile_95": "P95",
     "var_99": "VaR 99%",
     "es_99": "ES 99%",
+    "evt_var_99": "EVT VaR 99%",
+    "evt_es_99": "EVT ES 99%",
+    "max_drawdown_prob": "Max DD prob",
+    "prob_ruin": "P(ruin)",
+    "sharpe": "Sharpe",
+    "sortino": "Sortino",
+    "disagreement_rank": "Disagree rank",
     "runtime_seconds": "Runtime (s)",
     "chunk_safe": "Chunk-safe",
 }
@@ -520,7 +666,7 @@ def _render_comparison(st, pd, shared: dict) -> None:
 
     selected = st.multiselect(
         "Models to compare", list(mc_core.MODELS), default=list(mc_core.MODELS),
-        help="All six models are selected by default.",
+        help="All available models are selected by default.",
     )
     run_compare = st.button("Run comparison", type="primary", key="run_comparison")
 
@@ -546,6 +692,8 @@ def _render_comparison(st, pd, shared: dict) -> None:
                 stress_crash_pct=shared["stress_crash"],
                 stress_vol_multiplier=shared["stress_vol_mult"],
                 stress_drift_haircut=shared["stress_haircut"],
+                variance_reduction=shared.get("variance_reduction", mc_core.VR_NONE),
+                ruin_threshold=shared.get("ruin_threshold", 0.50),
                 model=mc_core.MODEL_GBM,
             )
         except ValueError as exc:
@@ -554,7 +702,10 @@ def _render_comparison(st, pd, shared: dict) -> None:
         with st.spinner(
             f"Comparing {len(selected)} models on {shared['paths']:,} paths each..."
         ):
-            report = mc_core.compare_models(base_config, models=selected, market=market)
+            report = mc_core.compare_models(
+                base_config, models=selected, market=market,
+                evt=shared.get("evt_enabled", False),
+            )
         st.session_state["mc_comparison"] = report
         st.session_state["mc_comp_market"] = market
 
@@ -600,6 +751,97 @@ def _render_comparison(st, pd, shared: dict) -> None:
     e2.download_button(
         "Download JSON comparison", data=json_text,
         file_name=f"{cfg.ticker}_model_comparison.json", mime="application/json",
+    )
+
+
+def _render_portfolio(st, pd, shared: dict) -> None:
+    """Render the Portfolio mode tab: multi-asset correlated simulation."""
+    st.subheader("Portfolio mode (multi-asset, laptop-safe)")
+    st.caption(
+        "Simulate a correlated multi-asset GBM portfolio. Historical returns are "
+        "fetched per ticker, covariance is shrunk, and paths are generated in a "
+        "chunk-safe per-asset block (no paths x steps matrix)."
+    )
+
+    tickers_text = st.text_input(
+        "Tickers (comma-separated)", value="AAPL,MSFT",
+        help="Example: AAPL,MSFT,NVDA",
+    )
+    weights_text = st.text_input(
+        "Weights (comma-separated, blank = equal weight)", value="",
+    )
+    run_pf = st.button("Run portfolio", type="primary", key="run_portfolio")
+
+    if run_pf:
+        tickers = [t.strip().upper() for t in tickers_text.split(",") if t.strip()]
+        if len(tickers) < 2:
+            st.error("Enter at least two tickers.")
+            st.stop()
+        returns_by_ticker = {}
+        s0_by_ticker = {}
+        with st.spinner(f"Fetching history for {', '.join(tickers)}..."):
+            for t in tickers:
+                mp = mc_core.estimate_parameters_from_history(t, years=shared["years"])
+                returns_by_ticker[t] = mp.daily_log_returns
+                s0_by_ticker[t] = mp.s0
+        weights = None
+        if weights_text.strip():
+            try:
+                weights = [float(w) for w in weights_text.split(",")]
+            except ValueError:
+                st.error("Weights must be numbers.")
+                st.stop()
+        try:
+            pf = mc_core.simulate_portfolio(
+                returns_by_ticker, weights=weights, s0_by_ticker=s0_by_ticker,
+                paths=shared["paths"], horizon=shared["horizon"],
+                chunk_size=shared["chunk_size"], seed=shared["seed"],
+                drift_mode=shared["drift_mode"], manual_drift=shared["manual_drift"],
+            )
+        except ValueError as exc:
+            st.error(f"Portfolio error: {exc}")
+            st.stop()
+        st.session_state["mc_portfolio"] = pf
+
+    pf = st.session_state.get("mc_portfolio")
+    if pf is None:
+        st.write("Enter tickers and click **Run portfolio**.")
+        return
+
+    ps = pf["statistics"]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Expected portfolio value", f"{ps['expected_value']:.4f}",
+              f"{ps['expected_return']:+.2%}")
+    c2.metric("Median portfolio value", f"{ps['median_value']:.4f}")
+    c3.metric("VaR 99%", f"{ps['var']['99']['value']:.4f}")
+    c4.metric("ES 99%", f"{ps['expected_shortfall']['99']['value']:.4f}")
+    st.caption(
+        f"Covariance method: {pf['covariance_method']} | "
+        f"Cholesky jittered: {pf['cholesky_jittered']} | "
+        f"chunk-safe: {pf['chunk_safe']}"
+    )
+
+    st.markdown("**Per-asset summary**")
+    per_asset_df = pd.DataFrame(pf["per_asset"]).T
+    st.dataframe(per_asset_df, use_container_width=True)
+
+    st.markdown("**Correlation matrix**")
+    corr_df = pd.DataFrame(
+        pf["correlation_matrix"], index=pf["tickers"], columns=pf["tickers"]
+    )
+    st.dataframe(corr_df, use_container_width=True)
+
+    import json as _json
+    e1, e2 = st.columns(2)
+    e1.download_button(
+        "Download correlation CSV", data=mc_core.portfolio_correlation_csv(pf),
+        file_name="portfolio_correlation.csv", mime="text/csv",
+    )
+    pf_export = {k: v for k, v in pf.items() if k != "portfolio_values"}
+    e2.download_button(
+        "Download portfolio JSON",
+        data=_json.dumps(pf_export, indent=2, default=mc_core._json_default),
+        file_name="portfolio_report.json", mime="application/json",
     )
 
 
