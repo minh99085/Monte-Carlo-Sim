@@ -58,6 +58,56 @@ def percentile_table_rows(result: mc_core.SimulationResult):
     return [(f"p{p}", v) for p, v in result.stats["percentiles"].items()]
 
 
+def path_mode_settings(mode: str):
+    """Return ``(min_paths, max_paths, default_paths, step)`` for a path mode.
+
+    * Preview / Standard / Serious -> editable in [1,000; 1,000,000], prefilled
+      with the preset value (10,000 / 100,000 / 1,000,000).
+    * Custom -> editable in [1,000; 1,000,000], prefilled with 250,000.
+    * Tail-risk (advanced) -> editable in [2,000,000; 5,000,000], prefilled with
+      2,000,000.
+    """
+
+    if mode not in mc_core.PATH_MODES:
+        raise ValueError(f"Unknown path mode: {mode!r}")
+    if mode == "Tail-risk (advanced)":
+        return (
+            mc_core.TAIL_RISK_MIN_PATHS,
+            mc_core.TAIL_RISK_MAX_PATHS,
+            mc_core.TAIL_RISK_MIN_PATHS,
+            500_000,
+        )
+    if mode == "Custom":
+        return (mc_core.CUSTOM_MIN_PATHS, mc_core.CUSTOM_MAX_PATHS, 250_000, 5_000)
+    # Preview / Standard / Serious presets
+    return (
+        mc_core.CUSTOM_MIN_PATHS,
+        mc_core.CUSTOM_MAX_PATHS,
+        int(mc_core.PATH_MODES[mode]),
+        1_000,
+    )
+
+
+def resolve_path_count(mode: str, explicit_paths=None) -> int:
+    """Resolve and validate the effective path count for the GUI.
+
+    This is the small, Streamlit-free helper that the GUI uses and that tests can
+    call directly.  When ``explicit_paths`` is ``None`` the mode's default/preset
+    is used (so Preview/Standard/Serious resolve to 10,000/100,000/1,000,000).
+    When ``explicit_paths`` is supplied it is validated against the mode's safe
+    range, mirroring what the editable "Number of paths" field allows.
+    """
+
+    min_paths, max_paths, default_paths, _ = path_mode_settings(mode)
+    paths = int(default_paths if explicit_paths is None else explicit_paths)
+    if not (min_paths <= paths <= max_paths):
+        raise ValueError(
+            f"{mode} mode requires paths between {min_paths:,} and {max_paths:,} "
+            f"(got {paths:,})."
+        )
+    return paths
+
+
 # ---------------------------------------------------------------------------
 # Streamlit application
 # ---------------------------------------------------------------------------
@@ -100,18 +150,7 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
         )
 
         # Per-mode editable range and the value to prefill when the mode changes.
-        if mode == "Tail-risk (advanced)":
-            min_paths, max_paths = mc_core.TAIL_RISK_MIN_PATHS, mc_core.TAIL_RISK_MAX_PATHS
-            default_paths = mc_core.TAIL_RISK_MIN_PATHS
-            path_step = 500_000
-        elif mode == "Custom":
-            min_paths, max_paths = mc_core.CUSTOM_MIN_PATHS, mc_core.CUSTOM_MAX_PATHS
-            default_paths = 250_000
-            path_step = 5_000
-        else:  # Preview / Standard / Serious presets
-            min_paths, max_paths = mc_core.CUSTOM_MIN_PATHS, mc_core.CUSTOM_MAX_PATHS
-            default_paths = mc_core.PATH_MODES[mode]
-            path_step = 1_000
+        min_paths, max_paths, default_paths, path_step = path_mode_settings(mode)
 
         # Snap the editable field to the mode's default whenever the mode changes,
         # but otherwise preserve whatever the user typed.
@@ -119,14 +158,20 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
             st.session_state["num_paths"] = int(default_paths)
             st.session_state["_last_path_mode"] = mode
 
-        paths = int(st.number_input(
+        edited_paths = st.number_input(
             "Number of paths",
             min_value=int(min_paths),
             max_value=int(max_paths),
             step=int(path_step),
             key="num_paths",
             help="Type any value within the selected mode's safe range.",
-        ))
+        )
+        # Validate through the same Streamlit-free helper the tests exercise.
+        try:
+            paths = resolve_path_count(mode, edited_paths)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
         st.caption(f"Selected paths: {paths:,}")
 
         if mode == "Tail-risk (advanced)":
@@ -166,11 +211,10 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
     seed = int(seed_text) if seed_text.strip() else None
 
     # ---------------------- Memory pre-flight ----------------------
-    preview_mem = mc_core.MemoryInfo(
+    preview_cfg = mc_core.SimulationConfig(
         paths=int(paths), horizon=int(horizon), chunk_size=int(chunk_size)
     )
-    preview_mem.peak_matrix_elements = 50 * (int(horizon) + 1)
-    preview_mem.peak_vector_elements = min(int(chunk_size), int(paths))
+    preview_mem = mc_core.predict_memory(preview_cfg)
     st.info(preview_mem.status())
 
     if not run_clicked:
