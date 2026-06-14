@@ -396,13 +396,12 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
         evt_enabled=evt_enabled,
     )
 
+    tab_names = ["Single model", "Model comparison", "Investment Report"]
     if portfolio_enabled:
-        tab_single, tab_compare, tab_portfolio = st.tabs(
-            ["Single model", "Model comparison", "Portfolio"]
-        )
-    else:
-        tab_single, tab_compare = st.tabs(["Single model", "Model comparison"])
-        tab_portfolio = None
+        tab_names.append("Portfolio")
+    _tabs = st.tabs(tab_names)
+    tab_single, tab_compare, tab_report = _tabs[0], _tabs[1], _tabs[2]
+    tab_portfolio = _tabs[3] if portfolio_enabled else None
 
     with tab_single:
         # Run only when the button is clicked; persist the result in
@@ -452,6 +451,9 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
 
     with tab_compare:
         _render_comparison(st, pd, shared)
+
+    with tab_report:
+        _render_investment_report(st, pd, shared)
 
     if tab_portfolio is not None:
         with tab_portfolio:
@@ -752,6 +754,152 @@ def _render_comparison(st, pd, shared: dict) -> None:
         "Download JSON comparison", data=json_text,
         file_name=f"{cfg.ticker}_model_comparison.json", mime="application/json",
     )
+
+
+def _render_investment_report(st, pd, shared: dict) -> None:
+    """Render the institutional Investment Report tab for a non-coder investor."""
+    import mc_report
+
+    st.subheader("Investment Report")
+    st.caption(
+        "Runs the full institutional model stack, stress tests, a model-risk "
+        "confidence score, and a benchmark comparison, then explains the results "
+        "in plain English. This is a risk simulation, not investment advice."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        ticker = st.text_input("Ticker", value=shared["ticker"], key="ir_ticker").strip().upper()
+        horizon = st.number_input("Investment horizon (trading days)", min_value=1,
+                                  max_value=2520, value=int(shared["horizon"]), step=1,
+                                  key="ir_horizon")
+        paths = st.number_input("Paths", min_value=1_000, max_value=5_000_000,
+                                value=int(shared["paths"]), step=10_000, key="ir_paths")
+        chunk_size = st.number_input("Chunk size", min_value=1_000, max_value=200_000,
+                                     value=int(shared["chunk_size"]), step=5_000,
+                                     key="ir_chunk")
+    with c2:
+        risk_tolerance = st.selectbox("Risk tolerance", list(mc_report.RISK_TOLERANCES),
+                                      index=1, key="ir_tol")
+        max_loss = st.number_input("Maximum acceptable loss (%)", min_value=1.0,
+                                   max_value=95.0, value=20.0, step=1.0, key="ir_maxloss")
+        ruin = st.number_input("Ruin threshold (% of start)", min_value=5.0,
+                               max_value=95.0, value=50.0, step=5.0, key="ir_ruin")
+        amount = st.number_input("Investment amount", min_value=0.0,
+                                 value=10_000.0, step=1_000.0, key="ir_amount")
+    with c3:
+        drift_mode = st.selectbox("Drift mode", list(mc_core.DRIFT_MODES),
+                                  index=list(mc_core.DRIFT_MODES).index(shared["drift_mode"]),
+                                  key="ir_drift")
+        benchmark = st.text_input("Benchmark ticker", value=mc_report.DEFAULT_BENCHMARK,
+                                  key="ir_bench").strip().upper()
+        seed_text = st.text_input("Seed (blank = random)", value=str(shared["seed"] or ""),
+                                  key="ir_seed")
+        save_files = st.checkbox("Also write files to outputs/", value=False, key="ir_save")
+
+    run_report = st.button("Run Report", type="primary", key="run_investment_report")
+
+    if run_report:
+        seed = int(seed_text) if seed_text.strip() else None
+        rcfg = mc_report.InvestmentReportConfig(
+            ticker=ticker or "ASSET", horizon=int(horizon), paths=int(paths),
+            chunk_size=int(chunk_size), seed=seed, drift_mode=drift_mode,
+            risk_tolerance=risk_tolerance, max_acceptable_loss_pct=max_loss / 100.0,
+            ruin_threshold=ruin / 100.0, investment_amount=float(amount),
+            benchmark=benchmark or mc_report.DEFAULT_BENCHMARK, years=shared["years"],
+        )
+        try:
+            with st.spinner(
+                f"Running {len(mc_report.INSTITUTIONAL_MODELS)} models + stress tests "
+                f"for {ticker}..."
+            ):
+                report = mc_report.build_investment_report(rcfg)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Report failed: {exc}")
+            st.stop()
+        st.session_state["mc_report"] = report
+        if save_files:
+            paths_written = mc_report.write_investment_report(report, outdir="outputs")
+            st.session_state["mc_report_files"] = paths_written
+
+    report = st.session_state.get("mc_report")
+    if report is None:
+        st.write("Set your inputs and click **Run Report**.")
+        return
+
+    # ---------------------- Risk cards ----------------------
+    c = report["central"]
+    st.markdown("### Plain-English risk cards")
+    cards = st.columns(3)
+    cards[0].metric("Profit Chance", f"{c['prob_profit']*100:.0f}%")
+    cards[1].metric("Big Loss Chance (>20%)", f"{c['prob_loss_20']*100:.0f}%")
+    cards[2].metric("Severe Drawdown Chance (50%)", f"{c['prob_drawdown_50']*100:.0f}%")
+    cards2 = st.columns(3)
+    cards2[0].metric("Worst Model", report["worst_model"])
+    cards2[1].metric("Model Confidence", report["model_confidence"])
+    cards2[2].metric("Investment Label", report["investment_label"])
+
+    if report["model_confidence"] == mc_report.CONFIDENCE_LOW:
+        st.error("Model confidence is LOW. Do not rely on this result alone.")
+
+    # ---------------------- Plain-English sections ----------------------
+    for name in mc_report.REPORT_SECTIONS:
+        st.markdown(f"#### {name}")
+        st.markdown(report["plain_english"].get(name, ""))
+
+    # ---------------------- Stress tests ----------------------
+    st.markdown("#### Stress test results")
+    st.dataframe(pd.DataFrame(report["stress_tests"]["rows"]),
+                 hide_index=True, use_container_width=True)
+
+    # ---------------------- Benchmark ----------------------
+    bm = report["benchmark_comparison"]
+    st.markdown("#### Benchmark comparison")
+    if bm.get("available"):
+        st.dataframe(pd.DataFrame([{
+            "Benchmark": bm["benchmark"],
+            "Excess return": bm["excess_return"],
+            "Beta": bm["beta"],
+            "Correlation": bm["correlation"],
+            "Ticker max DD": bm["ticker_max_drawdown"],
+            "Benchmark max DD": bm["benchmark_max_drawdown"],
+        }]), hide_index=True, use_container_width=True)
+    else:
+        st.info("Benchmark comparison unavailable.")
+
+    # ---------------------- Fundamentals ----------------------
+    st.markdown("#### Fundamentals (sanity check)")
+    f = report["fundamentals"]
+    if f.get("available"):
+        st.json(f["fields"])
+    else:
+        st.info(f.get("note", "Fundamental data unavailable from source."))
+
+    # ---------------------- Model-risk warnings ----------------------
+    if report["model_risk"]["warnings"]:
+        st.markdown("#### Model risk warnings")
+        for wmsg in report["model_risk"]["warnings"]:
+            st.warning(wmsg)
+
+    # ---------------------- Exports ----------------------
+    st.markdown("#### Export")
+    md_text = mc_report.render_markdown(report)
+    json_text = mc_report.report_to_json(report)
+    csv_text = mc_report.comparison_csv(report)
+    e1, e2, e3 = st.columns(3)
+    e1.download_button("Download Markdown report", data=md_text,
+                       file_name=f"{report['inputs']['ticker']}_investment_report.md",
+                       mime="text/markdown")
+    e2.download_button("Download JSON report", data=json_text,
+                       file_name=f"{report['inputs']['ticker']}_investment_report.json",
+                       mime="application/json")
+    e3.download_button("Download comparison CSV", data=csv_text,
+                       file_name=f"{report['inputs']['ticker']}_institutional_comparison.csv",
+                       mime="text/csv")
+    if st.session_state.get("mc_report_files"):
+        st.success(f"Files written: {st.session_state['mc_report_files']}")
+
+    st.caption(report["disclaimer"])
 
 
 def _render_portfolio(st, pd, shared: dict) -> None:
