@@ -126,9 +126,41 @@ realistic models, all sharing the same chunk-safe execution:
 | **Merton Jump-Diffusion** | GBM plus Poisson jumps (crypto preset is jump-heavy). | intensity, jump mean/vol |
 | **Regime Switching** | Normal / high-vol / crash regimes via a transition matrix. | stock or crypto preset |
 
+Advanced stochastic models are also available:
+
+| Model | Description | Key inputs |
+| --- | --- | --- |
+| **Heston Stochastic Volatility** | Mean-reverting stochastic variance, full-truncation Euler (variance never goes negative). | kappa, theta, xi, rho, v0 |
+| **GARCH(1,1)** | Volatility clustering via `sigma_t^2 = omega + alpha r^2 + beta sigma^2`. | omega, alpha, beta |
+| **Kou Jump-Diffusion** | Asymmetric double-exponential jumps (better crash/upside asymmetry). | intensity, p_up, eta_up, eta_down |
+
 **Conservative drift mode**: choose Historical, Half historical, Zero, or Manual
 drift. **Stress overlay** (optional, works on top of any model): a one-day crash
 %, a volatility multiplier, and a drift haircut.
+
+### Advanced math (risk lab)
+
+- **EVT tail risk**: a Generalized Pareto (peaks-over-threshold) fit to simulated
+  losses gives EVT VaR/ES at 95/99/99.5/99.9 with the threshold, exceedance count,
+  and a small-sample warning.
+- **Variance reduction**: antithetic variates and a GBM control variate (CPU-only);
+  optional Sobol QMC when scipy is present, with graceful fallback. Convergence
+  diagnostics compare plain vs variance-reduced Monte Carlo. The method is recorded
+  in exports as `variance_reduction_method`.
+- **Advanced risk metrics**: max drawdown, drawdown duration, Calmar, annualized
+  Sharpe/Sortino, probability of ruin (user threshold), and a *theoretical-only*
+  Kelly fraction (with a strong warning).
+- **Portfolio mode**: multi-asset correlated GBM with covariance shrinkage
+  (Ledoit-Wolf when scikit-learn is available, else a diagonal-shrinkage fallback)
+  and a Cholesky factor with PD repair. Outputs portfolio VaR/ES, per-asset summary,
+  and a correlation-matrix export. Chunk-safe (per-asset block, never paths × steps).
+- **Model validation**: a rolling-window GBM backtest reports the coverage of
+  realized forward returns inside the model's 5–95 band, plus calibration warnings
+  (very high drift, short history, low EVT exceedance count).
+- Exports include `math_model_version`, all model parameters, drift mode, variance
+  reduction method, a `warnings` list, and EVT/portfolio metadata when used. The
+  comparison dashboard adds EVT 99% tail loss/ES, max-drawdown probability,
+  probability of ruin, Sharpe/Sortino, and a model-disagreement rank.
 
 Extra output metrics include P(ending > +20%), P(ending < -10%),
 P(ending < -20%), probability of a 50% drawdown, and the worst-1% average ending
