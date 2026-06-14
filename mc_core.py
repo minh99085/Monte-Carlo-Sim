@@ -23,7 +23,7 @@ Design goals (CPU-first, Windows-laptop friendly):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Optional, Dict, List, Any
 import csv
 import io
@@ -1123,3 +1123,189 @@ def tail_risk_warning(paths: int) -> Optional[str]:
             "Keep chunk size at 25,000-50,000 and expect a longer runtime."
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Model comparison (run several models on identical settings, side-by-side)
+# ---------------------------------------------------------------------------
+
+# Columns reported in the comparison table, in display order.
+COMPARISON_COLUMNS = (
+    "model",
+    "expected_ending_value",
+    "median_ending_value",
+    "prob_profit",
+    "prob_loss",
+    "prob_gain_20",
+    "prob_loss_10",
+    "prob_loss_20",
+    "prob_drawdown_50",
+    "percentile_5",
+    "percentile_95",
+    "var_99",
+    "es_99",
+    "runtime_seconds",
+    "chunk_safe",
+)
+
+
+def comparison_row(result: SimulationResult) -> Dict[str, Any]:
+    """Flatten a :class:`SimulationResult` into one comparison-table row."""
+
+    s = result.stats
+    return {
+        "model": result.config.model,
+        "expected_ending_value": s["expected_value"],
+        "median_ending_value": s["median_value"],
+        "prob_profit": s["prob_profit"],
+        "prob_loss": s["prob_loss"],
+        "prob_gain_20": s["prob_gain_20"],
+        "prob_loss_10": s["prob_loss_10"],
+        "prob_loss_20": s["prob_loss_20"],
+        "prob_drawdown_50": s.get("prob_drawdown", float("nan")),
+        "percentile_5": s["percentiles"]["5"],
+        "percentile_95": s["percentiles"]["95"],
+        "var_99": s["var"]["99"]["value"],
+        "es_99": s["expected_shortfall"]["99"]["value"],
+        "runtime_seconds": s.get("runtime_seconds", result.runtime_seconds),
+        "chunk_safe": result.memory.is_chunk_safe,
+    }
+
+
+@dataclass
+class ComparisonReport:
+    """Result of comparing several models on identical settings."""
+
+    base_config: SimulationConfig
+    rows: List[Dict[str, Any]]
+    per_model: Dict[str, Dict[str, Any]]   # model -> {stats, memory, assumptions}
+    most_conservative: Optional[str]
+    market_source: Optional[str] = None
+
+    @property
+    def models(self) -> List[str]:
+        return [r["model"] for r in self.rows]
+
+    @property
+    def all_chunk_safe(self) -> bool:
+        return all(r["chunk_safe"] for r in self.rows)
+
+
+def most_conservative_model(rows: List[Dict[str, Any]]) -> Optional[str]:
+    """Pick the most conservative model.
+
+    Ranking favours the model with the highest probability of a >20% loss and,
+    as a tie-breaker, the highest 99% Expected Shortfall.
+    """
+
+    if not rows:
+        return None
+    best = max(rows, key=lambda r: (r["prob_loss_20"], r["es_99"]))
+    return best["model"]
+
+
+def compare_models(
+    base_config: SimulationConfig,
+    models: "Optional[List[str]]" = None,
+    *,
+    market: Optional[MarketParameters] = None,
+) -> ComparisonReport:
+    """Run several models on identical settings and assemble a comparison.
+
+    Each model reuses the chunk-safe :func:`simulate` engine, so no run ever
+    allocates a full ``paths x steps`` matrix.  ``base_config`` supplies the
+    shared ticker/paths/horizon/chunk/seed/drift settings; only ``model`` (and
+    its model-specific knobs already present on the config) varies per run.
+    """
+
+    if models is None:
+        models = list(MODELS)
+    if not models:
+        raise ValueError("compare_models requires at least one model")
+
+    base = replace(base_config)  # shallow copy so we never mutate the caller's config
+    rows: List[Dict[str, Any]] = []
+    per_model: Dict[str, Dict[str, Any]] = {}
+
+    for model in models:
+        if model not in MODELS:
+            raise ValueError(f"Unknown model: {model!r}")
+        cfg = replace(base, model=model)
+        result = simulate(cfg)
+        rows.append(comparison_row(result))
+        per_model[model] = {
+            "assumptions": model_assumptions(cfg, market),
+            "statistics": result.stats,
+            "memory": {
+                "is_chunk_safe": result.memory.is_chunk_safe,
+                "peak_matrix_elements": result.memory.peak_matrix_elements,
+                "full_matrix_elements": result.memory.full_matrix_elements,
+                "peak_vector_elements": result.memory.peak_vector_elements,
+                "status": result.memory.status(),
+            },
+        }
+
+    return ComparisonReport(
+        base_config=base,
+        rows=rows,
+        per_model=per_model,
+        most_conservative=most_conservative_model(rows),
+        market_source=(market.source if market is not None else None),
+    )
+
+
+def comparison_to_csv(report: ComparisonReport) -> str:
+    """Serialise the comparison table to CSV (one row per model)."""
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(list(COMPARISON_COLUMNS))
+    for row in report.rows:
+        writer.writerow([row[col] for col in COMPARISON_COLUMNS])
+    # Trailing annotation rows for shared context / headline takeaway.
+    writer.writerow([])
+    writer.writerow(["most_conservative_model", report.most_conservative])
+    writer.writerow(["ticker", report.base_config.ticker])
+    writer.writerow(["paths", report.base_config.paths])
+    writer.writerow(["horizon", report.base_config.horizon])
+    writer.writerow(["chunk_size", report.base_config.chunk_size])
+    writer.writerow(["seed", report.base_config.seed])
+    writer.writerow(["drift_mode", report.base_config.drift_mode])
+    writer.writerow(["all_chunk_safe", report.all_chunk_safe])
+    return buffer.getvalue()
+
+
+def comparison_to_json(report: ComparisonReport, *, indent: int = 2) -> str:
+    """Serialise the full comparison (table + per-model metadata) to JSON."""
+
+    cfg = report.base_config
+    payload = {
+        "comparison": {
+            "ticker": cfg.ticker,
+            "paths": cfg.paths,
+            "horizon": cfg.horizon,
+            "chunk_size": cfg.chunk_size,
+            "seed": cfg.seed,
+            "drift_mode": cfg.drift_mode,
+            "s0": cfg.s0,
+            "models": report.models,
+            "most_conservative_model": report.most_conservative,
+            "all_chunk_safe": report.all_chunk_safe,
+            "market_source": report.market_source,
+        },
+        "table": report.rows,
+        "per_model": report.per_model,
+    }
+    return json.dumps(payload, indent=indent, default=_json_default)
+
+
+def write_comparison_csv(report: ComparisonReport, path: str) -> str:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        fh.write(comparison_to_csv(report))
+    return path
+
+
+def write_comparison_json(report: ComparisonReport, path: str) -> str:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(comparison_to_json(report))
+    return path
