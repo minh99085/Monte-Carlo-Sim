@@ -474,6 +474,186 @@ def test_invalid_config_raises(kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Realism models: each model runs at small scale and stays chunk-safe
+# ---------------------------------------------------------------------------
+
+
+def _hist_returns(n=500, seed=0):
+    rng = np.random.default_rng(seed)
+    return rng.normal(0.0003, 0.02, size=n)
+
+
+def _model_config(model, **overrides):
+    base = dict(
+        s0=100.0, paths=4_000, horizon=20, mu=0.10, sigma=0.30,
+        chunk_size=1_000, seed=11, model=model,
+        historical_returns=_hist_returns(),
+    )
+    base.update(overrides)
+    return mc_core.SimulationConfig(**base)
+
+
+@pytest.mark.parametrize("model", list(mc_core.MODELS))
+def test_each_model_runs_small_and_chunk_safe(model):
+    result = mc_core.simulate(_model_config(model))
+    assert result.final_values.shape == (4_000,)
+    assert np.all(np.isfinite(result.final_values))
+    assert np.all(result.final_values > 0)
+    assert result.memory.is_chunk_safe
+    assert result.memory.peak_vector_elements <= 1_000
+    # New metrics are present for every model.
+    for key in ("prob_gain_20", "prob_loss_10", "prob_loss_20",
+                "prob_drawdown", "worst_1pct_avg_value", "model", "drift_mode"):
+        assert key in result.stats
+
+
+@pytest.mark.parametrize("model", list(mc_core.MODELS))
+def test_each_model_reproducible_with_seed(model):
+    cfg = _model_config(model, seed=2024)
+    r1 = mc_core.simulate(cfg)
+    r2 = mc_core.simulate(cfg)
+    assert np.array_equal(r1.final_values, r2.final_values)
+
+
+def test_student_t_requires_valid_df():
+    with pytest.raises(ValueError):
+        mc_core.SimulationConfig(
+            s0=100.0, paths=10, horizon=5, model=mc_core.MODEL_STUDENT_T, t_df=2.0
+        ).validate()
+
+
+def test_bootstrap_requires_history():
+    with pytest.raises(ValueError):
+        mc_core.SimulationConfig(
+            s0=100.0, paths=10, horizon=5,
+            model=mc_core.MODEL_HIST_BOOTSTRAP, historical_returns=None,
+        ).validate()
+
+
+def test_block_bootstrap_preserves_block_length():
+    # Block bootstrap with block length == horizon means each path reads one
+    # contiguous run from history -> still chunk-safe and finite.
+    cfg = _model_config(mc_core.MODEL_BLOCK_BOOTSTRAP, block_length=20, horizon=20)
+    result = mc_core.simulate(cfg)
+    assert result.memory.is_chunk_safe
+    assert np.all(np.isfinite(result.final_values))
+
+
+def test_crypto_jumps_are_heavier_than_stock():
+    stock = mc_core.JUMP_PRESETS["stock"]
+    crypto = mc_core.JUMP_PRESETS["crypto"]
+    assert crypto["intensity"] > stock["intensity"]
+    assert abs(crypto["mean"]) >= abs(stock["mean"])
+    assert crypto["vol"] > stock["vol"]
+
+
+def test_regime_presets_are_row_stochastic():
+    for preset in mc_core.REGIME_PRESETS.values():
+        P = np.asarray(preset["transition"], dtype=float)
+        assert P.shape[0] == P.shape[1]
+        assert np.allclose(P.sum(axis=1), 1.0)
+        assert np.all(P >= 0)
+
+
+# ---------------------------------------------------------------------------
+# Stress overlay
+# ---------------------------------------------------------------------------
+
+
+def test_stress_overlay_lowers_outcomes():
+    base = dict(s0=100.0, paths=8_000, horizon=30, mu=0.1, sigma=0.2,
+                chunk_size=2_000, seed=5, model=mc_core.MODEL_GBM)
+    calm = mc_core.simulate(mc_core.SimulationConfig(**base))
+    stressed = mc_core.simulate(mc_core.SimulationConfig(
+        stress_enabled=True, stress_crash_pct=0.2, stress_vol_multiplier=2.0,
+        stress_drift_haircut=0.5, **base,
+    ))
+    # A day-1 crash plus a drift haircut should drag the mean down materially.
+    assert stressed.stats["expected_value"] < calm.stats["expected_value"]
+    assert stressed.stats["prob_loss_10"] > calm.stats["prob_loss_10"]
+
+
+def test_effective_drift_modes():
+    cfg = mc_core.SimulationConfig(mu=0.10, sigma=0.2)
+    assert cfg.effective_mu() == pytest.approx(0.10)
+    assert mc_core.SimulationConfig(
+        mu=0.10, drift_mode=mc_core.DRIFT_HALF).effective_mu() == pytest.approx(0.05)
+    assert mc_core.SimulationConfig(
+        mu=0.10, drift_mode=mc_core.DRIFT_ZERO).effective_mu() == pytest.approx(0.0)
+    assert mc_core.SimulationConfig(
+        mu=0.10, drift_mode=mc_core.DRIFT_MANUAL,
+        manual_drift=0.03).effective_mu() == pytest.approx(0.03)
+
+
+def test_million_path_each_model_chunk_safe_without_running():
+    """1,000,000-path configs remain chunk-safe for every model (no run)."""
+    for model in mc_core.MODELS:
+        cfg = mc_core.SimulationConfig(
+            s0=100.0, paths=1_000_000, horizon=252,
+            chunk_size=mc_core.DEFAULT_SERIOUS_CHUNK_SIZE, model=model,
+            historical_returns=_hist_returns(), sample_paths=100,
+        )
+        mem = mc_core.predict_memory(cfg)
+        assert mem.is_chunk_safe
+        assert mem.peak_matrix_elements < mem.full_matrix_elements
+        assert mem.peak_vector_elements == mc_core.DEFAULT_SERIOUS_CHUNK_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Probability buckets in the statistics bundle
+# ---------------------------------------------------------------------------
+
+
+def test_probability_buckets_in_statistics():
+    # Deterministic final values: 6 up >20%, mixed losses.
+    fv = np.array([50.0, 70.0, 79.0, 85.0, 95.0, 100.0,
+                   121.0, 130.0, 140.0, 200.0])
+    stats = mc_core.compute_statistics(fv, s0=100.0, drawdown_prob=0.123)
+    assert stats["prob_gain_20"] == pytest.approx(0.4)   # 121,130,140,200
+    assert stats["prob_loss_10"] == pytest.approx(0.4)   # 50,70,79,85
+    assert stats["prob_loss_20"] == pytest.approx(0.3)   # 50,70,79
+    assert stats["prob_drawdown"] == pytest.approx(0.123)
+    assert stats["worst_1pct_avg_value"] == pytest.approx(50.0)
+
+
+def test_drawdown_probability_detects_crashes():
+    # A guaranteed day-1 90% crash forces every path past a 50% drawdown.
+    cfg = mc_core.SimulationConfig(
+        s0=100.0, paths=2_000, horizon=10, mu=0.0, sigma=0.1,
+        chunk_size=500, seed=1, model=mc_core.MODEL_GBM,
+        stress_enabled=True, stress_crash_pct=0.9,
+    )
+    result = mc_core.simulate(cfg)
+    assert result.stats["prob_drawdown"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# Exports include model metadata
+# ---------------------------------------------------------------------------
+
+
+def test_exports_include_model_metadata():
+    cfg = _model_config(mc_core.MODEL_MERTON, jump_intensity=3.0)
+    result = mc_core.simulate(cfg)
+
+    csv_text = mc_core.report_to_csv(result)
+    assert "model," in csv_text
+    assert "Merton Jump-Diffusion" in csv_text
+    assert "drift_mode" in csv_text
+    assert "jump_intensity" in csv_text
+    assert "stress_enabled" in csv_text
+    assert "prob_gain_more_than_20pct" in csv_text
+    assert "prob_drawdown_50pct" in csv_text
+
+    report = json.loads(mc_core.report_to_json(result))
+    assert report["model"]["model"] == "Merton Jump-Diffusion"
+    assert "jump_intensity" in report["model"]
+    assert report["model"]["stress"]["enabled"] is False
+    assert "prob_gain_20" in report["statistics"]
+    assert report["config"]["model"] == "Merton Jump-Diffusion"
+
+
+# ---------------------------------------------------------------------------
 # Parameter estimation (annualized mu / sigma)
 # ---------------------------------------------------------------------------
 
