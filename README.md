@@ -191,6 +191,38 @@ comparison as **CSV** and **JSON** (the JSON includes per-model assumptions and
 memory/chunk-safety metadata). Every comparison run uses the same chunk-safe
 engine, so no full path × step matrix is ever allocated.
 
+## Investment Report (plain-English risk lab)
+
+The GUI has an **Investment Report** tab that turns the simulation into an
+institutional-style, plain-English risk report for a non-coder investor. You set
+a ticker, horizon, risk tolerance (Conservative/Moderate/Aggressive), maximum
+acceptable loss, ruin threshold, investment amount, and an optional benchmark
+(default SPY), then click **Run Report**. It:
+
+- runs the **full institutional model stack** (all nine models) on the chunk-safe
+  engine, plus a **stress-test suite** (zero drift, half drift, doubled
+  volatility, one-day −10%/−20% crashes, a bear regime, and a combined stress);
+- computes a **model-risk confidence** score (High / Medium / Low) from history
+  length, drift/volatility extremeness, model disagreement, tail severity, and
+  backtest coverage — with a "do not rely on this result alone" warning when Low;
+- gives a descriptive **investment label** (`Favorable but risky`,
+  `Neutral / uncertain`, `Unfavorable risk-reward`, or `Too uncertain to judge`)
+  — never a guaranteed buy/sell;
+- shows **plain-English risk cards** (Profit Chance, Big Loss Chance, Severe
+  Drawdown Chance, Worst Model, Model Confidence, Investment Label) and a written
+  report (Bottom Line, What the Simulation Says, Best/Base/Bad/Severe-Stress
+  cases, Biggest Risks, What Could Make This Wrong, Position Sizing Warning, and
+  Suggested Next Questions);
+- adds a **benchmark comparison** (beta, correlation, excess return, drawdown,
+  downside risk) and best-effort **fundamentals** (gracefully shows
+  "Fundamental data unavailable from source" when missing);
+- exports a **Markdown** report, a **JSON** institutional report, and a **CSV**
+  comparison table to `outputs/{ticker}_investment_report.md` / `.json` /
+  `{ticker}_institutional_comparison.csv`.
+
+This is a statistical risk simulation, not investment advice, a forecast, or a
+guarantee.
+
 ## Memory safety notes
 
 - Default **Serious-mode chunk size is 25,000–50,000 paths**, which bounds peak
