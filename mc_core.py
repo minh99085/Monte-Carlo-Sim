@@ -219,6 +219,36 @@ class MarketParameters:
     note: str = ""
 
 
+def annualized_parameters(prices) -> "tuple[float, float]":
+    """Estimate annualized ``(mu, sigma)`` from a 1-D price series.
+
+    Uses daily log returns:
+
+    * daily drift   = mean(log returns)
+    * daily vol     = std(log returns, ddof=1)
+    * annual sigma  = daily vol * sqrt(252)
+    * annual mu     = daily drift * 252 + 0.5 * (daily vol ** 2) * 252
+
+    The ``0.5 * sigma^2`` term converts the estimated *log* drift back into the
+    simple annualized drift expected by the GBM formula
+    ``exp((mu - 0.5 * sigma^2) * dt + sigma * sqrt(dt) * Z)``, so the simulated
+    expected log-growth matches the history.
+    """
+
+    prices = np.asarray(prices, dtype=float).ravel()
+    if prices.size < 2:
+        raise ValueError("need at least two prices to estimate parameters")
+    if np.any(prices <= 0):
+        raise ValueError("prices must be strictly positive")
+
+    log_ret = np.diff(np.log(prices))
+    daily_mu = float(np.mean(log_ret))
+    daily_sigma = float(np.std(log_ret, ddof=1)) if log_ret.size > 1 else 0.0
+    mu = daily_mu * TRADING_DAYS_PER_YEAR + 0.5 * (daily_sigma ** 2) * TRADING_DAYS_PER_YEAR
+    sigma = daily_sigma * math.sqrt(TRADING_DAYS_PER_YEAR)
+    return mu, sigma
+
+
 def estimate_parameters_from_history(
     ticker: str,
     years: float = 3.0,
@@ -254,12 +284,7 @@ def estimate_parameters_from_history(
         if prices.size < 2:
             raise ValueError("insufficient price history")
 
-        log_ret = np.diff(np.log(prices))
-        daily_mu = float(np.mean(log_ret))
-        daily_sigma = float(np.std(log_ret, ddof=1))
-        # Convert log-drift back to the simple annualized drift used by GBM.
-        mu = daily_mu * TRADING_DAYS_PER_YEAR + 0.5 * (daily_sigma ** 2) * TRADING_DAYS_PER_YEAR
-        sigma = daily_sigma * math.sqrt(TRADING_DAYS_PER_YEAR)
+        mu, sigma = annualized_parameters(prices)
         s0 = float(prices[-1]) if s0_override is None else float(s0_override)
         return MarketParameters(s0=s0, mu=mu, sigma=sigma, source="yfinance", note=note)
     except Exception as exc:  # noqa: BLE001 - any failure -> safe fallback
