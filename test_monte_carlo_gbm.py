@@ -41,6 +41,38 @@ def test_cli_module_imports():
     assert callable(monte_carlo_gbm.run)
 
 
+def test_app_exposes_model_selector():
+    """The GUI source must wire a real model selector to mc_core.MODELS."""
+    import inspect
+    import app
+
+    src = inspect.getsource(app.main)
+    # A selectbox driven by the real model catalogue (not faked metadata).
+    assert "Simulation model" in src
+    assert "list(mc_core.MODELS)" in src
+    # Conservative drift-mode selector is present too.
+    assert "list(mc_core.DRIFT_MODES)" in src
+    # Title/caption must not advertise a GBM-only tool.
+    assert "GBM Simulator" not in src
+
+
+def test_app_build_config_supports_every_model():
+    """build_config_from_inputs must produce a runnable config for each model."""
+    import app
+
+    hist = np.random.default_rng(1).normal(0.0003, 0.02, size=400)
+    for model in mc_core.MODELS:
+        cfg = app.build_config_from_inputs(
+            ticker="TST", s0=100.0, paths=2_000, horizon=15, mu=0.08, sigma=0.25,
+            chunk_size=1_000, seed=3, cost=0.0,
+            model=model, historical_returns=hist,
+        )
+        assert cfg.model == model
+        result = mc_core.simulate(cfg)
+        assert result.final_values.shape == (2_000,)
+        assert result.stats["model"] == model
+
+
 # ---------------------------------------------------------------------------
 # Path-mode helpers
 # ---------------------------------------------------------------------------

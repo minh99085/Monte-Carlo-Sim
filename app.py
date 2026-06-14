@@ -128,16 +128,77 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    st.set_page_config(page_title="Monte Carlo GBM Simulator", layout="wide")
-    st.title("Monte Carlo GBM Simulator")
+    st.set_page_config(page_title="Monte Carlo Market-Risk Simulator", layout="wide")
+    st.title("Monte Carlo Market-Risk Simulator")
     st.caption(
-        "CPU-first, memory-safe Geometric Brownian Motion simulation. "
+        "CPU-first, memory-safe multi-model market-risk simulator: GBM, Student-t, "
+        "Historical/Block Bootstrap, Merton Jump-Diffusion, and Regime Switching. "
         "Never allocates a full path x step matrix."
     )
 
     # ---------------------- Sidebar inputs ----------------------
     with st.sidebar:
         st.header("Inputs")
+
+        # ---------------------- Model selection (top of sidebar) ----------------------
+        st.subheader("Model")
+        model = st.selectbox(
+            "Simulation model", list(mc_core.MODELS), index=0,
+            help="Choose the stochastic model used to generate price paths.",
+        )
+
+        model_inputs: dict = {"model": model}
+        if model == mc_core.MODEL_STUDENT_T:
+            model_inputs["t_df"] = st.number_input(
+                "Student-t degrees of freedom", min_value=2.5, max_value=100.0,
+                value=5.0, step=0.5,
+                help="Lower = fatter tails. Shocks are standardized to unit variance.",
+            )
+        elif model == mc_core.MODEL_BLOCK_BOOTSTRAP:
+            model_inputs["block_length"] = st.number_input(
+                "Block length (days)", min_value=1, max_value=120, value=20, step=1,
+                help="Preserves short-term volatility clustering.",
+            )
+        elif model == mc_core.MODEL_MERTON:
+            jump_preset = st.selectbox("Jump preset", ["stock", "crypto", "custom"], index=0)
+            base = mc_core.JUMP_PRESETS.get(
+                jump_preset, mc_core.JUMP_PRESETS["stock"]
+            )
+            disabled = jump_preset != "custom"
+            model_inputs["jump_intensity"] = st.number_input(
+                "Jump intensity (per year)", min_value=0.0, max_value=100.0,
+                value=float(base["intensity"]), step=0.5, disabled=disabled,
+            )
+            model_inputs["jump_mean"] = st.number_input(
+                "Jump mean (log)", min_value=-1.0, max_value=1.0,
+                value=float(base["mean"]), step=0.01, format="%.3f", disabled=disabled,
+            )
+            model_inputs["jump_vol"] = st.number_input(
+                "Jump volatility (log)", min_value=0.0, max_value=1.0,
+                value=float(base["vol"]), step=0.01, format="%.3f", disabled=disabled,
+            )
+        elif model == mc_core.MODEL_REGIME:
+            model_inputs["regime_preset"] = st.selectbox(
+                "Regime preset", list(mc_core.REGIME_PRESETS), index=0,
+                help="Crypto preset spends more time in high-vol/crash regimes.",
+            )
+        elif model in mc_core.BOOTSTRAP_MODELS:
+            st.caption("Uses empirical daily returns sampled from history.")
+
+        # ---------------------- Conservative drift mode ----------------------
+        st.subheader("Drift mode")
+        drift_mode = st.selectbox(
+            "Conservative drift mode", list(mc_core.DRIFT_MODES), index=0,
+            help="Reduce reliance on historical drift for more conservative outlooks.",
+        )
+        manual_drift = None
+        if drift_mode == mc_core.DRIFT_MANUAL:
+            manual_drift = st.number_input(
+                "Manual annual drift", min_value=-1.0, max_value=2.0,
+                value=0.0, step=0.01, format="%.3f",
+            )
+
+        st.subheader("Asset")
         ticker = st.text_input("Ticker", value="AAPL").strip().upper()
         years = st.number_input(
             "Years of history", min_value=1.0, max_value=30.0, value=3.0, step=1.0
@@ -208,64 +269,6 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
             "Transaction cost / slippage (fraction)",
             min_value=0.0, max_value=0.5, value=0.0, step=0.0005, format="%.4f",
         )
-
-        # ---------------------- Model selection ----------------------
-        st.subheader("Model")
-        model = st.selectbox(
-            "Simulation model", list(mc_core.MODELS), index=0,
-            help="Choose the stochastic model used to generate price paths.",
-        )
-
-        model_inputs: dict = {"model": model}
-        if model == mc_core.MODEL_STUDENT_T:
-            model_inputs["t_df"] = st.number_input(
-                "Student-t degrees of freedom", min_value=2.5, max_value=100.0,
-                value=5.0, step=0.5,
-                help="Lower = fatter tails. Shocks are standardized to unit variance.",
-            )
-        elif model == mc_core.MODEL_BLOCK_BOOTSTRAP:
-            model_inputs["block_length"] = st.number_input(
-                "Block length (days)", min_value=1, max_value=120, value=20, step=1,
-                help="Preserves short-term volatility clustering.",
-            )
-        elif model == mc_core.MODEL_MERTON:
-            jump_preset = st.selectbox("Jump preset", ["stock", "crypto", "custom"], index=0)
-            base = mc_core.JUMP_PRESETS.get(
-                jump_preset, mc_core.JUMP_PRESETS["stock"]
-            )
-            disabled = jump_preset != "custom"
-            model_inputs["jump_intensity"] = st.number_input(
-                "Jump intensity (per year)", min_value=0.0, max_value=100.0,
-                value=float(base["intensity"]), step=0.5, disabled=disabled,
-            )
-            model_inputs["jump_mean"] = st.number_input(
-                "Jump mean (log)", min_value=-1.0, max_value=1.0,
-                value=float(base["mean"]), step=0.01, format="%.3f", disabled=disabled,
-            )
-            model_inputs["jump_vol"] = st.number_input(
-                "Jump volatility (log)", min_value=0.0, max_value=1.0,
-                value=float(base["vol"]), step=0.01, format="%.3f", disabled=disabled,
-            )
-        elif model == mc_core.MODEL_REGIME:
-            model_inputs["regime_preset"] = st.selectbox(
-                "Regime preset", list(mc_core.REGIME_PRESETS), index=0,
-                help="Crypto preset spends more time in high-vol/crash regimes.",
-            )
-        elif model in mc_core.BOOTSTRAP_MODELS:
-            st.caption("Uses empirical daily returns sampled from history.")
-
-        # ---------------------- Conservative drift mode ----------------------
-        st.subheader("Drift mode")
-        drift_mode = st.selectbox(
-            "Conservative drift mode", list(mc_core.DRIFT_MODES), index=0,
-            help="Reduce reliance on historical drift for more conservative outlooks.",
-        )
-        manual_drift = None
-        if drift_mode == mc_core.DRIFT_MANUAL:
-            manual_drift = st.number_input(
-                "Manual annual drift", min_value=-1.0, max_value=2.0,
-                value=0.0, step=0.01, format="%.3f",
-            )
 
         # ---------------------- Stress overlay ----------------------
         st.subheader("Stress overlay")
