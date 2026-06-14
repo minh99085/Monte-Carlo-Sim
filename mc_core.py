@@ -280,6 +280,25 @@ def apply_costs(gross_ending: np.ndarray, s0: float, cost: float) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
+def predict_memory(config: "SimulationConfig") -> MemoryInfo:
+    """Predict the memory footprint of :func:`simulate` *without* running it.
+
+    Mirrors the accounting performed inside :func:`simulate`: the only 2-D array
+    kept is the bounded sample-trajectory block, and the largest 1-D working
+    buffer is bounded by the chunk size.  This lets callers (and tests) confirm
+    chunk-safety for very large path counts without paying for the simulation.
+    """
+
+    cfg = config
+    n_sample = min(cfg.sample_paths, cfg.paths)
+    mem = MemoryInfo(
+        paths=cfg.paths, horizon=cfg.horizon, chunk_size=cfg.chunk_size
+    )
+    mem.peak_matrix_elements = n_sample * (cfg.horizon + 1)
+    mem.peak_vector_elements = min(cfg.chunk_size, cfg.paths)
+    return mem
+
+
 def simulate(config: SimulationConfig) -> SimulationResult:
     """Run a chunked GBM Monte Carlo simulation.
 
