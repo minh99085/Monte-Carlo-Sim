@@ -1,16 +1,6 @@
-# Monte Carlo GBM simulator - CPU-first, Windows-laptop friendly.
-# Core numerics (required by the CLI and the simulation engine):
 numpy>=1.24
 pandas>=2.0
-
-# Charts (CLI charts and GUI charts):
 matplotlib>=3.7
-
-# GUI:
 streamlit>=1.30
-
-# Market data (optional at runtime; the tool falls back to safe defaults offline):
 yfinance>=0.2.40
-
-# Tests:
 pytest>=7.0
