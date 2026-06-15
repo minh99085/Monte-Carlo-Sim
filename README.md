@@ -67,6 +67,35 @@ streamlit run app.py
 
 To deactivate the virtual environment later, run `deactivate`.
 
+## Clean-install verification
+
+To confirm a fresh clone installs and runs end-to-end, use a brand-new virtual
+environment and run the exact commands below.
+
+**Windows (PowerShell):**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -m pytest -q
+python -c "import app; import mc_core; import mc_report; print('imports ok')"
+python monte_carlo_gbm.py AAPL --paths 1000 --horizon 10 --no-chart
+python run_gbm_million.py --ticker AAPL --paths 10000 --horizon 252 --years 5 --seed 42 --no-chart
+```
+
+**Linux / macOS:**
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+./verify_install.sh
+```
+
+`verify_install.sh` runs the same upgrade-pip → install → tests → imports → CLI →
+million-path checks in one step.
+
 ## Command line usage
 
 ```powershell
