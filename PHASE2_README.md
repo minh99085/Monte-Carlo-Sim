@@ -18,7 +18,7 @@ reduction in the simulate loop, calibration, statistical backtests).
 | Kupiec POF + rolling VaR coverage | **Done** |
 | CLI `--tactical` | **Done** |
 | GUI **Tactical** tab | **Done** |
-| Optional Numba | Detected / reported (`numba_available` in stats); hot path uses NumPy vectorization |
+| Optional Numba | **Done** — classic stop/hold kernel JIT when `numba` installed; NumPy vectorized fallback |
 | Plotly / PDF exports | **Phase 3** |
 | Parallel multi-process path farm | **Phase 3** |
 

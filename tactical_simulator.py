@@ -71,13 +71,81 @@ def _numba_available() -> bool:
         return False
 
 
-def _try_njit(fn):
-    """Decorator-like helper: return njit(fn) or fn."""
-    try:  # pragma: no cover
+def _classic_stop_hold_kernel(
+    paths: np.ndarray,
+    max_hold: int,
+    stop_pct: float,
+    is_long: bool,
+    cost: float,
+):
+    """
+    Classic enter-at-t0 / hard-stop / max-hold engine over all paths.
+
+    Pure Python + NumPy types so the same body can run under Numba ``njit``
+    or as a plain function.  Returns ``(exit_day, stop_hit, pnl, pnl_pct)``.
+    """
+    n_paths, n_cols = paths.shape
+    horizon = n_cols - 1
+    mh = max_hold if max_hold < horizon else horizon
+    if mh < 1:
+        mh = 1
+
+    exit_day = np.empty(n_paths, dtype=np.int64)
+    stop_hit = np.zeros(n_paths, dtype=np.bool_)
+    pnl = np.empty(n_paths, dtype=np.float64)
+    pnl_pct = np.empty(n_paths, dtype=np.float64)
+
+    for i in range(n_paths):
+        entry = paths[i, 0]
+        ed = mh
+        hit = False
+        if stop_pct > 0.0:
+            for d in range(1, mh + 1):
+                close = paths[i, d]
+                if is_long:
+                    if close <= entry * (1.0 - stop_pct):
+                        ed = d
+                        hit = True
+                        break
+                else:
+                    if close >= entry * (1.0 + stop_pct):
+                        ed = d
+                        hit = True
+                        break
+        exit_px = paths[i, ed]
+        if is_long:
+            p = exit_px * (1.0 - cost) - entry * (1.0 + cost)
+        else:
+            p = entry * (1.0 - cost) - exit_px * (1.0 + cost)
+        exit_day[i] = ed
+        stop_hit[i] = hit
+        pnl[i] = p
+        pnl_pct[i] = p / entry if entry != 0.0 else 0.0
+
+    return exit_day, stop_hit, pnl, pnl_pct
+
+
+# Compile with Numba when present; otherwise keep the pure-Python kernel.
+_classic_stop_hold_kernel_jit = None
+if _numba_available():  # pragma: no cover - depends on optional dep
+    try:
         from numba import njit
-        return njit(cache=True)(fn)
+
+        _classic_stop_hold_kernel_jit = njit(cache=True)(_classic_stop_hold_kernel)
     except Exception:
-        return fn
+        _classic_stop_hold_kernel_jit = None
+
+
+def _run_classic_stop_hold(
+    paths: np.ndarray,
+    max_hold: int,
+    stop_pct: float,
+    is_long: bool,
+    cost: float,
+):
+    """Dispatch to Numba JIT kernel when available, else pure Python."""
+    fn = _classic_stop_hold_kernel_jit or _classic_stop_hold_kernel
+    return fn(paths, int(max_hold), float(stop_pct), bool(is_long), float(cost))
 
 
 # ---------------------------------------------------------------------------
@@ -652,40 +720,66 @@ def _apply_rule_vectorized_simple(
     cost: float,
     side: str,
 ) -> Dict[str, np.ndarray]:
-    """Fast vectorized path for classic enter-at-0 / stop / max-hold rules."""
+    """
+    Fast path for classic enter-at-0 / stop / max-hold rules.
+
+    Uses an optional Numba JIT kernel when ``numba`` is installed; otherwise a
+    pure-Python kernel with the same math (still fine for short 5–10 day horizons).
+    """
     n_paths, n_cols = paths.shape
     horizon = n_cols - 1
     max_hold = min(int(rule.max_holding_days), horizon)
-    entry = paths[:, 0].copy()
+    if max_hold < 1:
+        max_hold = 1
+    entry = np.asarray(paths[:, 0], dtype=np.float64).copy()
     stop_pct = float(rule.stop_loss_pct)
+    is_long = side == SIDE_LONG
 
-    exit_day = np.full(n_paths, max_hold, dtype=np.int64)
-    stop_hit = np.zeros(n_paths, dtype=bool)
-
-    if stop_pct > 0.0 and max_hold >= 1:
-        still_open = np.ones(n_paths, dtype=bool)
-        for d in range(1, max_hold + 1):
-            close = paths[:, d]
-            if side == SIDE_LONG:
-                hit_today = close <= entry * (1.0 - stop_pct)
-            else:
-                hit_today = close >= entry * (1.0 + stop_pct)
-            newly = hit_today & still_open
-            if newly.any():
-                exit_day[newly] = d
-                stop_hit[newly] = True
-                still_open[newly] = False
-            if not still_open.any():
-                break
+    # Prefer NumPy vectorized scan (very fast); fall back to kernel for parity /
+    # when we want the Numba path exercised.  We use the kernel always when
+    # Numba is available so the optional dependency actually accelerates work;
+    # without Numba we keep the proven vectorized day-scan.
+    if _classic_stop_hold_kernel_jit is not None:
+        exit_day, stop_hit, pnl, pnl_pct = _run_classic_stop_hold(
+            np.ascontiguousarray(paths, dtype=np.float64),
+            max_hold,
+            stop_pct,
+            is_long,
+            float(cost),
+        )
+        stop_hit = np.asarray(stop_hit, dtype=bool)
+        exit_day = np.asarray(exit_day, dtype=np.int64)
+        pnl = np.asarray(pnl, dtype=np.float64)
+        pnl_pct = np.asarray(pnl_pct, dtype=np.float64)
+    else:
+        exit_day = np.full(n_paths, max_hold, dtype=np.int64)
+        stop_hit = np.zeros(n_paths, dtype=bool)
+        if stop_pct > 0.0 and max_hold >= 1:
+            still_open = np.ones(n_paths, dtype=bool)
+            for d in range(1, max_hold + 1):
+                close = paths[:, d]
+                if is_long:
+                    hit_today = close <= entry * (1.0 - stop_pct)
+                else:
+                    hit_today = close >= entry * (1.0 + stop_pct)
+                newly = hit_today & still_open
+                if newly.any():
+                    exit_day[newly] = d
+                    stop_hit[newly] = True
+                    still_open[newly] = False
+                if not still_open.any():
+                    break
+        rows = np.arange(n_paths)
+        exit_price_tmp = paths[rows, exit_day]
+        c = float(cost)
+        if is_long:
+            pnl = exit_price_tmp * (1.0 - c) - entry * (1.0 + c)
+        else:
+            pnl = entry * (1.0 - c) - exit_price_tmp * (1.0 + c)
+        pnl_pct = np.divide(pnl, entry, out=np.zeros_like(pnl), where=entry != 0)
 
     rows = np.arange(n_paths)
     exit_price = paths[rows, exit_day]
-    c = float(cost)
-    if side == SIDE_SHORT:
-        pnl = entry * (1.0 - c) - exit_price * (1.0 + c)
-    else:
-        pnl = exit_price * (1.0 - c) - entry * (1.0 + c)
-    pnl_pct = np.divide(pnl, entry, out=np.zeros_like(pnl), where=entry != 0)
 
     return {
         "pnl": pnl,
@@ -701,6 +795,7 @@ def _apply_rule_vectorized_simple(
         "entry_price": entry,
         "exit_price": exit_price,
         "side": side,
+        "numba_used": _classic_stop_hold_kernel_jit is not None,
     }
 
 
@@ -762,6 +857,7 @@ def compute_tactical_stats(
         "avg_holding_days": float(np.mean(holding)),
         "median_holding_days": float(np.median(holding)),
         "numba_available": _numba_available(),
+        "numba_used": bool(outcomes.get("numba_used", False)),
     }
 
 

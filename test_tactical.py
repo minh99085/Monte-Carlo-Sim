@@ -360,3 +360,43 @@ def test_app_exposes_tactical_tab():
     src = inspect.getsource(app)
     assert "Tactical" in src
     assert "_render_tactical" in src
+
+
+def test_numba_kernel_matches_python_when_available():
+    """If Numba is installed, JIT and pure kernels must agree on exits/P&L."""
+    import tactical_simulator as ts
+
+    rng = np.random.default_rng(99)
+    # Synthetic GBM-like paths, shape (n, horizon+1)
+    n, h = 400, 5
+    paths = np.empty((n, h + 1), dtype=np.float64)
+    paths[:, 0] = 100.0
+    for d in range(1, h + 1):
+        paths[:, d] = paths[:, d - 1] * np.exp(rng.normal(0, 0.02, size=n))
+
+    pure = ts._classic_stop_hold_kernel(paths, 5, 0.02, True, 0.001)
+    # Force pure vs dispatch (dispatch may be JIT)
+    dispatched = ts._run_classic_stop_hold(paths, 5, 0.02, True, 0.001)
+    for a, b in zip(pure, dispatched):
+        np.testing.assert_allclose(np.asarray(a, dtype=float), np.asarray(b, dtype=float), rtol=1e-12)
+
+    # Stats flag is present on a classic tactical run
+    cfg = preset_5_day(
+        "Z", paths=300, seed=4, starting_price=100.0,
+        annual_volatility=0.2, annual_drift=0.0,
+    )
+    res = run_tactical_simulation(cfg)
+    assert "numba_available" in res.stats
+    assert "numba_used" in res.stats
+
+
+def test_phase2_modules_importable_from_repo_root():
+    """Tactical + calibration must be first-class modules on main tree."""
+    import mc_calibration
+    import tactical_config
+    import tactical_simulator
+    assert hasattr(tactical_simulator, "run_tactical_simulation")
+    assert hasattr(tactical_config, "preset_5_day")
+    assert hasattr(mc_calibration, "calibrate_garch")
+    assert hasattr(mc_core, "kupiec_pof_test")
+    assert hasattr(mc_core, "rolling_var_coverage")

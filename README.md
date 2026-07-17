@@ -89,8 +89,9 @@ python -m venv .venv
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 python -m pytest -q
-python -c "import app; import mc_core; import mc_report; print('imports ok')"
+python -c "import app; import mc_core; import mc_report; import tactical_config; import tactical_simulator; import mc_calibration; print('imports ok')"
 python monte_carlo_gbm.py AAPL --paths 1000 --horizon 10 --no-chart
+python monte_carlo_gbm.py AAPL --tactical --paths 2000 --tactical-horizon 5 --seed 42 --start-price 100 --sigma 0.25 --tactical-tp 0.03 --no-chart
 python run_gbm_million.py --ticker AAPL --paths 10000 --horizon 252 --years 5 --seed 42 --no-chart
 ```
 
