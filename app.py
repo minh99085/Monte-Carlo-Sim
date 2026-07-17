@@ -396,12 +396,14 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
         evt_enabled=evt_enabled,
     )
 
-    tab_names = ["Single model", "Model comparison", "Investment Report"]
+    tab_names = ["Single model", "Model comparison", "Investment Report", "Tactical"]
     if portfolio_enabled:
         tab_names.append("Portfolio")
     _tabs = st.tabs(tab_names)
-    tab_single, tab_compare, tab_report = _tabs[0], _tabs[1], _tabs[2]
-    tab_portfolio = _tabs[3] if portfolio_enabled else None
+    tab_single, tab_compare, tab_report, tab_tactical = (
+        _tabs[0], _tabs[1], _tabs[2], _tabs[3]
+    )
+    tab_portfolio = _tabs[4] if portfolio_enabled else None
 
     with tab_single:
         # Run only when the button is clicked; persist the result in
@@ -454,6 +456,9 @@ def main() -> None:  # pragma: no cover - exercised via `streamlit run`
 
     with tab_report:
         _render_investment_report(st, pd, shared)
+
+    with tab_tactical:
+        _render_tactical(st, pd, shared)
 
     if tab_portfolio is not None:
         with tab_portfolio:
@@ -990,6 +995,178 @@ def _render_portfolio(st, pd, shared: dict) -> None:
         "Download portfolio JSON",
         data=_json.dumps(pf_export, indent=2, default=mc_core._json_default),
         file_name="portfolio_report.json", mime="application/json",
+    )
+
+
+def _render_tactical(st, pd, shared: dict) -> None:
+    """Phase 2 short-horizon tactical trading-rule simulator tab."""
+    from tactical_config import TradingRule, preset_5_day, preset_10_day
+    from tactical_simulator import run_tactical_simulation
+
+    st.subheader("Tactical short-horizon rule tester (5–10 trading days)")
+    st.caption(
+        "Simulate many short price paths with the existing Monte Carlo engine, "
+        "then apply a trading rule (entry, stop, take-profit, trailing stop, "
+        "max hold, optional re-entry). Results are research stats — not live signals."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        t_ticker = st.text_input("Tactical ticker", value=shared.get("ticker") or "AAPL",
+                                 key="tac_ticker").strip().upper()
+        t_horizon = st.selectbox("Horizon (trading days)", [5, 10], index=0, key="tac_h")
+        t_paths = st.number_input("Paths", min_value=1_000, max_value=200_000,
+                                  value=20_000, step=1_000, key="tac_paths")
+    with c2:
+        t_side = st.selectbox("Side", ["long", "short"], index=0, key="tac_side")
+        t_stop = st.number_input("Stop loss %", min_value=0.0, max_value=50.0,
+                                 value=2.0, step=0.25, key="tac_stop") / 100.0
+        t_tp_on = st.checkbox("Enable take-profit", value=True, key="tac_tp_on")
+        t_tp = st.number_input("Take profit %", min_value=0.1, max_value=50.0,
+                               value=3.0, step=0.25, key="tac_tp") / 100.0 if t_tp_on else None
+    with c3:
+        t_trail_on = st.checkbox("Enable trailing stop", value=False, key="tac_trail_on")
+        t_trail = (
+            st.number_input("Trailing stop %", min_value=0.1, max_value=50.0,
+                            value=1.5, step=0.25, key="tac_trail") / 100.0
+            if t_trail_on else None
+        )
+        t_reentry = st.checkbox("Allow re-entry", value=False, key="tac_re")
+        t_max_trades = st.number_input("Max trades / path", min_value=1, max_value=10,
+                                       value=1, key="tac_mt") if t_reentry else 1
+        t_cost = st.number_input("Cost fraction", min_value=0.0, max_value=0.05,
+                                 value=0.001, step=0.0005, format="%.4f", key="tac_cost")
+        t_seed = st.number_input("Seed", min_value=0, value=42, step=1, key="tac_seed")
+
+    t_hist = st.checkbox("Also run historical rolling windows", value=False, key="tac_hist")
+    t_var_bt = st.checkbox("Rolling VaR coverage (Kupiec)", value=False, key="tac_var")
+    t_vr = st.selectbox(
+        "Variance reduction (MC engine)",
+        ["none", "antithetic", "sobol", "control_variate"],
+        index=0,
+        key="tac_vr",
+    )
+
+    run_tac = st.button("Run tactical simulation", type="primary", key="tac_run")
+
+    if run_tac:
+        progress = st.progress(0, text="Building config…")
+        try:
+            base = preset_5_day if int(t_horizon) <= 5 else preset_10_day
+            cfg = base(
+                t_ticker,
+                paths=int(t_paths),
+                seed=int(t_seed),
+                transaction_cost=float(t_cost),
+                horizon_days=int(t_horizon),
+            )
+            rule = TradingRule(
+                name=f"GUI {t_side} {t_horizon}d",
+                entry_condition=f"Enter {t_side} at start",
+                exit_condition="Exit on stop/TP/trail/max hold",
+                stop_loss_pct=float(t_stop),
+                max_holding_days=int(t_horizon),
+                side=t_side,
+                take_profit_pct=t_tp,
+                trailing_stop_pct=t_trail,
+                allow_reentry=bool(t_reentry),
+                max_trades=int(t_max_trades),
+            )
+            cfg = cfg.with_rule(rule)
+            progress.progress(30, text="Generating paths + applying rule…")
+
+            hist_px = None
+            if t_hist or t_var_bt:
+                mkt = mc_core.estimate_parameters_from_history(t_ticker)
+                if mkt.daily_log_returns is not None and mkt.daily_log_returns.size > 2:
+                    lr = np.asarray(mkt.daily_log_returns, dtype=float)
+                    px = float(mkt.s0) * np.exp(np.cumsum(np.r_[0.0, lr]))
+                    hist_px = px * (float(mkt.s0) / px[-1])
+
+            result = run_tactical_simulation(
+                cfg,
+                historical_prices=hist_px if t_hist else None,
+                run_var_backtest=bool(t_var_bt),
+                variance_reduction=t_vr,
+            )
+            progress.progress(100, text="Done")
+            st.session_state["tac_result"] = result
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Tactical run failed: {exc}")
+            progress.empty()
+            return
+
+    result = st.session_state.get("tac_result")
+    if result is None:
+        st.info("Configure the rule above and click **Run tactical simulation**.")
+        return
+
+    s = result.stats
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Profit chance", f"{s['prob_profit']:.2%}")
+    m2.metric("Avg P&L", f"{s['avg_pnl']:+.4f}")
+    m3.metric("Worst P&L", f"{s['worst_pnl']:+.4f}")
+    m4.metric("Stop hit rate", f"{s['stop_hit_rate']:.2%}")
+
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("TP rate", f"{s.get('take_profit_rate', 0):.2%}")
+    m6.metric("Trail rate", f"{s.get('trailing_stop_rate', 0):.2%}")
+    m7.metric("Avg trades/path", f"{s['avg_trades_per_path']:.2f}")
+    m8.metric("Avg hold (days)", f"{s['avg_holding_days']:.2f}")
+
+    st.markdown("**Summary**")
+    st.code(result.summary_text())
+
+    # P&L histogram (matplotlib via streamlit)
+    try:
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(7, 3.5))
+        ax.hist(result.pnl, bins=60, color="#3b7dd8", alpha=0.85)
+        ax.axvline(0.0, color="black", linestyle="--", linewidth=1)
+        ax.set_title(f"{result.config.ticker}: tactical P&L distribution")
+        ax.set_xlabel("P&L per share")
+        st.pyplot(fig)
+        plt.close(fig)
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Chart skipped: {exc}")
+
+    # Sample paths
+    try:
+        import matplotlib.pyplot as plt
+        fig2, ax2 = plt.subplots(figsize=(7, 3.5))
+        n_show = min(40, result.price_paths.shape[0])
+        for i in range(n_show):
+            ax2.plot(result.price_paths[i], linewidth=0.7, alpha=0.6)
+        ax2.set_title(f"Sample paths ({n_show} of {result.price_paths.shape[0]:,})")
+        ax2.set_xlabel("trading day")
+        ax2.set_ylabel("price")
+        st.pyplot(fig2)
+        plt.close(fig2)
+    except Exception:
+        pass
+
+    stats_df = pd.DataFrame(
+        [{"metric": k, "value": v} for k, v in result.to_stats_dict().items()
+         if not isinstance(v, (list, dict))]
+    )
+    st.dataframe(stats_df, hide_index=True, use_container_width=True)
+
+    import json as _json
+    d1, d2 = st.columns(2)
+    d1.download_button(
+        "Download tactical stats JSON",
+        data=_json.dumps(result.to_stats_dict(), indent=2, default=str),
+        file_name=f"{result.config.ticker}_tactical_stats.json",
+        mime="application/json",
+        key="tac_dl_json",
+    )
+    d2.download_button(
+        "Download P&L CSV",
+        data=pd.DataFrame({"pnl": result.pnl, "n_trades": result.n_trades,
+                           "stop_hit": result.stop_hit}).to_csv(index=False),
+        file_name=f"{result.config.ticker}_tactical_pnl.csv",
+        mime="text/csv",
+        key="tac_dl_csv",
     )
 
 

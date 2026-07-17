@@ -1267,6 +1267,8 @@ def test_summarize_has_required_fields():
 def test_write_outputs_creates_csv_json_png(tmp_path):
     import run_gbm_million as r
 
+    pytest.importorskip("matplotlib")
+
     cfg = r.build_config(
         ticker="OUT", s0=100.0, mu=0.05, sigma=0.2,
         paths=5_000, horizon=10, seed=3, chunk_size=2_500,

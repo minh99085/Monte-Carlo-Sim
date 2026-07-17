@@ -117,6 +117,50 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Do not render or save any charts.")
     p.add_argument("--chart-path", default=None,
                    help="Save the sample-path/histogram chart to this PNG path.")
+
+    # ---- Phase 2 tactical short-horizon rule tester --------------------
+    p.add_argument(
+        "--tactical",
+        action="store_true",
+        help="Run the short-horizon tactical trading-rule simulator instead "
+             "of the standard buy-and-hold risk lab.",
+    )
+    p.add_argument(
+        "--tactical-horizon", type=int, default=5,
+        help="Tactical horizon in trading days (default 5; typical 5-10).",
+    )
+    p.add_argument(
+        "--tactical-stop", type=float, default=0.02,
+        help="Stop-loss fraction (default 0.02 = 2%%).",
+    )
+    p.add_argument(
+        "--tactical-tp", type=float, default=None,
+        help="Optional take-profit fraction (e.g. 0.03 = 3%%).",
+    )
+    p.add_argument(
+        "--tactical-trail", type=float, default=None,
+        help="Optional trailing-stop fraction (e.g. 0.015 = 1.5%%).",
+    )
+    p.add_argument(
+        "--tactical-side", choices=["long", "short"], default="long",
+        help="Trade side for the tactical rule (default long).",
+    )
+    p.add_argument(
+        "--tactical-reentry", action="store_true",
+        help="Allow re-entry within the tactical horizon.",
+    )
+    p.add_argument(
+        "--tactical-max-trades", type=int, default=1,
+        help="Max round-trips per path when re-entry is enabled.",
+    )
+    p.add_argument(
+        "--tactical-historical", action="store_true",
+        help="Also apply the rule to rolling historical windows.",
+    )
+    p.add_argument(
+        "--tactical-var-backtest", action="store_true",
+        help="Run rolling VaR coverage + Kupiec test on history.",
+    )
     return p
 
 
@@ -244,6 +288,52 @@ def _maybe_chart(result: mc_core.SimulationResult, args: argparse.Namespace) -> 
 
 def run(argv: Optional[list] = None) -> int:
     args = build_parser().parse_args(argv)
+
+    # ---- Tactical short-horizon mode (Phase 2) -------------------------
+    if getattr(args, "tactical", False):
+        from tactical_simulator import run_tactical_cli
+
+        result = run_tactical_cli(
+            args.ticker,
+            horizon=int(args.tactical_horizon),
+            paths=int(args.paths),
+            seed=args.seed if args.seed is not None else 42,
+            stop_loss=float(args.tactical_stop),
+            take_profit=args.tactical_tp,
+            trailing_stop=args.tactical_trail,
+            max_holding=int(args.tactical_horizon),
+            side=str(args.tactical_side),
+            cost=float(args.cost) if args.cost else 0.001,
+            s0=args.start_price,
+            sigma=args.sigma,
+            allow_reentry=bool(args.tactical_reentry),
+            max_trades=int(args.tactical_max_trades),
+            historical=bool(args.tactical_historical),
+            var_backtest=bool(args.tactical_var_backtest),
+            variance_reduction=str(args.variance_reduction),
+        )
+        print(result.summary_text())
+        if args.export_json:
+            import json
+            from pathlib import Path
+            Path(args.export_json).write_text(
+                json.dumps(result.to_stats_dict(), indent=2, default=str),
+                encoding="utf-8",
+            )
+            print(f"[json exported] {args.export_json}")
+        if args.export_csv:
+            import csv
+            from pathlib import Path
+            stats = result.to_stats_dict()
+            with open(args.export_csv, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["metric", "value"])
+                for k, v in stats.items():
+                    if not isinstance(v, (list, dict)):
+                        w.writerow([k, v])
+            print(f"[csv exported] {args.export_csv}")
+        return 0
+
     market = _resolve_market(args)
 
     jump_intensity = args.jump_intensity

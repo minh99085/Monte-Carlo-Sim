@@ -18,10 +18,13 @@ echo "==> Running test suite"
 python -m pytest -q
 
 echo "==> Import check"
-python -c "import app; import mc_core; import mc_report; print('imports ok')"
+python -c "import app; import mc_core; import mc_report; import tactical_config; import tactical_simulator; import mc_calibration; print('imports ok')"
 
 echo "==> CLI smoke test"
 python monte_carlo_gbm.py AAPL --paths 1000 --horizon 10 --no-chart
+
+echo "==> Tactical CLI smoke test (Phase 2)"
+python monte_carlo_gbm.py AAPL --tactical --paths 2000 --tactical-horizon 5 --seed 42 --start-price 100 --sigma 0.25 --tactical-tp 0.03 --no-chart
 
 echo "==> Million-path runner smoke test (chunk-safe)"
 python run_gbm_million.py --ticker AAPL --paths 10000 --horizon 252 --years 5 --seed 42 --no-chart

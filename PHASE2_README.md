@@ -1,274 +1,171 @@
-# Phase 2 — Testing Trading Rules on Simulated Paths
+# Phase 2 — Production Tactical MC Tester (Complete)
 
-This document explains **Phase 2** of the short-horizon tactical trading
-simulator built on top of
-[Monte-Carlo-Sim](https://github.com/minh99085/Monte-Carlo-Sim).
-
-Phase 1 gave you **settings** and a **rule checklist**.  
-Phase 2 makes those rules **run against thousands of possible price stories**.
+Phase 2 turns the short-horizon sketch into a **production-grade tactical Monte
+Carlo rule tester**, while wiring remaining core enhancements (variance
+reduction in the simulate loop, calibration, statistical backtests).
 
 ---
 
-## What Phase 2 adds
+## Status
 
-| New file | Purpose |
+| Area | Status |
 | --- | --- |
-| `tactical_simulator.py` | Generate short paths + apply rules + summarize results |
-| `PHASE2_README.md` | This guide |
-
-Still unchanged: `mc_core.py`, `app.py`, the CLI, and other original files.  
-Phase 2 **reuses** the engine; it does not rewrite it.
+| Flexible rule engine (TP, trail, re-entry, callable entry) | **Done** |
+| Historical rolling-window rule mode | **Done** |
+| MC path generation via `mc_core.simulate` (full short paths) | **Done** |
+| Sobol QMC + control variate in simulate loop | **Done** (Sobol needs SciPy; graceful fallback) |
+| `mc_calibration.py` (GARCH MLE / Heston moments) | **Done** |
+| Kupiec POF + rolling VaR coverage | **Done** |
+| CLI `--tactical` | **Done** |
+| GUI **Tactical** tab | **Done** |
+| Optional Numba | Detected / reported (`numba_available` in stats); hot path uses NumPy vectorization |
+| Plotly / PDF exports | **Phase 3** |
+| Parallel multi-process path farm | **Phase 3** |
 
 ---
 
 ## How trading-rule testing works
 
-### Big picture
-
 ```
-TacticalConfig + TradingRule   (from Phase 1)
+TacticalConfig + TradingRule
         │
         ▼
-mc_core.simulate(...)          ← invent many 5–10 day price paths
+mc_core.simulate  ── short paths (5–10d), optional VR
         │
         ▼
-For each path, day by day:     ← apply entry / stop / max hold
+apply_rule_to_paths  ── entry / stop / TP / trail / max hold / re-entry
         │
         ▼
-Per-path P&L, stop hits, trades
-        │
-        ▼
-Distribution summary           ← chance of profit, avg P&L, worst loss, …
+TacticalResult stats + optional historical + VaR backtest
 ```
 
-### Step 1 — Generate short price paths
+### Executable rule features
 
-The simulator builds a `SimulationConfig` from your `TacticalConfig` and calls
-the existing **`mc_core.simulate`** function.
+| Feature | Field | Behavior |
+| --- | --- | --- |
+| Side | `side` or text `"short"` | Long or short |
+| Entry day | `entry_day` | First eligible bar (default 0) |
+| Callable entry | `entry_fn(day, prices_so_far)` | Custom signal |
+| Stop loss | `stop_loss_pct` | Hard stop from entry |
+| Take profit | `take_profit_pct` | Profit target |
+| Trailing stop | `trailing_stop_pct` | From running favorable extreme |
+| Max hold | `max_holding_days` | Time stop |
+| Re-entry | `allow_reentry`, `max_trades` | Multiple round-trips per path |
 
-For short horizons it asks the engine to **keep every full path**
-(`sample_paths = paths`). That is cheap when the window is only 5–10 days:
+Costs are applied on each entry and exit (same spirit as `mc_core.apply_costs`).
 
-- 100,000 paths × 6 prices ≈ a few megabytes  
-- Long enough to walk day by day, small enough for a laptop  
-
-Each path looks like:
-
-| Index | Meaning |
-| --- | --- |
-| `prices[0]` | Starting price (“now”) |
-| `prices[1]` | Close after 1 trading day |
-| `prices[2]` | Close after 2 trading days |
-| … | … |
-| `prices[H]` | Close after H trading days (horizon) |
-
-### Step 2 — Apply the rule on each path
-
-Phase 1 stores entry/exit as plain English, plus two hard numbers:
-
-- **`stop_loss_pct`** (e.g. `0.02` = 2%)  
-- **`max_holding_days`** (e.g. `5`)
-
-Phase 2 turns that into executable logic:
-
-1. **Side (long vs short)**  
-   - If the word `"short"` appears in `entry_condition` → **short**  
-   - Otherwise → **long**
-
-2. **Entry**  
-   - Enter once at the **start of the window** (`prices[0]`).  
-   - Matches the default Phase 1 language:  
-     *“Enter long at the start of day 1”*.
-
-3. **Each following day** `d = 1 … max_holding_days` (capped by the horizon):
-   - Read that day’s close.
-   - **Stop loss**
-     - Long: stop if close ≤ entry × (1 − stop%)  
-     - Short: stop if close ≥ entry × (1 + stop%)  
-   - If the stop hits → exit that day, mark `stop_hit = True`.
-   - If day `d` is the last allowed hold day → **time stop** exit  
-     (`exit_reason = max_holding`).
-
-4. **P&L** (per share), after proportional transaction costs on entry and exit  
-   (same spirit as `mc_core.apply_costs`):
-   - Long:  `exit×(1−cost) − entry×(1+cost)`  
-   - Short: `entry×(1−cost) − exit×(1+cost)`
-
-5. **Trades**  
-   - Default rules complete **one** round-trip per path → `n_trades = 1`.
-
-> Note: the free-text `exit_condition` is kept as documentation in Phase 2.  
-> The **numbers that actually fire** are stop-loss and max holding period.
-
-### Step 3 — Summarize all paths
-
-Across every path the simulator computes a clear distribution:
-
-| Metric | Meaning |
-| --- | --- |
-| Chance of profit / loss / flat | Fraction of paths with P&L > 0, < 0, ≈ 0 |
-| Average / median P&L | Typical outcome (cash and %) |
-| Best / worst P&L | Right and left extremes |
-| 5th / 95th percentile P&L | Tail sketch without full charts |
-| Stop-loss hit rate | How often the stop ended the trade |
-| Max-hold exit rate | How often the time stop ended the trade |
-| Avg trades per path | Typically ~1.0 with the default single-entry rule |
-| Avg holding days | How long positions stayed open on average |
-
----
-
-## What outputs you get
-
-The main return type is **`TacticalResult`**.
-
-### Human-readable summary
+### Historical mode
 
 ```python
-print(result.summary_text())
+result = run_tactical_simulation(cfg, historical_prices=price_array, run_var_backtest=True)
+print(result.historical.stats)
+print(result.backtest["kupiec"])
 ```
 
-Prints ticker, horizon, rule, runtime, and the distribution table above.
-
-### Per-path arrays (for your own analysis)
-
-| Attribute | Content |
-| --- | --- |
-| `result.pnl` | Cash P&L per path |
-| `result.pnl_pct` | P&L as a fraction of entry |
-| `result.n_trades` | Trades completed on that path |
-| `result.stop_hit` | `True` if the stop fired |
-| `result.exit_reason` | `"stop_loss"` or `"max_holding"` |
-| `result.holding_days` | Days the position was open |
-| `result.price_paths` | Full price matrix `(paths × horizon+1)` |
-
-### Compact stats dict
-
-```python
-stats = result.to_stats_dict()
-# e.g. stats["prob_profit"], stats["avg_pnl"], stats["worst_pnl"], …
-```
+Sliding windows of length `horizon+1` apply the **same** rule engine used on MC paths.
 
 ---
 
-## Key functions
+## Outputs
 
-| Function | Role |
-| --- | --- |
-| `run_tactical_simulation(cfg)` | **Main entry point** — generate paths, apply rule, return `TacticalResult` |
-| `generate_price_paths(cfg)` | Call `mc_core.simulate` and return the full price matrix |
-| `build_simulation_config(cfg, …)` | Map Phase 1 settings → `SimulationConfig` (keeps all paths) |
-| `resolve_market_parameters(cfg)` | Fill s0 / mu / sigma (manual, yfinance, or fallback) |
-| `infer_side(rule)` | Long vs short from entry text |
-| `apply_rule_to_one_path(prices, rule)` | Day-by-day walk for a single story (easy to read) |
-| `apply_rule_to_paths(matrix, rule)` | Same logic for all paths (fast) |
-| `compute_tactical_stats(outcomes)` | Build the distribution summary dict |
+`TacticalResult.summary_text()` and `.to_stats_dict()` include:
+
+- Chance of profit / loss / flat  
+- Avg / median / best / worst P&L (+ percentiles)  
+- Stop / TP / trailing / max-hold exit rates  
+- Avg trades per path and holding days  
+- Optional historical comparison and Kupiec VaR coverage  
 
 ---
 
-## Example: run a basic tactical simulation
+## Examples
 
-### Option A — from Python
+### Python
 
 ```python
 from tactical_config import preset_5_day, TradingRule
 from tactical_simulator import run_tactical_simulation
 
-# 1) Start from the 5-trading-day preset (includes a default long rule + 2% stop)
-cfg = preset_5_day(
-    "AAPL",
-    paths=20_000,              # enough for a smooth preview
-    seed=42,                   # reproducible
-    starting_price=100.0,      # optional; otherwise market/fallback
-    annual_volatility=0.25,    # optional; otherwise estimated
-    annual_drift=0.0,          # short-horizon conservative default
-)
-
-# 2) Run the tactical simulation
-result = run_tactical_simulation(cfg)
-
-# 3) Read the plain-English summary
-print(result.summary_text())
-
-# 4) Dig into numbers if you want
-print("Profit chance:", result.stats["prob_profit"])
-print("Average P&L:  ", result.stats["avg_pnl"])
-print("Worst loss:   ", result.stats["worst_pnl"])
-print("Stop hit rate:", result.stats["stop_hit_rate"])
-```
-
-### Option B — custom rule (including short)
-
-```python
-from tactical_config import preset_10_day, TradingRule
-from tactical_simulator import run_tactical_simulation
-
 rule = TradingRule(
-    name="Short, 5-day hold, 2% stop",
-    entry_condition="Enter short at the start of day 1",
-    exit_condition="Cover at max hold or stop",
+    name="Long 5d, 2% stop, 3% TP",
+    entry_condition="Enter long at start",
+    exit_condition="TP, stop, or max hold",
     stop_loss_pct=0.02,
+    take_profit_pct=0.03,
     max_holding_days=5,
+    side="long",
 )
-
-cfg = preset_10_day(
-    "MSFT",
-    paths=10_000,
-    seed=7,
-    starting_price=100.0,
-    annual_volatility=0.30,
+cfg = preset_5_day(
+    "AAPL", paths=20_000, seed=42,
+    starting_price=100.0, annual_volatility=0.25, annual_drift=0.0,
 ).with_rule(rule)
 
 result = run_tactical_simulation(cfg)
 print(result.summary_text())
 ```
 
-### Option C — run the built-in demo from the terminal
+### CLI
 
 ```powershell
-cd Monte-Carlo-Sim
-python tactical_simulator.py
+python monte_carlo_gbm.py AAPL --tactical --paths 20000 --tactical-horizon 5 `
+  --seed 42 --start-price 100 --sigma 0.25 --tactical-stop 0.02 --tactical-tp 0.03 --no-chart
 ```
 
-This runs a 5-day long demo and a small 10-day short-rule demo with fixed
-prices/vol so it works offline.
+### GUI
+
+```powershell
+streamlit run app.py
+```
+
+Open the **Tactical** tab, set horizon / stop / TP / trail / re-entry, click
+**Run tactical simulation**. Results stay in `st.session_state` for downloads.
+
+### Calibration (optional SciPy)
+
+```python
+import mc_calibration, numpy as np
+rets = np.diff(np.log(prices))
+g = mc_calibration.calibrate_garch(rets)
+h = mc_calibration.calibrate_heston(rets)
+# Pass g.as_config_kwargs() / h.as_config_kwargs() into SimulationConfig
+```
+
+### Variance reduction in the core engine
+
+```python
+cfg = SimulationConfig(..., variance_reduction="control_variate")  # GBM mean
+cfg = SimulationConfig(..., variance_reduction="sobol")            # needs SciPy
+result = simulate(cfg)
+print(result.stats.get("variance_reduction_effective"))
+print(result.stats.get("control_variate_mean"))
+```
 
 ---
 
-## Tips for short horizons (5–10 days)
-
-- Prefer **`preset_5_day`** / **`preset_10_day`** so horizon and max hold stay aligned.
-- Use **`annual_drift=0.0`** if you do not want the model to assume a bullish trend over a few days.
-- Start with **10k–50k paths** while exploring; use **100k** for smoother stats.
-- Keep **`max_holding_days ≤ horizon_days`** (validation enforces this).
-- Transaction cost matters more for short trades; the presets use **0.1%**.
-
----
-
-## What Phase 2 does *not* do yet
-
-- It does not parse complex free-text strategies (only side + stop + max hold).
-- It does not re-enter after an exit (one trade per path).
-- It does not add a GUI tab or CLI flag (you call it from Python).
-- It does not place live orders.
-
-Those are natural later phases (richer rule language, multi-trade paths,
-reports, UI).
-
----
-
-## Files after Phase 1 + Phase 2
+## Key modules
 
 | File | Role |
 | --- | --- |
-| `tactical_config.py` | Phase 1 — config presets + `TradingRule` |
-| `tactical_simulator.py` | Phase 2 — path generation + rule testing + stats |
-| `PHASE1_README.md` | Phase 1 docs |
-| `PHASE2_README.md` | Phase 2 docs (this file) |
-| `mc_core.py` | Original engine (reused, not modified) |
+| `tactical_config.py` | Presets + structured `TradingRule` |
+| `tactical_simulator.py` | Path gen, flexible rule engine, historical mode, stats |
+| `mc_calibration.py` | GARCH / Heston calibration helpers |
+| `mc_core.py` | Engine + Sobol/CV wiring + Kupiec + rolling VaR |
+| `monte_carlo_gbm.py` | `--tactical` CLI |
+| `app.py` | **Tactical** GUI tab |
+| `test_tactical.py` | Phase 2 unit tests |
+
+---
+
+## Phase 3 gaps (not in this drop)
+
+- Plotly interactive charts and PDF report export  
+- Multi-process / joblib path farms for multi-million tactical runs  
+- Richer signal DSL (indicators, multi-asset rules)  
+- Live data streaming / paper-trade bridge (out of scope for research tool)  
+- Full options-surface Heston calibration  
 
 ---
 
 ## Disclaimer
 
-This is a **statistical research tool**. Simulated P&L is not a forecast, not
-investment advice, and not a live trading system.
+Statistical research tool only. Not investment advice. No live order routing.

@@ -593,6 +593,45 @@ def _draw_gauss(rng, n: int, antithetic: bool) -> np.ndarray:
     return out
 
 
+def _sobol_standard_normals(n_paths: int, n_dims: int, seed: Optional[int]) -> np.ndarray:
+    """Generate an ``(n_paths, n_dims)`` matrix of standard normals via Sobol QMC.
+
+    Requires SciPy.  Caller must guard with :func:`sobol_available`.  Values are
+    clipped away from {0,1} before the inverse-normal map so quantiles stay finite.
+    Memory is bounded by the *chunk* size the caller requests, not total paths.
+    """
+    from scipy.stats import qmc  # type: ignore
+
+    # SciPy Sobol is most balanced at power-of-two sizes; generate then slice.
+    n_gen = 1 << max(1, int(math.ceil(math.log2(max(n_paths, 2)))))
+    eng = qmc.Sobol(d=int(n_dims), scramble=True, seed=seed)
+    try:
+        u = eng.random(n_gen)
+    except Exception:  # pragma: no cover
+        u = eng.random_base2(m=int(math.log2(n_gen)))
+    u = np.clip(np.asarray(u[:n_paths], dtype=np.float64), 1e-12, 1.0 - 1e-12)
+    # Phi^{-1}(u) = sqrt(2) * erfinv(2u - 1)
+    if hasattr(np, "erfinv"):
+        z = math.sqrt(2.0) * np.erfinv(2.0 * u - 1.0)
+    else:  # pragma: no cover - ancient numpy
+        z = np.empty_like(u)
+        for idx, ui in np.ndenumerate(u):
+            z[idx] = _norm_ppf(float(ui))
+    return np.asarray(z, dtype=np.float64)
+
+
+def _attach_sobol_shocks(state, n: int, steps: int, seed: Optional[int]):
+    """Ensure ``state`` is a dict carrying a chunk-local Sobol shock matrix."""
+    z = _sobol_standard_normals(n, steps, seed)
+    if state is None:
+        return {"sobol_z": z}
+    if isinstance(state, dict):
+        state = dict(state)
+        state["sobol_z"] = z
+        return state
+    return {"sobol_z": z, "_wrapped": state}
+
+
 def _build_step_engine(cfg: SimulationConfig):
     """Return ``(init_chunk, step)`` closures implementing the selected model.
 
@@ -600,6 +639,16 @@ def _build_step_engine(cfg: SimulationConfig):
     chunk size -- never by total paths).  ``step(rng, n, state, i)`` returns the
     log-return for every path on step ``i`` (1-based).  All state and working
     arrays are length ``n`` (the chunk), preserving chunk-safe memory use.
+
+    Variance reduction
+    ------------------
+    * **antithetic** -- mirrored Gaussian draws inside each chunk.
+    * **sobol** -- when SciPy is available, per-chunk Sobol normals are stored on
+      ``state['sobol_z']`` (shape ``n x steps``) and consumed step-by-step for
+      models that draw Gaussian shocks (GBM, Heston z1, GARCH).  Callers must
+      attach the matrix via :func:`_attach_sobol_shocks` before the step loop.
+    * **control_variate** -- applied *after* the path loop in :func:`simulate`
+      (GBM terminal-price control); does not change the step engine.
     """
 
     dt = cfg.dt
@@ -611,7 +660,15 @@ def _build_step_engine(cfg: SimulationConfig):
     model = cfg.model
     antithetic = cfg.variance_reduction == VR_ANTITHETIC
 
-    def gauss(rng, n):
+    def gauss(rng, n, state=None, step_i=None):
+        # Prefer precomputed Sobol normals when the simulate loop attached them.
+        if (
+            state is not None
+            and isinstance(state, dict)
+            and "sobol_z" in state
+            and step_i is not None
+        ):
+            return state["sobol_z"][:, int(step_i) - 1]
         return _draw_gauss(rng, n, antithetic)
 
     if model == MODEL_GBM:
@@ -619,7 +676,7 @@ def _build_step_engine(cfg: SimulationConfig):
             return None
 
         def step(rng, n, state, i):
-            return diff_drift + diff_vol * gauss(rng, n)
+            return diff_drift + diff_vol * gauss(rng, n, state, i)
         return init_chunk, step
 
     if model == MODEL_STUDENT_T:
@@ -630,6 +687,7 @@ def _build_step_engine(cfg: SimulationConfig):
             return None
 
         def step(rng, n, state, i):
+            # Student-t keeps its own heavy-tail draws; Sobol is not applied here.
             shock = rng.standard_t(df, size=n) * scale
             return diff_drift + diff_vol * shock
         return init_chunk, step
@@ -731,7 +789,7 @@ def _build_step_engine(cfg: SimulationConfig):
             # Full-truncation: use max(v, 0) wherever variance enters.
             v_pos = np.maximum(v, 0.0)
             sqrt_v = np.sqrt(v_pos)
-            z1 = gauss(rng, n)
+            z1 = gauss(rng, n, state, i)
             z2 = rng.standard_normal(n)
             zv = rho * z1 + rho_c * z2  # correlated shock for the variance SDE
             # Variance update (full-truncation Euler) -- never stays negative.
@@ -759,7 +817,7 @@ def _build_step_engine(cfg: SimulationConfig):
             var = state["var"]                       # current per-step variance
             var = np.maximum(var, 1e-300)            # keep strictly positive
             vol = np.sqrt(var)
-            z = gauss(rng, n)
+            z = gauss(rng, n, state, i)
             shock = vol * z                          # mean-zero return shock
             log_ret = mu_step - 0.5 * var + shock
             # GARCH(1,1) recursion on the realized shock.
@@ -809,6 +867,17 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     ``paths x steps`` matrix.  This holds for every model (GBM, Student-t,
     bootstrap, block bootstrap, Merton jumps, regime switching) because each
     model's per-step state is bounded by the chunk size.
+
+    Variance reduction (wired into this loop)
+    -----------------------------------------
+    * ``antithetic`` -- mirrored Gaussian shocks per chunk (step engine).
+    * ``sobol`` -- when SciPy is available, each chunk draws a Sobol normal
+      matrix of shape ``(chunk, steps)`` (still O(chunk × steps), never
+      O(paths × steps) for the full run's working set beyond the sample block).
+      Falls back to plain MC with a stats warning if SciPy is missing.
+    * ``control_variate`` -- after the path loop, for GBM-family terminal
+      values, adjusts the *reported mean* using the known analytic E[S_T]
+      (raw samples kept for VaR/percentiles so risk metrics stay distributional).
     """
 
     cfg = config.validate()
@@ -816,6 +885,20 @@ def simulate(config: SimulationConfig) -> SimulationResult:
 
     steps = cfg.horizon
     init_chunk, step_fn = _build_step_engine(cfg)
+
+    # Resolve effective VR (Sobol may fall back).
+    vr_requested = cfg.variance_reduction
+    vr_effective = vr_requested
+    vr_notes: List[str] = []
+    use_sobol = False
+    if vr_requested == VR_SOBOL:
+        if sobol_available():
+            use_sobol = True
+        else:
+            vr_effective = VR_NONE
+            vr_notes.append(
+                "Sobol QMC requested but SciPy is unavailable; fell back to plain MC."
+            )
 
     # Deterministic one-day crash applied on the first step (any model).
     crash_log = (
@@ -831,6 +914,8 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     dd_depth_sum = 0.0          # sum over paths of each path's max drawdown fraction
 
     final_values = np.empty(cfg.paths, dtype=np.float64)
+    # Gross (pre-cost) terminal prices — used for control-variate post-process.
+    gross_terminals = np.empty(cfg.paths, dtype=np.float64)
 
     n_sample = min(cfg.sample_paths, cfg.paths)
     sample_trajectories = np.empty((n_sample, steps + 1), dtype=np.float64)
@@ -840,11 +925,18 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     memory = MemoryInfo(
         paths=cfg.paths, horizon=cfg.horizon, chunk_size=cfg.chunk_size
     )
-    # The sample block is the only 2-D array we deliberately keep.
+    # The sample block is the only 2-D array we deliberately keep long-term.
+    # Sobol attaches a temporary (chunk x steps) shock matrix per chunk only.
     memory.peak_matrix_elements = max(memory.peak_matrix_elements, n_sample * (steps + 1))
+    if use_sobol:
+        memory.peak_matrix_elements = max(
+            memory.peak_matrix_elements,
+            min(cfg.chunk_size, cfg.paths) * steps,
+        )
 
     start = time.perf_counter()
     produced = 0
+    chunk_idx = 0
     while produced < cfg.paths:
         this_chunk = min(cfg.chunk_size, cfg.paths - produced)
 
@@ -862,6 +954,11 @@ def simulate(config: SimulationConfig) -> SimulationResult:
 
         # Per-chunk model state (bounded by chunk size).
         state = init_chunk(rng, this_chunk)
+        if use_sobol:
+            # Distinct seed per chunk keeps streams independent while remaining
+            # reproducible for a fixed global seed.
+            sobol_seed = None if cfg.seed is None else int(cfg.seed) + chunk_idx * 1_000_003
+            state = _attach_sobol_shocks(state, this_chunk, steps, sobol_seed)
 
         # How many of this chunk's paths feed the global sample block.
         sample_in_chunk = max(0, min(n_sample - produced, this_chunk))
@@ -893,9 +990,50 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         gross = prices
         net = apply_costs(gross, cfg.s0, cfg.cost)
         final_values[produced:produced + this_chunk] = net
+        gross_terminals[produced:produced + this_chunk] = gross
         produced += this_chunk
+        chunk_idx += 1
 
     runtime = time.perf_counter() - start
+
+    # ---- Control variate post-process (GBM terminal mean) ---------------
+    # Keep raw final_values for distributional risk metrics (VaR, percentiles).
+    # Report a CV-adjusted expected value when requested and model is GBM.
+    cv_beta = None
+    cv_mean = None
+    if vr_requested == VR_CONTROL:
+        if cfg.model == MODEL_GBM and not cfg.stress_enabled:
+            T = steps * cfg.dt
+            mu_eff = cfg.effective_mu()
+            analytic_ST = cfg.s0 * math.exp(mu_eff * T)
+            # Map analytic gross E[S_T] through the same cost model.
+            if cfg.cost > 0.0:
+                analytic_net = analytic_ST * (1.0 - cfg.cost) - cfg.s0 * cfg.cost
+            else:
+                analytic_net = analytic_ST
+            g = gross_terminals
+            y = final_values
+            if cfg.paths > 1 and float(np.var(g)) > 0.0:
+                cov_yg = float(np.cov(y, g, ddof=1)[0, 1])
+                var_g = float(np.var(g, ddof=1))
+                cv_beta = cov_yg / var_g
+                # Unbiased control: E[g] = analytic_ST under GBM.
+                adjusted = y - cv_beta * (g - analytic_ST)
+                cv_mean = float(np.mean(adjusted))
+            else:
+                cv_beta = 0.0
+                cv_mean = float(np.mean(y))
+            vr_effective = VR_CONTROL
+            vr_notes.append(
+                f"Control variate applied to expected value (beta={cv_beta:.4f}); "
+                "VaR/percentiles use raw samples."
+            )
+        else:
+            vr_effective = VR_NONE
+            vr_notes.append(
+                "Control variate is implemented for unstressed GBM only; "
+                "fell back to plain MC mean."
+            )
 
     convergence_paths, convergence_means = _convergence_curve(
         final_values, cfg.convergence_points
@@ -905,9 +1043,18 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         drawdown_prob=drawdown_hits / cfg.paths,
         drawdown_threshold=dd_threshold,
     )
+    if cv_mean is not None:
+        stats["expected_value_raw"] = stats["expected_value"]
+        stats["expected_value"] = cv_mean
+        stats["expected_return"] = (cv_mean / cfg.s0) - 1.0
+        stats["control_variate_beta"] = cv_beta
+        stats["control_variate_mean"] = cv_mean
     stats["model"] = cfg.model
     stats["drift_mode"] = cfg.drift_mode
-    stats["variance_reduction"] = cfg.variance_reduction
+    stats["variance_reduction"] = vr_requested
+    stats["variance_reduction_effective"] = vr_effective
+    if vr_notes:
+        stats["variance_reduction_notes"] = vr_notes
     # Path-based risk metrics (averaged over paths).
     stats["mean_max_drawdown"] = dd_depth_sum / cfg.paths
     stats["mean_drawdown_duration"] = dd_duration_sum / cfg.paths
@@ -2067,6 +2214,149 @@ def backtest_percentile_bands(
     if total < 10:
         result["warning"] = f"Only {total} backtest windows; coverage is noisy."
     return result
+
+
+def kupiec_pof_test(
+    n_obs: int,
+    n_breaches: int,
+    alpha: float = 0.05,
+) -> Dict[str, Any]:
+    """Kupiec proportion-of-failures test for VaR exception rate.
+
+    Under a correct VaR at level ``1 - alpha``, breach indicators are i.i.d.
+    Bernoulli(alpha).  This likelihood-ratio test checks whether the observed
+    breach rate equals ``alpha``.
+
+    Parameters
+    ----------
+    n_obs :
+        Number of forecast days (or windows).
+    n_breaches :
+        Count of VaR breaches (loss > VaR).
+    alpha :
+        Tail probability of the VaR (e.g. 0.05 for 95% VaR).
+
+    Returns
+    -------
+    dict with LR statistic, p-value (chi-square 1 d.f.), observed rate, and a
+    simple ``reject_null_5pct`` flag (reject = model coverage looks wrong).
+    """
+    n = int(n_obs)
+    x = int(n_breaches)
+    a = float(alpha)
+    out: Dict[str, Any] = {
+        "n_obs": n,
+        "n_breaches": x,
+        "alpha": a,
+        "breach_rate": float("nan"),
+        "lr_stat": float("nan"),
+        "p_value": float("nan"),
+        "reject_null_5pct": False,
+        "warning": None,
+    }
+    if n <= 0 or not (0.0 < a < 1.0) or x < 0 or x > n:
+        out["warning"] = "Invalid inputs for Kupiec test."
+        return out
+    pi_hat = x / n
+    out["breach_rate"] = pi_hat
+    # LR = -2 ln( L(alpha) / L(pi_hat) )
+    # Guard edges where log(0) would appear.
+    def _safe_log(p: float) -> float:
+        return math.log(max(p, 1e-300))
+
+    if x == 0:
+        lr = -2.0 * (n * _safe_log(1.0 - a) - n * _safe_log(1.0 - pi_hat if pi_hat < 1 else 1e-300))
+        # When x=0, pi_hat=0: L(pi)= (1-0)^n = 1, so ln L(pi)=0
+        lr = -2.0 * (n * _safe_log(1.0 - a))
+    elif x == n:
+        lr = -2.0 * (n * _safe_log(a))
+    else:
+        lr = -2.0 * (
+            x * _safe_log(a) + (n - x) * _safe_log(1.0 - a)
+            - x * _safe_log(pi_hat) - (n - x) * _safe_log(1.0 - pi_hat)
+        )
+    out["lr_stat"] = float(lr)
+    # Survival function of chi-square(1): P(X > lr) = erfc(sqrt(lr/2))
+    # chi2(1) CDF related to erf; p = erfc(sqrt(lr/2))
+    out["p_value"] = float(math.erfc(math.sqrt(max(lr, 0.0) / 2.0)))
+    out["reject_null_5pct"] = bool(out["p_value"] < 0.05)
+    return out
+
+
+def rolling_var_coverage(
+    prices: np.ndarray,
+    *,
+    window: int = 252,
+    alpha: float = 0.05,
+    method: str = "historical",
+) -> Dict[str, Any]:
+    """Rolling one-day VaR coverage test on a price series.
+
+    For each day ``t`` after ``window`` history:
+      1. Estimate a one-day loss VaR from the past ``window`` daily returns
+         (historical percentile, or Gaussian using sample mean/vol).
+      2. Compare to the *realized* next-day loss ``-(r_{t})``.
+      3. Count a breach when realized loss > VaR.
+
+    Returns breach stats plus a Kupiec POF test.
+
+    Parameters
+    ----------
+    prices :
+        Positive price levels (oldest → newest).
+    window :
+        Estimation window length in trading days.
+    alpha :
+        VaR tail level (0.05 → 95% VaR).
+    method :
+        ``\"historical\"`` (empirical quantile) or ``\"gaussian\"``.
+    """
+    p = np.asarray(prices, dtype=float).ravel()
+    out: Dict[str, Any] = {
+        "window": int(window),
+        "alpha": float(alpha),
+        "method": method,
+        "n_forecasts": 0,
+        "n_breaches": 0,
+        "breach_rate": float("nan"),
+        "kupiec": {},
+        "warning": None,
+    }
+    if p.size < window + 2:
+        out["warning"] = "Not enough prices for rolling VaR coverage."
+        return out
+    if np.any(p <= 0):
+        out["warning"] = "Prices must be strictly positive."
+        return out
+
+    log_r = np.diff(np.log(p))
+    breaches = 0
+    total = 0
+    # forecast day index i uses returns log_r[i-window : i] to VaR-check log_r[i]
+    for i in range(window, log_r.size):
+        hist = log_r[i - window:i]
+        realized_loss = -float(log_r[i])  # positive when price falls
+        if method == "gaussian":
+            m = float(np.mean(hist))
+            s = float(np.std(hist, ddof=1)) if hist.size > 1 else 0.0
+            # VaR on loss scale: - (mean + z_alpha * vol) for left-tail return
+            z = _norm_ppf(alpha)
+            var_loss = - (m + z * s)
+        else:
+            # Historical VaR: - quantile_alpha(returns) as loss threshold
+            q = float(np.quantile(hist, alpha))
+            var_loss = -q
+        if realized_loss > var_loss + 1e-15:
+            breaches += 1
+        total += 1
+
+    out["n_forecasts"] = total
+    out["n_breaches"] = breaches
+    out["breach_rate"] = (breaches / total) if total else float("nan")
+    out["kupiec"] = kupiec_pof_test(total, breaches, alpha=alpha)
+    if total < 50:
+        out["warning"] = f"Only {total} VaR forecasts; Kupiec test is low-power."
+    return out
 
 
 def _norm_ppf(p: float) -> float:

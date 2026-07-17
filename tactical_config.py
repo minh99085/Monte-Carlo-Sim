@@ -19,7 +19,10 @@ original simulation engine yet. Later phases will wire them into mc_core.py.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict, replace
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
+
+# Optional callable: entry_fn(day_index, prices_up_to_day) -> bool
+EntryFn = Callable[[int, Any], bool]
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +92,33 @@ class TradingRule:
     # Optional notes for humans reading the rule later (strategy thesis, etc.).
     notes: str = ""
 
+    # ---- Phase 2 structured controls (all optional / backward-compatible) ----
+
+    # Explicit side: "long", "short", or None (infer from entry_condition text).
+    side: Optional[str] = None
+
+    # First day index (0 = start of window) when an entry may be considered.
+    entry_day: int = 0
+
+    # Take-profit as a fraction of entry (e.g. 0.03 = +3%). None = disabled.
+    take_profit_pct: Optional[float] = None
+
+    # Trailing stop as a fraction from the favorable extreme since entry.
+    # Long: trail from running high; short: trail from running low.
+    # None = disabled. Example: 0.015 = 1.5% trail.
+    trailing_stop_pct: Optional[float] = None
+
+    # Allow opening another trade after an exit within the same path/window.
+    allow_reentry: bool = False
+
+    # Maximum completed round-trips per path/window (1 = classic single trade).
+    max_trades: int = 1
+
+    # Optional Python callable for flexible entry signals.
+    # Signature: entry_fn(day: int, prices_so_far: ndarray) -> bool
+    # Not serialized to JSON; use for research notebooks / unit tests.
+    entry_fn: Optional[EntryFn] = None
+
     def validate(self) -> "TradingRule":
         """Check that the rule values make sense. Raises ValueError if not."""
         if not self.name or not str(self.name).strip():
@@ -104,6 +134,16 @@ class TradingRule:
             )
         if self.max_holding_days < 1:
             raise ValueError("TradingRule.max_holding_days must be >= 1")
+        if self.side is not None and str(self.side).lower() not in ("long", "short"):
+            raise ValueError("TradingRule.side must be 'long', 'short', or None")
+        if self.entry_day < 0:
+            raise ValueError("TradingRule.entry_day must be >= 0")
+        if self.take_profit_pct is not None and self.take_profit_pct <= 0:
+            raise ValueError("take_profit_pct must be > 0 when set")
+        if self.trailing_stop_pct is not None and not (0.0 < self.trailing_stop_pct < 1.0):
+            raise ValueError("trailing_stop_pct must be in (0, 1) when set")
+        if self.max_trades < 1:
+            raise ValueError("max_trades must be >= 1")
         return self
 
     def summary(self) -> str:
@@ -113,11 +153,20 @@ class TradingRule:
             if self.stop_loss_pct > 0
             else "no stop"
         )
-        return (
+        bits = [
             f"{self.name}: enter=[{self.entry_condition}]; "
             f"exit=[{self.exit_condition}]; {stop_txt}; "
             f"max hold={self.max_holding_days} day(s)"
-        )
+        ]
+        if self.take_profit_pct:
+            bits.append(f"TP={self.take_profit_pct * 100:.2f}%")
+        if self.trailing_stop_pct:
+            bits.append(f"trail={self.trailing_stop_pct * 100:.2f}%")
+        if self.allow_reentry:
+            bits.append(f"reentry(max_trades={self.max_trades})")
+        if self.side:
+            bits.append(f"side={self.side}")
+        return "; ".join(bits) if len(bits) > 1 else bits[0]
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +318,10 @@ class TacticalConfig:
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a plain dict (useful for JSON exports later)."""
         data = asdict(self)
+        # Callables are not JSON-serializable — drop entry_fn if present.
+        rule = data.get("trading_rule")
+        if isinstance(rule, dict) and "entry_fn" in rule:
+            rule["entry_fn"] = None if rule["entry_fn"] is None else "<callable>"
         return data
 
     def to_simulation_kwargs(self) -> Dict[str, Any]:

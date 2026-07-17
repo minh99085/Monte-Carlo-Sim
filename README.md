@@ -28,10 +28,15 @@ Streamlit GUI and is designed to run comfortably on a Windows 11 laptop
 
 | File | Purpose |
 | --- | --- |
-| `mc_core.py` | Shared simulation engine (chunked GBM, statistics, VaR/ES, exports). |
-| `monte_carlo_gbm.py` | Command line interface. |
-| `app.py` | Streamlit GUI entry point. |
-| `test_monte_carlo_gbm.py` | Test suite. |
+| `mc_core.py` | Shared simulation engine (chunked models, statistics, VaR/ES, VR, backtests). |
+| `monte_carlo_gbm.py` | Command line interface (includes `--tactical` mode). |
+| `app.py` | Streamlit GUI entry point (includes **Tactical** tab). |
+| `tactical_config.py` | Short-horizon presets + structured trading rules (Phase 1/2). |
+| `tactical_simulator.py` | Tactical rule tester on MC paths + historical windows (Phase 2). |
+| `mc_calibration.py` | Optional GARCH/Heston calibration helpers. |
+| `mc_report.py` | Investment report engine. |
+| `test_monte_carlo_gbm.py` / `test_tactical.py` | Test suites. |
+| `PHASE1_README.md` / `PHASE2_README.md` | Phase docs. |
 | `requirements.txt` | Dependencies. |
 
 ## Windows (PowerShell) quick start
@@ -61,7 +66,11 @@ python -m pytest -q
 # 6. Run the CLI
 python monte_carlo_gbm.py AAPL --paths 1000 --horizon 10 --no-chart
 
-# 7. Launch the GUI
+# 6b. Tactical short-horizon rule test (Phase 2)
+python monte_carlo_gbm.py AAPL --tactical --paths 20000 --tactical-horizon 5 `
+  --seed 42 --start-price 100 --sigma 0.25 --tactical-stop 0.02 --tactical-tp 0.03 --no-chart
+
+# 7. Launch the GUI (use the Tactical tab for rule testing)
 streamlit run app.py
 ```
 
@@ -95,6 +104,25 @@ source .venv/bin/activate
 
 `verify_install.sh` runs the same upgrade-pip → install → tests → imports → CLI →
 million-path checks in one step.
+
+## Tactical short-horizon mode (Phase 2)
+
+Test a trading rule on thousands of **5–10 trading day** Monte Carlo paths
+(stop-loss, take-profit, trailing stop, max hold, optional re-entry), with
+optional historical rolling-window validation and Kupiec VaR coverage.
+
+```powershell
+# CLI
+python monte_carlo_gbm.py MSFT --tactical --paths 20000 --tactical-horizon 10 `
+  --tactical-side short --tactical-stop 0.02 --tactical-trail 0.015 --no-chart
+
+# Python API
+python -c "from tactical_config import preset_5_day, TradingRule; from tactical_simulator import run_tactical_simulation; r=run_tactical_simulation(preset_5_day('AAPL', paths=5000, starting_price=100, annual_volatility=0.25)); print(r.summary_text())"
+```
+
+See `PHASE2_README.md` for the full rule engine, historical mode, calibration,
+and variance-reduction notes. GUI: open the **Tactical** tab after
+`streamlit run app.py`.
 
 ## Command line usage
 
