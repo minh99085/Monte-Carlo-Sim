@@ -139,6 +139,57 @@ Paste `tradingview_alert_template.pine` into the Pine Editor, create an alert
 with webhook URL `https://YOUR_PUBLIC_HOST/webhook?secret=...`, and inspect
 `tv_data/latest_signal.json`. Full setup: **`PHASE3_README.md`**.
 
+## How to use the full tactical system with TradingView
+
+End-to-end path from a chart alert to a short-horizon Monte Carlo risk check:
+
+1. **Start the bridge** (keep this terminal open):
+   ```powershell
+   python tv_webhook_bridge.py --secret "your-long-random-secret" --port 5001
+   ```
+2. **Expose it** with ngrok / a tunnel / a VPS so TradingView can POST to you.
+3. **Install** `tradingview_alert_template.pine` and create an alert with webhook  
+   `https://YOUR_PUBLIC_HOST/webhook?secret=your-long-random-secret`.
+4. When an alert fires, the bridge writes `tv_data/latest_signal.json`
+   (ticker, price, trend, momentum/RSI, timeframe).
+5. **Run a tactical simulation that reads that file:**
+
+   ```powershell
+   # One-shot demo (writes a fake signal — no TradingView needed)
+   python run_tactical_with_tv.py --demo
+
+   # Real signal file from the bridge
+   python run_tactical_with_tv.py
+
+   # Or via the main CLI
+   python monte_carlo_gbm.py AAPL --tactical --tactical-tv --paths 15000 `
+     --tactical-horizon 5 --tactical-tp 0.03 --seed 42 --sigma 0.25 --no-chart
+   ```
+
+What the simulator does with the TV data (optional, on when `--tactical-tv` /
+`use_tradingview=True`):
+
+| TV field | How it is used |
+| --- | --- |
+| `ticker` | Sets the simulation symbol |
+| `price` | Sets the starting price \(S_0\) |
+| `trend` (`bullish` / `bearish`) | Aligns the rule side to long / short |
+| `momentum` (RSI-like) | Scales annual volatility (and jump intensity for jump models) |
+
+The printed summary includes **`Used TradingView: YES/NO`** and a
+**TradingView context** block so you always know whether live bridge data
+shaped the run.
+
+Pieces that work together:
+
+| Piece | Role |
+| --- | --- |
+| `mc_core.py` | Memory-safe path engine + risk maths |
+| `tactical_config.py` / `tactical_simulator.py` | 5–10 day rules + P&L distribution |
+| `tv_webhook_bridge.py` | Receives TradingView webhooks → JSON file |
+| `tv_integration.py` | Maps that JSON into tactical knobs |
+| `run_tactical_with_tv.py` | Simple demo of the full chain |
+
 ## Command line usage
 
 ```powershell

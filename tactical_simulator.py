@@ -1,5 +1,5 @@
 """
-Phase 2 — Production-grade tactical trading-rule simulator.
+Production-grade tactical trading-rule simulator (Phases 1–3).
 
 What this module does (plain English)
 -------------------------------------
@@ -12,10 +12,10 @@ What this module does (plain English)
       - optional re-entry within the horizon.
 3. Optionally run the **same rule on historical prices** (rolling windows) and
    compare to the Monte Carlo distribution.
-4. Summarize P&L, trade counts, stop/TP hit rates, and optional VaR backtests.
-
-Phase 1 described rules. Phase 2 tests them — with richer structure, historical
-validation, and light performance hooks (optional Numba).
+4. Optionally read the latest **TradingView webhook** JSON (Phase 3 bridge)
+   to set ticker/price, align side to trend, and scale volatility/jumps
+   from momentum.
+5. Summarize P&L, trade counts, stop/TP hit rates, and whether TV data was used.
 
 This file reuses ``mc_core``; it does not break the long-horizon buy-and-hold path.
 """
@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -39,6 +40,12 @@ from mc_core import (
     simulate,
 )
 from tactical_config import TacticalConfig, TradingRule, preset_5_day
+from tv_integration import (
+    TVSignalContext,
+    apply_tradingview_to_tactical,
+    load_tradingview_signal,
+    resolve_signal_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +211,8 @@ class TacticalResult:
     notes: List[str] = field(default_factory=list)
     historical: Optional["HistoricalTacticalResult"] = None
     backtest: Optional[Dict[str, Any]] = None
+    # Phase 3 integration: optional TradingView signal context
+    tv_context: Optional[TVSignalContext] = None
 
     def summary_text(self) -> str:
         s = self.stats
@@ -231,6 +240,7 @@ class TacticalResult:
             f"Re-entry:         {self.rule.allow_reentry} (max_trades={self.rule.max_trades})",
             f"Market source:    {self.market_source}",
             f"Runtime:          {self.runtime_seconds:.3f}s",
+            f"Used TradingView: {'YES' if s.get('used_tradingview_data') else 'NO'}",
             "",
             "--- Outcome distribution ---",
             f"Chance of profit:     {s['prob_profit'] * 100:.2f}%",
@@ -253,6 +263,10 @@ class TacticalResult:
             f"5th pct P&L:          {s['pnl_p05']:+.4f}",
             f"95th pct P&L:         {s['pnl_p95']:+.4f}",
         ]
+        if self.tv_context is not None:
+            lines.append("")
+            lines.append("--- TradingView context ---")
+            lines.extend(self.tv_context.summary_lines())
         if self.notes:
             lines.append("")
             lines.append("--- Notes ---")
@@ -292,6 +306,11 @@ class TacticalResult:
         out["market_source"] = self.market_source
         out["runtime_seconds"] = self.runtime_seconds
         out["notes"] = list(self.notes)
+        out["used_tradingview_data"] = bool(
+            self.tv_context.used if self.tv_context is not None else False
+        )
+        if self.tv_context is not None:
+            out["tradingview"] = self.tv_context.as_dict()
         return out
 
 
@@ -350,6 +369,7 @@ def build_simulation_config(
     mu: float,
     sigma: float,
     variance_reduction: str = "none",
+    jump_intensity_multiplier: float = 1.0,
 ) -> SimulationConfig:
     tactical.validate()
     n_paths = int(tactical.paths)
@@ -382,6 +402,12 @@ def build_simulation_config(
             "variance_reduction": variance_reduction,
         }
     )
+    # Momentum-scaled jump intensity (only affects jump models; safe default for GBM).
+    if jump_intensity_multiplier and jump_intensity_multiplier != 1.0:
+        base_jump = float(kwargs.get("jump_intensity", 1.0) or 1.0)
+        kwargs["jump_intensity"] = base_jump * float(jump_intensity_multiplier)
+        base_kou = float(kwargs.get("kou_intensity", 1.0) or 1.0)
+        kwargs["kou_intensity"] = base_kou * float(jump_intensity_multiplier)
     return SimulationConfig(**kwargs).validate()
 
 
@@ -389,10 +415,16 @@ def generate_price_paths(
     tactical: TacticalConfig,
     *,
     variance_reduction: str = "none",
+    jump_intensity_multiplier: float = 1.0,
 ) -> Tuple[np.ndarray, SimulationConfig, str, float]:
     s0, mu, sigma, source = resolve_market_parameters(tactical)
     sim_cfg = build_simulation_config(
-        tactical, s0=s0, mu=mu, sigma=sigma, variance_reduction=variance_reduction
+        tactical,
+        s0=s0,
+        mu=mu,
+        sigma=sigma,
+        variance_reduction=variance_reduction,
+        jump_intensity_multiplier=jump_intensity_multiplier,
     )
     t0 = time.perf_counter()
     result = simulate(sim_cfg)
@@ -973,10 +1005,21 @@ def run_tactical_simulation(
     historical_prices: Optional[np.ndarray] = None,
     run_var_backtest: bool = False,
     variance_reduction: str = "none",
+    # --- TradingView integration (Phase 3 bridge file) ---
+    use_tradingview: bool = False,
+    tv_data_dir: str | Path = "tv_data",
+    tv_signal_path: Optional[str | Path] = None,
+    tv_use_ticker: bool = True,
+    tv_use_price: bool = True,
+    tv_align_side: bool = True,
+    tv_filter_against_trend: bool = False,
+    tv_scale_vol: bool = True,
+    tv_scale_jumps: bool = True,
+    tv_require_signal: bool = False,
     **overrides: Any,
 ) -> TacticalResult:
     """
-    Run a full short-horizon tactical Monte Carlo (+ optional historical mode).
+    Run a full short-horizon tactical Monte Carlo (+ optional historical / TV).
 
     Parameters
     ----------
@@ -994,6 +1037,11 @@ def run_tactical_simulation(
     variance_reduction :
         Forwarded to ``mc_core.simulate`` (``none`` / ``antithetic`` / ``sobol`` /
         ``control_variate``).
+    use_tradingview :
+        If True, load ``tv_data/latest_signal.json`` (or ``tv_signal_path``) and
+        apply trend/momentum/price to the run.
+    tv_require_signal :
+        If True with ``use_tradingview``, raise when no signal file is found.
     **overrides :
         Field overrides on the config (e.g. ``paths=20_000``).
     """
@@ -1005,6 +1053,8 @@ def run_tactical_simulation(
 
     tactical = tactical.validate()
     notes: List[str] = []
+    tv_ctx: Optional[TVSignalContext] = None
+    jump_mult = 1.0
 
     active_rule = rule if rule is not None else tactical.trading_rule
     if active_rule is None:
@@ -1014,6 +1064,65 @@ def run_tactical_simulation(
         )
     active_rule = active_rule.validate()
 
+    # ---- Optional TradingView context ---------------------------------
+    if use_tradingview:
+        sig_path = resolve_signal_path(tv_data_dir, tv_signal_path)
+        signal = load_tradingview_signal(tv_data_dir, tv_signal_path)
+        if signal is None and tv_require_signal:
+            raise FileNotFoundError(
+                f"TradingView signal required but not found at {sig_path}. "
+                "Run tv_webhook_bridge.py and fire an alert, or use "
+                "tv_integration.write_demo_signal() for an offline demo."
+            )
+        tactical, active_rule, tv_ctx, jump_mult = apply_tradingview_to_tactical(
+            tactical,
+            active_rule,
+            signal,
+            use_ticker=tv_use_ticker,
+            use_price=tv_use_price,
+            align_side_to_trend=tv_align_side,
+            filter_against_trend=tv_filter_against_trend,
+            scale_vol_by_momentum=tv_scale_vol,
+            scale_jumps_by_momentum=tv_scale_jumps,
+            signal_path=str(sig_path),
+            base_sigma=tactical.annual_volatility,
+        )
+        notes.extend(tv_ctx.notes)
+        if tv_ctx.used:
+            notes.append("Simulation used live TradingView bridge data.")
+        else:
+            notes.append("TradingView mode on, but no signal file — ran without TV data.")
+
+        # If sigma was still None, resolve market then apply vol multiplier.
+        if (
+            tv_ctx.used
+            and tv_scale_vol
+            and tactical.annual_volatility is None
+            and tv_ctx.vol_multiplier != 1.0
+        ):
+            _s0, _mu, base_sig, _src = resolve_market_parameters(tactical)
+            from dataclasses import replace as dc_replace
+            tactical = dc_replace(
+                tactical,
+                starting_price=tactical.starting_price or _s0,
+                annual_drift=tactical.annual_drift,
+                annual_volatility=float(base_sig) * float(tv_ctx.vol_multiplier),
+            )
+            notes.append(
+                f"Post-market vol scale: {base_sig:.4f} × {tv_ctx.vol_multiplier:.3f} "
+                f"→ {tactical.annual_volatility:.4f}"
+            )
+
+        # Block all entries when trend filter says no
+        if tv_ctx is not None and not tv_ctx.trades_allowed:
+            def _block(_day, _px):
+                return False
+            entry_fn = _block
+            notes.append("All path entries blocked by TV trend filter.")
+
+    active_rule = active_rule.validate()
+    tactical = tactical.validate()
+
     if active_rule.max_holding_days > tactical.horizon_days:
         raise ValueError(
             f"rule.max_holding_days ({active_rule.max_holding_days}) exceeds "
@@ -1022,10 +1131,11 @@ def run_tactical_simulation(
 
     t0 = time.perf_counter()
     price_paths, sim_cfg, market_source, _eng_rt = generate_price_paths(
-        tactical, variance_reduction=variance_reduction
+        tactical,
+        variance_reduction=variance_reduction,
+        jump_intensity_multiplier=jump_mult,
     )
     if variance_reduction != "none":
-        vr_eff = sim_cfg  # noqa: F841
         notes.append(f"MC variance_reduction requested: {variance_reduction}")
 
     side = infer_side(active_rule)
@@ -1044,6 +1154,12 @@ def run_tactical_simulation(
     stats["engine_sigma"] = float(sim_cfg.sigma)
     stats["engine_model"] = sim_cfg.model
     stats["variance_reduction"] = variance_reduction
+    stats["used_tradingview_data"] = bool(tv_ctx.used) if tv_ctx is not None else False
+    stats["jump_intensity_multiplier"] = float(jump_mult)
+    if tv_ctx is not None and tv_ctx.used:
+        stats["tv_trend"] = tv_ctx.trend
+        stats["tv_momentum"] = tv_ctx.momentum
+        stats["tv_vol_multiplier"] = tv_ctx.vol_multiplier
 
     hist_result: Optional[HistoricalTacticalResult] = None
     bt: Optional[Dict[str, Any]] = None
@@ -1110,6 +1226,7 @@ def run_tactical_simulation(
         notes=notes,
         historical=hist_result,
         backtest=bt,
+        tv_context=tv_ctx,
     )
 
 
@@ -1137,6 +1254,12 @@ def run_tactical_cli(
     historical: bool = False,
     var_backtest: bool = False,
     variance_reduction: str = "none",
+    use_tradingview: bool = False,
+    tv_data_dir: str = "tv_data",
+    tv_signal_path: Optional[str] = None,
+    tv_align_side: bool = True,
+    tv_filter_against_trend: bool = False,
+    tv_require_signal: bool = False,
 ) -> TacticalResult:
     """Build a config/rule from CLI-like kwargs and run the tactical simulator."""
     from tactical_config import preset_5_day, preset_10_day
@@ -1186,6 +1309,12 @@ def run_tactical_cli(
         historical_prices=hist_px if historical else None,
         run_var_backtest=var_backtest,
         variance_reduction=variance_reduction,
+        use_tradingview=use_tradingview,
+        tv_data_dir=tv_data_dir,
+        tv_signal_path=tv_signal_path,
+        tv_align_side=tv_align_side,
+        tv_filter_against_trend=tv_filter_against_trend,
+        tv_require_signal=tv_require_signal,
     )
 
 

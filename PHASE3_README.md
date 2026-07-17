@@ -232,24 +232,37 @@ Accepted secret locations:
 
 ---
 
-## Reading signals later (for the tactical simulator)
+## Reading signals in the tactical simulator (integration)
+
+The tactical runner can load the bridge file automatically:
 
 ```python
-import json
-from pathlib import Path
+from tactical_config import preset_5_day, TradingRule
+from tactical_simulator import run_tactical_simulation
 
-path = Path("tv_data/latest_signal.json")
-if path.is_file():
-    signal = json.loads(path.read_text(encoding="utf-8"))
-    print(signal["ticker"], signal["trend"], signal["momentum"], signal["price"])
-    # Example: use ticker + price as context for a tactical MC run
-    # from tactical_config import preset_5_day
-    # from tactical_simulator import run_tactical_simulation
-    # cfg = preset_5_day(signal["ticker"], starting_price=signal["price"], ...)
+cfg = preset_5_day("AAPL", paths=10_000, annual_volatility=0.25).with_rule(
+    TradingRule(
+        name="TV-aware",
+        entry_condition="Enter with TV trend",
+        exit_condition="stop/tp/hold",
+        stop_loss_pct=0.02,
+        take_profit_pct=0.03,
+        max_holding_days=5,
+    )
+)
+result = run_tactical_simulation(cfg, use_tradingview=True)
+print(result.summary_text())  # shows Used TradingView: YES/NO
 ```
 
-Full wiring of TV signals into automatic tactical runs is a natural next step;
-Phase 3 only establishes a **reliable receive + store** path.
+Or from the command line:
+
+```powershell
+python run_tactical_with_tv.py --demo          # offline fake signal
+python run_tactical_with_tv.py                 # real tv_data/latest_signal.json
+python monte_carlo_gbm.py AAPL --tactical --tactical-tv --paths 10000 --no-chart
+```
+
+See the main **README** section *How to use the full tactical system with TradingView*.
 
 ---
 

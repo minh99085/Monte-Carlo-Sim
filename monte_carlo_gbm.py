@@ -161,6 +161,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--tactical-var-backtest", action="store_true",
         help="Run rolling VaR coverage + Kupiec test on history.",
     )
+    p.add_argument(
+        "--tactical-tv",
+        action="store_true",
+        help="Use latest TradingView bridge signal (tv_data/latest_signal.json) "
+             "for ticker/price/trend/momentum.",
+    )
+    p.add_argument(
+        "--tactical-tv-dir",
+        default="tv_data",
+        help="Folder containing latest_signal.json (default: tv_data).",
+    )
+    p.add_argument(
+        "--tactical-tv-require",
+        action="store_true",
+        help="Fail if --tactical-tv is set but no signal file is found.",
+    )
     return p
 
 
@@ -311,6 +327,9 @@ def run(argv: Optional[list] = None) -> int:
             historical=bool(args.tactical_historical),
             var_backtest=bool(args.tactical_var_backtest),
             variance_reduction=str(args.variance_reduction),
+            use_tradingview=bool(getattr(args, "tactical_tv", False)),
+            tv_data_dir=str(getattr(args, "tactical_tv_dir", "tv_data")),
+            tv_require_signal=bool(getattr(args, "tactical_tv_require", False)),
         )
         print(result.summary_text())
         if args.export_json:
