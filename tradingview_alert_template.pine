@@ -1,0 +1,98 @@
+// =============================================================================
+// Monte-Carlo-Sim — TradingView alert template (Phase 3)
+// =============================================================================
+//
+// What this script does
+// ---------------------
+// * Builds a simple TREND label from a fast / slow EMA cross
+//     - "bullish" when fast EMA > slow EMA
+//     - "bearish" when fast EMA < slow EMA
+// * Builds a MOMENTUM value from RSI (0–100)
+// * Fires an alert message that is pure JSON so the local webhook bridge
+//   (tv_webhook_bridge.py) can parse it cleanly
+//
+// How to use
+// ----------
+// 1. Open TradingView → Pine Editor → New blank indicator
+// 2. Paste this entire file → Save → Add to chart
+// 3. Create an Alert on this script:
+//      - Condition: "MC Bridge JSON alert" (or "Any alert() function call")
+//      - Webhook URL:  http://YOUR_HOST:5001/webhook?secret=YOUR_SECRET
+//      - Message: leave as the script default (it already contains {{message}})
+// 4. Run:  python tv_webhook_bridge.py --secret YOUR_SECRET --port 5001
+//
+// Notes
+// -----
+// * TradingView webhooks need a publicly reachable URL (ngrok, cloudflare tunnel,
+//   VPS, etc.). Localhost alone is not enough from TradingView's servers.
+// * Do NOT put your real secret inside this Pine file if you publish the script.
+//   Pass the secret only in the webhook URL query string.
+// =============================================================================
+
+//@version=5
+indicator("MC Bridge — Trend + Momentum JSON", shorttitle="MC Bridge", overlay=true)
+
+// ---- Inputs -----------------------------------------------------------------
+fastLen   = input.int(9,  "Fast EMA length", minval=1)
+slowLen   = input.int(21, "Slow EMA length", minval=2)
+rsiLen    = input.int(14, "RSI length", minval=2)
+useClose  = input.bool(true, "Alert only when trend flips (else every bar)")
+
+// ---- Trend (EMA cross) ------------------------------------------------------
+fastEma = ta.ema(close, fastLen)
+slowEma = ta.ema(close, slowLen)
+trendBull = fastEma > slowEma
+trendStr  = trendBull ? "bullish" : "bearish"
+
+// ---- Momentum (RSI) ---------------------------------------------------------
+rsiVal = ta.rsi(close, rsiLen)
+
+// ---- Plot (visual only) -----------------------------------------------------
+plot(fastEma, "Fast EMA", color=color.new(color.teal, 0))
+plot(slowEma, "Slow EMA", color=color.new(color.orange, 0))
+bgcolor(trendBull ? color.new(color.green, 92) : color.new(color.red, 92))
+
+// ---- JSON message for the webhook bridge ------------------------------------
+// Field names match what tv_webhook_bridge.normalize_signal() understands:
+//   ticker, price, trend, momentum, timeframe, strategy
+//
+// syminfo.ticker   → e.g. "AAPL"
+// close            → current bar close
+// timeframe.period → e.g. "5", "60", "D"
+jsonMsg =
+  '{"ticker":"' + syminfo.ticker +
+  '","price":' + str.tostring(close, format.mintick) +
+  ',"trend":"' + trendStr +
+  '","momentum":' + str.tostring(rsiVal, "#.##") +
+  ',"timeframe":"' + timeframe.period +
+  '","strategy":"mc_bridge_ema_rsi"}'
+
+// ---- Alert conditions -------------------------------------------------------
+trendFlip = ta.change(trendBull) != 0
+
+if useClose
+    // Fire only when bullish/bearish state changes
+    if trendFlip
+        alert(jsonMsg, alert.freq_once_per_bar_close)
+else
+    // Fire every completed bar (more traffic — useful for testing)
+    if barstate.isconfirmed
+        alert(jsonMsg, alert.freq_once_per_bar_close)
+
+// Optional: named conditions for the alert UI dropdown
+alertcondition(trendFlip and trendBull,  title="MC Bridge → bullish flip",
+     message='{"ticker":"{{ticker}}","price":{{close}},"trend":"bullish","momentum":0,"strategy":"mc_bridge_alertcondition"}')
+alertcondition(trendFlip and not trendBull, title="MC Bridge → bearish flip",
+     message='{"ticker":"{{ticker}}","price":{{close}},"trend":"bearish","momentum":0,"strategy":"mc_bridge_alertcondition"}')
+
+// ---- Table (on-chart status) -------------------------------------------------
+var table t = table.new(position.top_right, 2, 4, border_width=1)
+if barstate.islast
+    table.cell(t, 0, 0, "Trend",     text_color=color.gray)
+    table.cell(t, 1, 0, trendStr,    text_color=trendBull ? color.lime : color.red)
+    table.cell(t, 0, 1, "RSI",       text_color=color.gray)
+    table.cell(t, 1, 1, str.tostring(rsiVal, "#.##"))
+    table.cell(t, 0, 2, "Price",     text_color=color.gray)
+    table.cell(t, 1, 2, str.tostring(close, format.mintick))
+    table.cell(t, 0, 3, "JSON ready", text_color=color.gray)
+    table.cell(t, 1, 3, "yes",       text_color=color.aqua)

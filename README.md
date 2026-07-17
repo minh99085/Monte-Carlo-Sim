@@ -36,7 +36,9 @@ Streamlit GUI and is designed to run comfortably on a Windows 11 laptop
 | `mc_calibration.py` | Optional GARCH/Heston calibration helpers. |
 | `mc_report.py` | Investment report engine. |
 | `test_monte_carlo_gbm.py` / `test_tactical.py` | Test suites. |
-| `PHASE1_README.md` / `PHASE2_README.md` | Phase docs. |
+| `tv_webhook_bridge.py` | Phase 3 — local TradingView webhook receiver. |
+| `tradingview_alert_template.pine` | Phase 3 — Pine Script JSON alert template. |
+| `PHASE1_README.md` / `PHASE2_README.md` / `PHASE3_README.md` | Phase docs. |
 | `requirements.txt` | Dependencies. |
 
 ## Windows (PowerShell) quick start
@@ -124,6 +126,18 @@ python -c "from tactical_config import preset_5_day, TradingRule; from tactical_
 See `PHASE2_README.md` for the full rule engine, historical mode, calibration,
 and variance-reduction notes. GUI: open the **Tactical** tab after
 `streamlit run app.py`.
+
+## TradingView webhook bridge (Phase 3)
+
+Receive trend/momentum alerts from TradingView into a local JSON file:
+
+```powershell
+python tv_webhook_bridge.py --secret "your-long-random-secret" --port 5001
+```
+
+Paste `tradingview_alert_template.pine` into the Pine Editor, create an alert
+with webhook URL `https://YOUR_PUBLIC_HOST/webhook?secret=...`, and inspect
+`tv_data/latest_signal.json`. Full setup: **`PHASE3_README.md`**.
 
 ## Command line usage
 
