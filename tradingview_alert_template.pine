@@ -54,36 +54,44 @@ bgcolor(trendBull ? color.new(color.green, 92) : color.new(color.red, 92))
 
 // ---- JSON message for the webhook bridge ------------------------------------
 // Field names match what tv_webhook_bridge.normalize_signal() understands:
-//   ticker, price, trend, momentum, timeframe, strategy
+//   ticker, price, trend, momentum, timeframe, strategy, bar_time
 //
 // syminfo.ticker   → e.g. "AAPL"
 // close            → current bar close
 // timeframe.period → e.g. "5", "60", "D"
+// time             → bar open time (UNIX ms) so downstream tools can audit
+//                    exactly which bar produced the alert
 jsonMsg =
   '{"ticker":"' + syminfo.ticker +
   '","price":' + str.tostring(close, format.mintick) +
   ',"trend":"' + trendStr +
   '","momentum":' + str.tostring(rsiVal, "#.##") +
   ',"timeframe":"' + timeframe.period +
-  '","strategy":"mc_bridge_ema_rsi"}'
+  '","bar_time":' + str.tostring(time) +
+  ',"strategy":"mc_bridge_ema_rsi"}'
 
 // ---- Alert conditions -------------------------------------------------------
-trendFlip = ta.change(trendBull) != 0
+// ta.cross* fire only on the actual EMA crossing bar — unlike comparing the
+// boolean state, they cannot re-fire while the trend merely persists.
+flipBull = ta.crossover(fastEma, slowEma)
+flipBear = ta.crossunder(fastEma, slowEma)
+trendFlip = flipBull or flipBear
 
 if useClose
-    // Fire only when bullish/bearish state changes
-    if trendFlip
+    // Fire only on a confirmed trend flip (EMA cross on a closed bar)
+    if trendFlip and barstate.isconfirmed
         alert(jsonMsg, alert.freq_once_per_bar_close)
 else
     // Fire every completed bar (more traffic — useful for testing)
     if barstate.isconfirmed
         alert(jsonMsg, alert.freq_once_per_bar_close)
 
-// Optional: named conditions for the alert UI dropdown
-alertcondition(trendFlip and trendBull,  title="MC Bridge → bullish flip",
-     message='{"ticker":"{{ticker}}","price":{{close}},"trend":"bullish","momentum":0,"strategy":"mc_bridge_alertcondition"}')
-alertcondition(trendFlip and not trendBull, title="MC Bridge → bearish flip",
-     message='{"ticker":"{{ticker}}","price":{{close}},"trend":"bearish","momentum":0,"strategy":"mc_bridge_alertcondition"}')
+// Optional: named conditions for the alert UI dropdown (cross-based, so they
+// only trigger on the flip bar itself)
+alertcondition(flipBull,  title="MC Bridge → bullish flip",
+     message='{"ticker":"{{ticker}}","price":{{close}},"trend":"bullish","momentum":0,"bar_time":"{{time}}","strategy":"mc_bridge_alertcondition"}')
+alertcondition(flipBear, title="MC Bridge → bearish flip",
+     message='{"ticker":"{{ticker}}","price":{{close}},"trend":"bearish","momentum":0,"bar_time":"{{time}}","strategy":"mc_bridge_alertcondition"}')
 
 // ---- Table (on-chart status) -------------------------------------------------
 var table t = table.new(position.top_right, 2, 4, border_width=1)

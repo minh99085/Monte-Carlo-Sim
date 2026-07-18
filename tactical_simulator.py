@@ -910,6 +910,14 @@ def run_historical_rule_backtest(
     """
     Slide a window of length ``horizon_days + 1`` across a real price series
     and apply the trading rule to each window (same engine as MC paths).
+
+    .. warning::
+        With the default ``step=1`` adjacent windows share ``horizon_days - 1``
+        days, so window P&Ls are heavily autocorrelated and ``n_windows``
+        drastically overstates the independent sample size — any standard
+        error or hit-rate confidence derived from it will be too optimistic.
+        For statistically honest estimates pass ``step=horizon_days``
+        (non-overlapping windows), as the drift-calibration pipeline does.
     """
     rule.validate()
     p = np.asarray(prices, dtype=np.float64).ravel()
@@ -1013,9 +1021,11 @@ def run_tactical_simulation(
     tv_use_price: bool = True,
     tv_align_side: bool = True,
     tv_filter_against_trend: bool = False,
-    tv_scale_vol: bool = True,
+    tv_scale_vol: bool = False,
     tv_scale_jumps: bool = True,
     tv_require_signal: bool = False,
+    tv_use_signal_drift: bool = True,
+    tv_calibration_dir: str | Path = "calibration",
     **overrides: Any,
 ) -> TacticalResult:
     """
@@ -1086,6 +1096,8 @@ def run_tactical_simulation(
             scale_jumps_by_momentum=tv_scale_jumps,
             signal_path=str(sig_path),
             base_sigma=tactical.annual_volatility,
+            use_signal_drift=tv_use_signal_drift,
+            calibration_dir=tv_calibration_dir,
         )
         notes.extend(tv_ctx.notes)
         if tv_ctx.used:
@@ -1160,6 +1172,8 @@ def run_tactical_simulation(
         stats["tv_trend"] = tv_ctx.trend
         stats["tv_momentum"] = tv_ctx.momentum
         stats["tv_vol_multiplier"] = tv_ctx.vol_multiplier
+        if tv_ctx.drift_estimate is not None:
+            stats["tv_drift_estimate"] = tv_ctx.drift_estimate.as_dict()
 
     hist_result: Optional[HistoricalTacticalResult] = None
     bt: Optional[Dict[str, Any]] = None

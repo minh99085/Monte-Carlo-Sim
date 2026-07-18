@@ -23,6 +23,8 @@ For local testing without TradingView, see PHASE3_README.md.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -43,6 +45,17 @@ DEFAULT_PORT = 5001
 DEFAULT_DATA_DIR = Path("tv_data")
 LATEST_FILENAME = "latest_signal.json"
 HISTORY_FILENAME = "signal_history.jsonl"
+
+# Consecutive identical signals (same ticker / trend / RSI bucket) within this
+# window are logged to history but do NOT rewrite latest_signal.json, so a
+# repeated alert cannot refresh a signal's timestamp and defeat the
+# downstream freshness check.
+DEDUPE_WINDOW_SECONDS = 600
+
+# RSI tercile edges — keep in sync with signal_calibration.RSI_LOW_MAX /
+# RSI_HIGH_MIN (duplicated here so the bridge stays stdlib-only).
+_RSI_LOW_MAX = 40.0
+_RSI_HIGH_MIN = 60.0
 
 logger = logging.getLogger("tv_webhook_bridge")
 
@@ -69,10 +82,17 @@ def history_path(data_dir: Path) -> Path:
     return data_dir / HISTORY_FILENAME
 
 
-def save_signal(record: Dict[str, Any], data_dir: Path) -> Tuple[Path, Path]:
+def save_signal(
+    record: Dict[str, Any],
+    data_dir: Path,
+    *,
+    update_latest: bool = True,
+) -> Tuple[Path, Path]:
     """
     Write ``record`` as the latest signal and append one line to history.
 
+    With ``update_latest=False`` only the history line is appended (used for
+    deduplicated repeats so latest_signal.json keeps its original timestamp).
     Uses a lock so concurrent webhooks do not corrupt the files.
     """
     ensure_data_dir(data_dir)
@@ -82,7 +102,8 @@ def save_signal(record: Dict[str, Any], data_dir: Path) -> Tuple[Path, Path]:
     line = json.dumps(record, ensure_ascii=False)
 
     with _SAVE_LOCK:
-        latest.write_text(text + "\n", encoding="utf-8")
+        if update_latest:
+            latest.write_text(text + "\n", encoding="utf-8")
         with history.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     return latest, history
@@ -237,6 +258,82 @@ def check_secret(
     return False
 
 
+def check_hmac_signature(
+    headers: Dict[str, str],
+    raw_body: bytes,
+    hmac_key: str,
+) -> bool:
+    """
+    Verify an HMAC-SHA256 signature of the raw request body.
+
+    Accepted headers (first found wins): ``X-Signature-SHA256``,
+    ``X-Signature``, ``X-Hub-Signature-256``. The value is the hex digest,
+    optionally prefixed with ``sha256=``. Comparison is constant-time.
+    """
+    if not hmac_key:
+        return True
+    lowered = {str(k).lower(): v for k, v in headers.items()}
+    provided = ""
+    for name in ("x-signature-sha256", "x-signature", "x-hub-signature-256"):
+        if lowered.get(name):
+            provided = str(lowered[name]).strip()
+            break
+    if not provided:
+        return False
+    if provided.lower().startswith("sha256="):
+        provided = provided[7:].strip()
+    expected = hmac.new(hmac_key.encode("utf-8"), raw_body,
+                        hashlib.sha256).hexdigest()
+    return hmac.compare_digest(provided.lower(), expected)
+
+
+def _rsi_bucket(momentum: Any) -> Optional[str]:
+    """Stdlib tercile bucket for dedupe (mirror of signal_calibration edges)."""
+    try:
+        m = float(momentum)
+    except (TypeError, ValueError):
+        return None
+    if m < _RSI_LOW_MAX:
+        return "low"
+    if m > _RSI_HIGH_MIN:
+        return "high"
+    return "mid"
+
+
+def _parse_utc(ts: Any) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(str(ts))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def is_duplicate_signal(
+    record: Dict[str, Any],
+    previous: Optional[Dict[str, Any]],
+    window_seconds: float = DEDUPE_WINDOW_SECONDS,
+) -> bool:
+    """
+    True when ``record`` repeats ``previous`` — same ticker, trend and
+    bucketed RSI — within ``window_seconds``.
+    """
+    if not previous or window_seconds <= 0:
+        return False
+    if str(record.get("ticker")) != str(previous.get("ticker")):
+        return False
+    if str(record.get("trend")) != str(previous.get("trend")):
+        return False
+    if _rsi_bucket(record.get("momentum")) != _rsi_bucket(previous.get("momentum")):
+        return False
+    t_new = _parse_utc(record.get("received_at_utc"))
+    t_old = _parse_utc(previous.get("received_at_utc"))
+    if t_new is None or t_old is None:
+        return False
+    return abs((t_new - t_old).total_seconds()) <= float(window_seconds)
+
+
 # ---------------------------------------------------------------------------
 # HTTP server
 # ---------------------------------------------------------------------------
@@ -245,9 +342,17 @@ def check_secret(
 class BridgeState:
     """Shared config for request handlers."""
 
-    def __init__(self, secret: str, data_dir: Path):
+    def __init__(
+        self,
+        secret: str,
+        data_dir: Path,
+        hmac_key: str = "",
+        dedupe_window: float = DEDUPE_WINDOW_SECONDS,
+    ):
         self.secret = secret
         self.data_dir = data_dir
+        self.hmac_key = hmac_key or ""
+        self.dedupe_window = float(dedupe_window)
         self.received_count = 0
         self.lock = threading.Lock()
 
@@ -331,6 +436,16 @@ def make_handler(state: BridgeState):
                 self._send_json(401, {"error": "unauthorized"})
                 return
 
+            # Optional HMAC-SHA256 body signature (defense in depth)
+            if state.hmac_key and not check_hmac_signature(headers, raw, state.hmac_key):
+                logger.warning(
+                    "Rejected webhook from %s (bad or missing HMAC signature)",
+                    self.client_address[0],
+                )
+                self._send_json(401, {"error": "bad_signature",
+                                      "hint": "X-Signature-SHA256: hex(hmac_sha256(body))"})
+                return
+
             payload = parse_payload(raw, content_type)
             # Never persist the shared secret
             if isinstance(payload, dict):
@@ -338,6 +453,30 @@ def make_handler(state: BridgeState):
                     payload.pop(k, None)
 
             record = normalize_signal(payload, source_ip=self.client_address[0])
+
+            # Dedupe: identical consecutive signal within the window → keep it
+            # in history but do NOT rewrite latest_signal.json (its timestamp
+            # must not be refreshed by repeats).
+            previous = load_latest(state.data_dir)
+            duplicate = is_duplicate_signal(record, previous, state.dedupe_window)
+            if duplicate:
+                record["duplicate_of_received_at_utc"] = previous.get("received_at_utc")
+                latest, history = save_signal(record, state.data_dir,
+                                              update_latest=False)
+                logger.info(
+                    "Duplicate signal %s trend=%s momentum=%s within %ss — "
+                    "history only, latest untouched",
+                    record.get("ticker"), record.get("trend"),
+                    record.get("momentum"), int(state.dedupe_window),
+                )
+                self._send_json(200, {
+                    "status": "duplicate_ignored",
+                    "ticker": record.get("ticker"),
+                    "trend": record.get("trend"),
+                    "history_file": str(history),
+                })
+                return
+
             latest, history = save_signal(record, state.data_dir)
 
             with state.lock:
@@ -365,9 +504,17 @@ def make_handler(state: BridgeState):
     return WebhookHandler
 
 
-def run_server(host: str, port: int, secret: str, data_dir: Path) -> None:
+def run_server(
+    host: str,
+    port: int,
+    secret: str,
+    data_dir: Path,
+    hmac_key: str = "",
+    dedupe_window: float = DEDUPE_WINDOW_SECONDS,
+) -> None:
     ensure_data_dir(data_dir)
-    state = BridgeState(secret=secret, data_dir=data_dir)
+    state = BridgeState(secret=secret, data_dir=data_dir,
+                        hmac_key=hmac_key, dedupe_window=dedupe_window)
     handler = make_handler(state)
     httpd = ThreadingHTTPServer((host, port), handler)
     logger.info("TradingView webhook bridge listening on http://%s:%s", host, port)
@@ -414,6 +561,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Folder for latest_signal.json + history (default {DEFAULT_DATA_DIR}).",
     )
     p.add_argument(
+        "--hmac-key",
+        default=os.environ.get("TV_BRIDGE_HMAC_KEY", ""),
+        help="Optional HMAC-SHA256 key: when set, every webhook body must "
+             "carry a matching X-Signature-SHA256 header "
+             "(or set TV_BRIDGE_HMAC_KEY).",
+    )
+    p.add_argument(
+        "--dedupe-window",
+        type=float,
+        default=float(os.environ.get("TV_BRIDGE_DEDUPE_WINDOW",
+                                     DEDUPE_WINDOW_SECONDS)),
+        help="Seconds within which an identical consecutive signal (same "
+             "ticker/trend/RSI bucket) only goes to history, leaving "
+             f"latest_signal.json untouched (default {DEDUPE_WINDOW_SECONDS}; "
+             "0 disables).",
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -437,7 +601,14 @@ def main(argv: Optional[list] = None) -> int:
         logger.warning("Weak secret detected — use a long random string in production.")
 
     data_dir = Path(args.data_dir)
-    run_server(args.host, int(args.port), secret, data_dir)
+    run_server(
+        args.host,
+        int(args.port),
+        secret,
+        data_dir,
+        hmac_key=(args.hmac_key or "").strip(),
+        dedupe_window=float(args.dedupe_window),
+    )
     return 0
 
 
