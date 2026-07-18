@@ -29,6 +29,7 @@ import csv
 import io
 import json
 import math
+import os
 import time
 
 import numpy as np
@@ -127,6 +128,23 @@ VR_ANTITHETIC = "antithetic"
 VR_SOBOL = "sobol"
 VR_CONTROL = "control_variate"
 VARIANCE_REDUCTION_METHODS = (VR_NONE, VR_ANTITHETIC, VR_SOBOL, VR_CONTROL)
+
+# ---------------------------------------------------------------------------
+# Engine selection (Phase 1 of the mc_engine refactor — see REVIEW.md)
+# ---------------------------------------------------------------------------
+
+ENGINE_LEGACY = "legacy"
+ENGINE_V2 = "v2"
+ENGINES = (ENGINE_LEGACY, ENGINE_V2)
+# Environment override so the CLI/GUI can opt in without new flags.
+ENGINE_ENV_VAR = "MC_ENGINE"
+
+
+def _effective_engine(cfg: "SimulationConfig") -> str:
+    env = os.environ.get(ENGINE_ENV_VAR, "").strip().lower()
+    if env in ENGINES:
+        return env
+    return cfg.engine
 
 # ---------------------------------------------------------------------------
 # Conservative drift modes
@@ -259,6 +277,11 @@ class SimulationConfig:
     # Threshold (fraction) for the large-drawdown probability metric.
     drawdown_threshold: float = DRAWDOWN_THRESHOLD
 
+    # Engine selection: "legacy" (default) or "v2" (mc_engine StochasticProcess
+    # pipeline; GBM/Heston in Phase 1, other models fall back to legacy).
+    # The MC_ENGINE environment variable overrides this without CLI changes.
+    engine: str = ENGINE_LEGACY
+
     def validate(self) -> "SimulationConfig":
         if self.paths < 1:
             raise ValueError("paths must be >= 1")
@@ -313,6 +336,8 @@ class SimulationConfig:
                 raise ValueError("kou_eta_up must be > 1 and kou_eta_down > 0")
         if self.variance_reduction not in VARIANCE_REDUCTION_METHODS:
             raise ValueError(f"Unknown variance_reduction: {self.variance_reduction!r}")
+        if self.engine not in ENGINES:
+            raise ValueError(f"Unknown engine: {self.engine!r} (use one of {ENGINES})")
         if not (0.0 < self.ruin_threshold < 1.0):
             raise ValueError("ruin_threshold must be in (0, 1)")
         if not (0.0 <= self.stress_crash_pct < 1.0):
@@ -670,6 +695,20 @@ def _build_step_engine(cfg: SimulationConfig):
         ):
             return state["sobol_z"][:, int(step_i) - 1]
         return _draw_gauss(rng, n, antithetic)
+
+    # ---- v2 engine (opt-in): route supported models through mc_engine's ----
+    # StochasticProcess objects. The adapter reuses this loop's ``gauss``
+    # closure, so RNG draw order — and every output — is bit-identical to the
+    # legacy closures below. Unsupported models fall through to legacy.
+    if _effective_engine(cfg) == ENGINE_V2:
+        try:
+            from mc_engine import legacy_engine_from_config
+        except ImportError:  # pragma: no cover - mc_engine ships with the repo
+            pass
+        else:
+            adapted = legacy_engine_from_config(cfg, gauss)
+            if adapted is not None:
+                return adapted
 
     if model == MODEL_GBM:
         def init_chunk(rng, n):
@@ -1051,6 +1090,17 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         stats["control_variate_mean"] = cv_mean
     stats["model"] = cfg.model
     stats["drift_mode"] = cfg.drift_mode
+    # Record the engine only when v2 was requested, so default (legacy) runs
+    # keep their exact historical output schema.
+    if _effective_engine(cfg) == ENGINE_V2:
+        try:
+            from mc_engine import V2_SUPPORTED_MODELS
+            stats["engine"] = (
+                ENGINE_V2 if cfg.model in V2_SUPPORTED_MODELS
+                else f"{ENGINE_LEGACY} (v2 requested; model not ported)"
+            )
+        except ImportError:  # pragma: no cover
+            stats["engine"] = ENGINE_LEGACY
     stats["variance_reduction"] = vr_requested
     stats["variance_reduction_effective"] = vr_effective
     if vr_notes:
