@@ -298,7 +298,43 @@ default.
 
 ---
 
-## Phase 1 implementation (in this change)
+## Phase status
+
+| Phase | Status | Notes |
+|---|---|---|
+| 1 — process/generator/pricer abstractions, GBM+Heston behind flag | **Done** (commit 4af95dd) | bit-identical to legacy; 23 tests |
+| 2 — payoff-agnostic engine: path-dependent pricers + Longstaff-Schwartz | **Done** (this change) | see validation below; 39 tests |
+| 3+ — remaining model ports, observers, Greeks, QMC bridge, kernels | pending | plan unchanged (§d) |
+
+**Deviations from the original §c/§d plan, by request:** Phase 2 was
+re-scoped from "port the remaining 7 models" to "prove the PathPricer
+abstraction" (originally Phases 3 and 5); the model ports move to Phase 3+.
+File names differ from the §c sketch: `mc_payoffs.py` (was `mc_pricers.py`)
+and `mc_lsm.py` (was `mc_lsmc.py`); `mc_options.py` is the options entry
+point. The LSM pricer stores a documented `paths × K` exercise-date matrix
+(assembled chunk-by-chunk, calibration matrix freed before the pricing
+pass) — the one agreed exception to full streaming; everything else
+(`Asian`, barrier, lookback) is running-statistic streaming as designed.
+
+### Phase 2 validation results (risk-neutral GBM, S0=100, K=100, r=5%, σ=25%, T=1y, 252 steps, 100k paths, seed 42)
+
+| Check | MC price (se) | Reference | Verdict |
+|---|---|---|---|
+| European call vs Black-Scholes | 12.3729 (0.0586) | 12.3360 | within 0.63 se ✔ |
+| Down-and-out call, B=85, vs Reiner-Rubinstein @ BGK-adjusted barrier | 11.2690 (0.0585) | 11.2447 | within 0.42 se ✔; above the unadjusted continuous formula 11.0529, confirming the discrete-monitoring bias direction |
+| Geometric Asian vs exact discrete closed form (Kemna-Vorst) | 6.5431 (0.0302) | 6.5517 | within 0.28 se ✔; arithmetic Asian 6.8663 dominates path-by-path (AM-GM) and sits below the European |
+| Antithetic variance reduction (European, 40k paths) | paired se 0.0687 | plain se 0.0927 | 26% se reduction ✔ (Sobol beats plain MC on mean abs error across seeds — tested) |
+| LSM American put 36/0.2/1y (20k+20k paths, K=50 dates, degree 3) | 4.4851 (0.0199) | LS2001 4.472; CRR tree 4.4867 | within 0.7 se of the paper and 0.1 se of the tree ✔ |
+| LSM grid (S0∈{36,40,44}, σ∈{0.2,0.4}, T∈{1,2}) | — | LS2001 Table 1 + in-test CRR oracle | all within max(0.08, 4 se) ✔ |
+| American call, no dividends | 4.3772 | BS European 4.3958 | equal within tolerance ✔ (early exercise ≈ never optimal) |
+
+Chunk-invariance is asserted three ways (pricer state machines are exactly
+invariant on identical paths under different chunk splits; a zero-vol
+process is exactly invariant end-to-end; the random pipeline is invariant
+within MC error — bit-exact invariance across chunk sizes is impossible
+with a shared sequential PRNG stream, same as the legacy engine).
+
+## Phase 1 implementation (commit 4af95dd)
 
 Delivered in `mc_engine.py` + `test_mc_engine.py`:
 
