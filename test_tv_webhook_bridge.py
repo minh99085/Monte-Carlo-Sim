@@ -151,3 +151,103 @@ def test_pine_template_exists_and_has_json_fields():
 
 def test_cli_requires_secret():
     assert bridge.main([]) == 2
+
+
+# ---------------------------------------------------------------------------
+# Phase D: HMAC body signatures + consecutive-duplicate dedupe
+# ---------------------------------------------------------------------------
+
+import hashlib
+import hmac as hmac_mod
+from datetime import datetime, timedelta, timezone
+
+
+def _sig(key: str, body: bytes) -> str:
+    return hmac_mod.new(key.encode(), body, hashlib.sha256).hexdigest()
+
+
+def test_check_hmac_signature_unit():
+    key, body = "hmac-key", b'{"ticker":"AAPL"}'
+    good = _sig(key, body)
+    assert bridge.check_hmac_signature({"X-Signature-SHA256": good}, body, key)
+    assert bridge.check_hmac_signature({"x-signature": "sha256=" + good}, body, key)
+    assert not bridge.check_hmac_signature({"X-Signature-SHA256": "00" * 32}, body, key)
+    assert not bridge.check_hmac_signature({}, body, key)  # missing → reject
+    # No key configured → HMAC layer is a no-op
+    assert bridge.check_hmac_signature({}, body, "")
+
+
+def _rec(ticker="AAPL", trend="bullish", momentum=55.0, minutes_ago=0.0):
+    ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago))
+    return {
+        "received_at_utc": ts.replace(microsecond=0).isoformat(),
+        "ticker": ticker,
+        "trend": trend,
+        "momentum": momentum,
+    }
+
+
+def test_is_duplicate_signal_rules():
+    prev = _rec(minutes_ago=5)
+    assert bridge.is_duplicate_signal(_rec(), prev)
+    # RSI moves within the same tercile → still a duplicate
+    assert bridge.is_duplicate_signal(_rec(momentum=58.0), prev)
+    # Different tercile, trend, or ticker → not a duplicate
+    assert not bridge.is_duplicate_signal(_rec(momentum=75.0), prev)
+    assert not bridge.is_duplicate_signal(_rec(trend="bearish"), prev)
+    assert not bridge.is_duplicate_signal(_rec(ticker="MSFT"), prev)
+    # Outside the 10-minute window → not a duplicate
+    old = _rec(minutes_ago=11)
+    assert not bridge.is_duplicate_signal(_rec(), old)
+    # No previous signal → never a duplicate
+    assert not bridge.is_duplicate_signal(_rec(), None)
+
+
+def test_server_hmac_and_dedupe(tmp_path: Path):
+    secret, key = "s3cret", "hmac-key-123"
+    host, port = "127.0.0.1", 8766
+    state = bridge.BridgeState(secret=secret, data_dir=tmp_path,
+                               hmac_key=key, dedupe_window=600)
+    httpd = bridge.ThreadingHTTPServer((host, port), bridge.make_handler(state))
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    time.sleep(0.15)
+    url = f"http://{host}:{port}/webhook?secret={secret}"
+    body = b'{"ticker":"AAPL","price":101.5,"trend":"bullish","momentum":55.5}'
+    try:
+        # Missing signature → 401
+        code, err = _http_json("POST", url, data=body,
+                               headers={"Content-Type": "application/json"})
+        assert code == 401
+        assert err["error"] == "bad_signature"
+
+        # Valid signature → saved
+        headers = {"Content-Type": "application/json",
+                   "X-Signature-SHA256": _sig(key, body)}
+        code, ok = _http_json("POST", url, data=body, headers=headers)
+        assert code == 200
+        assert ok["status"] == "saved"
+        first = bridge.load_latest(tmp_path)
+        first_ts = first["received_at_utc"]
+
+        # Identical consecutive signal → history only, latest untouched
+        code, dup = _http_json("POST", url, data=body, headers=headers)
+        assert code == 200
+        assert dup["status"] == "duplicate_ignored"
+        latest = bridge.load_latest(tmp_path)
+        assert latest["received_at_utc"] == first_ts
+        history = (tmp_path / "signal_history.jsonl").read_text().strip()
+        assert len(history.splitlines()) == 2
+        assert "duplicate_of_received_at_utc" in history.splitlines()[1]
+
+        # Different tercile → new latest
+        body2 = b'{"ticker":"AAPL","price":102,"trend":"bullish","momentum":75}'
+        headers2 = {"Content-Type": "application/json",
+                    "X-Signature-SHA256": _sig(key, body2)}
+        code, ok2 = _http_json("POST", url, data=body2, headers=headers2)
+        assert code == 200
+        assert ok2["status"] == "saved"
+        assert bridge.load_latest(tmp_path)["momentum"] == 75.0
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

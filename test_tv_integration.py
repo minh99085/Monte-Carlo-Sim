@@ -65,9 +65,12 @@ def test_apply_tv_aligns_side_and_vol(tmp_path: Path):
         max_holding_days=5,
         side="short",
     )
+    # scale_vol_by_momentum now defaults to False (RSI is a drift-state
+    # indicator, not a vol forecast) — enable explicitly to test the legacy path.
     cfg2, rule2, ctx, jump_m = apply_tradingview_to_tactical(
         cfg, rule, signal, signal_path=str(tmp_path / "latest_signal.json"),
-        base_sigma=0.20,
+        base_sigma=0.20, scale_vol_by_momentum=True,
+        calibration_dir=tmp_path / "no_calib",
     )
     assert ctx.used is True
     assert cfg2.ticker == "NVDA"

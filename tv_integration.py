@@ -9,7 +9,14 @@ concrete knobs for a short-horizon tactical run:
 
   * **Ticker / price**  → starting point of the simulation
   * **Trend**           → preferred trade side (bullish→long, bearish→short)
-  * **Momentum (RSI)**  → scale annual volatility (and optional jump intensity)
+  * **Trend + RSI**     → calibrated conditional drift (``annual_drift``)
+    via the bucket table built by ``signal_calibration.py``. This is the key
+    link: without it every simulated P(profit) is a diffusion coin-flip minus
+    costs. Missing / stale calibration or an undefined bucket maps to drift
+    0.0 with the reason recorded (never fabricate edge).
+  * **Momentum (RSI)**  → *legacy* volatility multiplier, now OFF by default;
+    current volatility should come from EWMA(λ=0.94) realized vol instead
+    (see ``weekly_decision.ewma_annual_sigma`` / ``run_weekly_from_tv.py``).
 
 Nothing here talks to TradingView over the network. It only reads the JSON
 file that ``tv_webhook_bridge.py`` already wrote.
@@ -17,7 +24,8 @@ file that ``tv_webhook_bridge.py`` already wrote.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,6 +34,94 @@ from tactical_config import TacticalConfig, TradingRule
 # Default folder written by tv_webhook_bridge.py
 DEFAULT_TV_DATA_DIR = Path("tv_data")
 DEFAULT_TV_LATEST = "latest_signal.json"
+
+# Reject signals older than this by default (see run_weekly_from_tv.py).
+DEFAULT_MAX_SIGNAL_AGE_HOURS = 30.0
+
+DEFAULT_CALIBRATION_DIR = Path("calibration")
+
+
+@dataclass
+class DriftEstimate:
+    """Calibrated conditional drift for one signal state.
+
+    ``source`` is ``"calibration"`` when a stored bucket table supplied the
+    number, else ``"none"`` (mu forced to 0.0, with ``reason`` explaining
+    why). ``mu_weekly`` is the per-horizon (default 5-day) expected log
+    return; ``mu_annual`` = mu_weekly * 252 / horizon.
+    """
+
+    mu_annual: float = 0.0
+    mu_weekly: float = 0.0
+    bucket: Optional[str] = None
+    t_stat: Optional[float] = None
+    n_eff: Optional[float] = None
+    source: str = "none"
+    reason: str = ""
+    raw_mu_weekly: Optional[float] = None
+    horizon_days: int = 5
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "mu_annual": self.mu_annual,
+            "mu_weekly": self.mu_weekly,
+            "bucket": self.bucket,
+            "t_stat": self.t_stat,
+            "n_eff": self.n_eff,
+            "source": self.source,
+            "reason": self.reason,
+            "raw_mu_weekly": self.raw_mu_weekly,
+            "horizon_days": self.horizon_days,
+        }
+
+    def label(self) -> str:
+        """Human-readable drift-source label; every probability shown to the
+        user must carry this so there are no naked probabilities."""
+        if self.source != "calibration" or self.bucket is None:
+            return f"drift μ=0.0 (source={self.source}: {self.reason or 'n/a'})"
+        t = f"{self.t_stat:.2f}" if self.t_stat is not None else "n/a"
+        n = f"{self.n_eff:.0f}" if self.n_eff is not None else "n/a"
+        return (
+            f"drift μ={self.mu_annual:+.2%}/yr "
+            f"[bucket={self.bucket}, t={t}, n_eff={n}, source=calibration]"
+        )
+
+
+def signal_age_hours(
+    signal: Optional[Dict[str, Any]],
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[float]:
+    """Age of a signal in hours from ``received_at_utc``; None if absent or
+    unparseable."""
+    if not signal:
+        return None
+    ts = signal.get("received_at_utc")
+    if not ts:
+        return None
+    try:
+        received = datetime.fromisoformat(str(ts))
+    except ValueError:
+        return None
+    if received.tzinfo is None:
+        received = received.replace(tzinfo=timezone.utc)
+    ref = now or datetime.now(timezone.utc)
+    return (ref - received).total_seconds() / 3600.0
+
+
+def is_signal_fresh(
+    signal: Optional[Dict[str, Any]],
+    max_age_hours: float = DEFAULT_MAX_SIGNAL_AGE_HOURS,
+    *,
+    now: Optional[datetime] = None,
+) -> bool:
+    """True when the signal carries a parseable timestamp within
+    ``max_age_hours``. A missing or unparseable ``received_at_utc`` counts as
+    stale — an undatable signal must not drive a trade."""
+    age = signal_age_hours(signal, now=now)
+    if age is None:
+        return False
+    return age <= float(max_age_hours)
 
 
 @dataclass
@@ -50,6 +146,7 @@ class TVSignalContext:
     vol_multiplier: float = 1.0
     jump_multiplier: float = 1.0
     trades_allowed: bool = True
+    drift_estimate: Optional[DriftEstimate] = None
     notes: List[str] = None  # type: ignore[assignment]
     raw: Optional[Dict[str, Any]] = None
 
@@ -72,6 +169,10 @@ class TVSignalContext:
             "vol_multiplier": self.vol_multiplier,
             "jump_multiplier": self.jump_multiplier,
             "trades_allowed": self.trades_allowed,
+            "drift_estimate": (
+                self.drift_estimate.as_dict()
+                if self.drift_estimate is not None else None
+            ),
             "notes": list(self.notes),
         }
 
@@ -95,6 +196,8 @@ class TVSignalContext:
             f"  Jump multiplier:  {self.jump_multiplier:.3f}",
             f"  Trades allowed:   {self.trades_allowed}",
         ]
+        if self.drift_estimate is not None:
+            lines.append(f"  Drift:            {self.drift_estimate.label()}")
         lines.extend(f"  * {n}" for n in self.notes)
         return lines
 
@@ -112,35 +215,47 @@ def resolve_signal_path(
 def load_tradingview_signal(
     data_dir: Path | str = DEFAULT_TV_DATA_DIR,
     signal_path: Optional[Path | str] = None,
+    *,
+    max_age_hours: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Load the latest TradingView signal JSON, or return None if missing/invalid.
 
     Prefers :func:`tv_webhook_bridge.load_latest` when the package layout allows
     it; otherwise reads the file directly (same schema).
+
+    When ``max_age_hours`` is set, a signal older than that (or one without a
+    parseable ``received_at_utc``) is treated as **no signal** and None is
+    returned. The production entrypoint (``run_weekly_from_tv.py``) enforces
+    this with a default of 30 hours.
     """
     path = resolve_signal_path(data_dir, signal_path)
+    data: Optional[Dict[str, Any]] = None
     # Try bridge helper first (keeps one parser for free-form / normalized files)
     try:
         from tv_webhook_bridge import load_latest, DEFAULT_DATA_DIR
 
         if signal_path is None and Path(data_dir) == Path(DEFAULT_DATA_DIR):
             data = load_latest(Path(data_dir))
-            if data is not None:
-                return data
         # Fall through to direct read for custom paths
     except Exception:
-        pass
+        data = None
 
-    if not path.is_file():
-        return None
-    try:
-        import json
+    if data is None:
+        if not path.is_file():
+            return None
+        try:
+            import json
 
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else None
-    except (OSError, ValueError):
-        return None
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            data = loaded if isinstance(loaded, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    if data is not None and max_age_hours is not None:
+        if not is_signal_fresh(data, max_age_hours):
+            return None
+    return data
 
 
 def trend_to_side(trend: Optional[str]) -> Optional[str]:
@@ -153,6 +268,91 @@ def trend_to_side(trend: Optional[str]) -> Optional[str]:
     if t in ("bearish", "bear", "short", "down", "sell"):
         return "short"
     return None
+
+
+def signal_to_drift(
+    signal: Dict[str, Any],
+    ticker: str,
+    *,
+    horizon_days: int = 5,
+    calibration_dir: Path | str = DEFAULT_CALIBRATION_DIR,
+) -> DriftEstimate:
+    """
+    Map an incoming TradingView signal (trend + RSI) to a calibrated,
+    shrunken conditional drift via the stored bucket table.
+
+    Any failure mode — missing or stale calibration, unknown trend,
+    missing/undefined RSI, empty bucket — returns ``mu = 0.0`` with the
+    reason recorded, never an invented number.
+    """
+    from signal_calibration import (
+        CalibrationError,
+        CalibrationStaleError,
+        bucket as make_bucket,
+        load_calibration,
+    )
+
+    trend = _as_str(signal.get("trend") or signal.get("direction"))
+    rsi = _as_float(signal.get("momentum") or signal.get("rsi"))
+    if trend is None or rsi is None:
+        return DriftEstimate(
+            source="none",
+            reason=f"signal missing trend/RSI (trend={trend!r}, rsi={rsi!r})",
+            horizon_days=horizon_days,
+        )
+
+    try:
+        bucket_name = make_bucket(trend, rsi)
+    except ValueError as exc:
+        return DriftEstimate(
+            source="none",
+            reason=f"undefined bucket: {exc}",
+            horizon_days=horizon_days,
+        )
+
+    try:
+        table = load_calibration(ticker, horizon_days, calibration_dir)
+    except FileNotFoundError:
+        return DriftEstimate(
+            source="none", bucket=bucket_name,
+            reason=f"no calibration table for {ticker.upper()} "
+                   f"({horizon_days}d) in {calibration_dir}",
+            horizon_days=horizon_days,
+        )
+    except CalibrationStaleError as exc:
+        return DriftEstimate(
+            source="none", bucket=bucket_name,
+            reason=f"calibration too stale: {exc}",
+            horizon_days=horizon_days,
+        )
+    except CalibrationError as exc:
+        return DriftEstimate(
+            source="none", bucket=bucket_name,
+            reason=f"calibration unreadable: {exc}",
+            horizon_days=horizon_days,
+        )
+
+    stats = table.get(bucket_name)
+    if stats is None or stats.n < 2:
+        return DriftEstimate(
+            source="none", bucket=bucket_name,
+            reason=f"bucket {bucket_name} has no usable samples",
+            horizon_days=horizon_days,
+        )
+
+    return DriftEstimate(
+        mu_annual=float(stats.shrunk_mu_annual),
+        mu_weekly=float(stats.shrunk_mu_weekly),
+        bucket=bucket_name,
+        t_stat=float(stats.t_stat),
+        n_eff=float(stats.n_eff),
+        source="calibration",
+        reason="" if stats.shrunk_mu_weekly != 0.0 else (
+            "bucket shrunk to zero (|t| < 1 or weak evidence)"
+        ),
+        raw_mu_weekly=float(stats.raw_mu_weekly),
+        horizon_days=horizon_days,
+    )
 
 
 def momentum_to_vol_multiplier(
@@ -214,14 +414,29 @@ def apply_tradingview_to_tactical(
     use_price: bool = True,
     align_side_to_trend: bool = True,
     filter_against_trend: bool = False,
-    scale_vol_by_momentum: bool = True,
+    scale_vol_by_momentum: bool = False,
     scale_jumps_by_momentum: bool = True,
     momentum_vol_strength: float = 0.40,
     signal_path: Optional[str] = None,
     base_sigma: Optional[float] = None,
+    use_signal_drift: bool = True,
+    drift_horizon_days: int = 5,
+    calibration_dir: Path | str = DEFAULT_CALIBRATION_DIR,
 ) -> Tuple[TacticalConfig, TradingRule, TVSignalContext, float]:
     """
     Apply a TradingView signal dict to config + rule.
+
+    When ``use_signal_drift`` is True (default), ``tactical.annual_drift`` is
+    set from :func:`signal_to_drift` — the calibrated, shrunken conditional
+    drift for the signal's trend/RSI bucket. The drift describes the
+    *underlying* and is used as-is regardless of trade side; the rule engine
+    already prices short P&L correctly against it. Missing calibration →
+    drift 0.0 with the reason recorded in the context.
+
+    ``scale_vol_by_momentum`` (the legacy RSI→volatility multiplier) now
+    defaults to **False**: RSI is a drift-state indicator, not a volatility
+    forecast. Use EWMA(λ=0.94) realized vol instead
+    (``weekly_decision.ewma_annual_sigma``, wired in ``run_weekly_from_tv.py``).
 
     Returns
     -------
@@ -279,6 +494,18 @@ def apply_tradingview_to_tactical(
                 f"Trades blocked: rule side={current_side} conflicts with "
                 f"TV trend={ctx.trend} ({aligned})."
             )
+
+    # --- trend + RSI → calibrated drift (the core signal→simulation link) ---
+    if use_signal_drift:
+        de = signal_to_drift(
+            signal,
+            tactical.ticker,
+            horizon_days=drift_horizon_days,
+            calibration_dir=calibration_dir,
+        )
+        ctx.drift_estimate = de
+        tactical = replace(tactical, annual_drift=float(de.mu_annual))
+        ctx.notes.append(f"annual_drift set from signal: {de.label()}")
 
     # --- momentum → vol / jumps ---
     vol_m = 1.0

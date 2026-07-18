@@ -18,6 +18,10 @@ __pycache__/
 # TradingView webhook bridge runtime data (Phase 3)
 tv_data/
 
+# Drift calibration tables + pipeline outputs (regenerate, don't commit)
+calibration/
+outputs/
+
 # OS / editor
 .DS_Store
 .idea/
