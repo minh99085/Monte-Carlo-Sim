@@ -305,8 +305,9 @@ default.
 | 1 — process/generator/pricer abstractions, GBM+Heston behind flag | **Done** (commit 4af95dd) | bit-identical to legacy; 23 tests |
 | 2 — payoff-agnostic engine: path-dependent pricers + Longstaff-Schwartz | **Done** (commit f43cf66) | see validation below; 39 tests |
 | 3 — Greeks (PW / LRM / CRN-FD) + Sobol Brownian bridge | **Done** | see validation below; 27 tests |
-| 4 — port the remaining 7 models (`mc_processes.py`) | **Done** (this change) | bit-identical for all 9 models × plain/antithetic/Sobol/stress; 59 tests; default engine still legacy |
-| 5+ — flip v2 default (gated), observers extraction, kernels | pending | plan unchanged (§d) |
+| 4 — port the remaining 7 models (`mc_processes.py`) | **Done** | bit-identical for all 9 models × plain/antithetic/Sobol/stress; 59 tests; default engine still legacy |
+| 5 — flip the v2 default + extract observers | **Done** (this change) | `engine="v2"` is now the default; the `engine="legacy"` field and `MC_ENGINE=legacy` env var are the escape hatches. Drawdown/ruin/underwater/sample logic extracted from `simulate()` into `DrawdownObserver`/`SampleRecorder` (duck-typed PathPricers, shared with the v2 PathGenerator — option runs get drawdown metrics for free). Pre-flip golden hashes anchor all 9 models under BOTH engines, so a shared-code regression can no longer hide from pairwise tests. `stats["engine"]` is now always recorded — the one additive schema change, shipped deliberately with the flip. 32 tests |
+| 6+ — streaming quantile accumulators, Numba kernels, multi-asset process | pending | plan unchanged (§d) |
 
 **Deviations from the original §c/§d plan, by request:** Phase 2 was
 re-scoped from "port the remaining 7 models" to "prove the PathPricer

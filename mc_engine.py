@@ -47,6 +47,8 @@ from mc_core import (
     MODEL_MERTON,
     MODEL_REGIME,
     MODEL_STUDENT_T,
+    DrawdownObserver,   # re-exported: duck-typed streaming observers shared
+    SampleRecorder,     # between simulate() and this pipeline (Phase 5)
     MemoryInfo,
     SimulationConfig,
     _draw_gauss,

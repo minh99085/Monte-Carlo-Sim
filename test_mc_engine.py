@@ -58,13 +58,14 @@ def _final_values(cfg: SimulationConfig) -> np.ndarray:
 class TestFlaggedEquivalence:
     @pytest.mark.parametrize("model", [mc_core.MODEL_GBM, mc_core.MODEL_HESTON])
     def test_exact_match_plain(self, model):
-        legacy = _final_values(_cfg(model=model))
+        legacy = _final_values(_cfg(model=model, engine="legacy"))
         v2 = _final_values(_cfg(model=model, engine="v2"))
         assert np.array_equal(legacy, v2)
 
     @pytest.mark.parametrize("model", [mc_core.MODEL_GBM, mc_core.MODEL_HESTON])
     def test_exact_match_antithetic(self, model):
-        legacy = _final_values(_cfg(model=model, variance_reduction="antithetic"))
+        legacy = _final_values(_cfg(model=model, variance_reduction="antithetic",
+                                    engine="legacy"))
         v2 = _final_values(
             _cfg(model=model, variance_reduction="antithetic", engine="v2"))
         assert np.array_equal(legacy, v2)
@@ -73,7 +74,8 @@ class TestFlaggedEquivalence:
                         reason="SciPy Sobol not available")
     @pytest.mark.parametrize("model", [mc_core.MODEL_GBM, mc_core.MODEL_HESTON])
     def test_exact_match_sobol(self, model):
-        legacy = _final_values(_cfg(model=model, variance_reduction="sobol"))
+        legacy = _final_values(_cfg(model=model, variance_reduction="sobol",
+                                    engine="legacy"))
         v2 = _final_values(
             _cfg(model=model, variance_reduction="sobol", engine="v2"))
         assert np.array_equal(legacy, v2)
@@ -82,25 +84,32 @@ class TestFlaggedEquivalence:
         kw = dict(model=mc_core.MODEL_GBM, stress_enabled=True,
                   stress_crash_pct=0.10, stress_vol_multiplier=1.5,
                   stress_drift_haircut=0.5)
-        legacy = _final_values(_cfg(**kw))
+        legacy = _final_values(_cfg(engine="legacy", **kw))
         v2 = _final_values(_cfg(engine="v2", **kw))
         assert np.array_equal(legacy, v2)
 
     def test_stats_equal_and_engine_recorded(self):
-        r_legacy = simulate(_cfg(model=mc_core.MODEL_HESTON))
+        r_legacy = simulate(_cfg(model=mc_core.MODEL_HESTON, engine="legacy"))
         r_v2 = simulate(_cfg(model=mc_core.MODEL_HESTON, engine="v2"))
         assert r_v2.stats["engine"] == "v2"
-        assert "engine" not in r_legacy.stats  # default schema unchanged
+        # Phase 5: the engine is always recorded ("legacy" when forced).
+        assert r_legacy.stats["engine"] == "legacy"
         for key in ("expected_value", "median_value", "prob_profit",
                     "std_value", "prob_ruin", "mean_max_drawdown"):
             assert r_legacy.stats[key] == r_v2.stats[key], key
 
     def test_env_var_flag(self, monkeypatch):
-        legacy = _final_values(_cfg())
+        # Env var beats the config field in both directions (Phase 5 flip:
+        # the default is v2, MC_ENGINE=legacy is the global escape hatch).
+        baseline = _final_values(_cfg())
         monkeypatch.setenv(mc_core.ENGINE_ENV_VAR, "v2")
-        r = simulate(_cfg())
+        r = simulate(_cfg(engine="legacy"))
         assert r.stats["engine"] == "v2"
-        assert np.array_equal(legacy, r.final_values)
+        assert np.array_equal(baseline, r.final_values)
+        monkeypatch.setenv(mc_core.ENGINE_ENV_VAR, "legacy")
+        r2 = simulate(_cfg())
+        assert r2.stats["engine"] == "legacy"
+        assert np.array_equal(baseline, r2.final_values)
 
     def test_unported_model_falls_back_to_legacy(self, monkeypatch):
         # All shipped models are ported as of Phase 4, so simulate an
@@ -109,7 +118,7 @@ class TestFlaggedEquivalence:
         monkeypatch.setattr(mc_engine, "V2_SUPPORTED_MODELS",
                             (mc_core.MODEL_GBM,))
         kw = dict(model=mc_core.MODEL_STUDENT_T, t_df=5.0)
-        legacy = _final_values(_cfg(**kw))
+        legacy = _final_values(_cfg(engine="legacy", **kw))
         r = simulate(_cfg(engine="v2", **kw))
         assert np.array_equal(legacy, r.final_values)
         assert "not ported" in r.stats["engine"]

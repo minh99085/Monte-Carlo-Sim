@@ -277,10 +277,12 @@ class SimulationConfig:
     # Threshold (fraction) for the large-drawdown probability metric.
     drawdown_threshold: float = DRAWDOWN_THRESHOLD
 
-    # Engine selection: "legacy" (default) or "v2" (mc_engine StochasticProcess
-    # pipeline; GBM/Heston in Phase 1, other models fall back to legacy).
-    # The MC_ENGINE environment variable overrides this without CLI changes.
-    engine: str = ENGINE_LEGACY
+    # Engine selection. As of Phase 5 the default is "v2" (the mc_engine
+    # StochasticProcess pipeline — all nine models, bit-identical to the
+    # legacy closures). "legacy" remains available as a one-release escape
+    # hatch, and the MC_ENGINE environment variable overrides either way
+    # without CLI changes (MC_ENGINE=legacy to fall back globally).
+    engine: str = ENGINE_V2
 
     def validate(self) -> "SimulationConfig":
         if self.paths < 1:
@@ -898,6 +900,92 @@ def _build_step_engine(cfg: SimulationConfig):
     raise ValueError(f"Unsupported model: {model!r}")
 
 
+class DrawdownObserver:
+    """Streaming drawdown / ruin / underwater-duration tracker (Phase 5).
+
+    Extracted from the previously inlined accumulators in :func:`simulate`;
+    the per-step arithmetic and its order are preserved exactly, so results
+    are bit-identical. Duck-types the ``mc_engine.PathPricer`` streaming
+    protocol (``begin_chunk`` / ``observe`` / ``end_chunk``) so the same
+    observer runs in the v2 ``PathGenerator`` — option runs can now report
+    drawdown metrics for free. All state is chunk-local.
+    """
+
+    def __init__(self, ruin_level: float, drawdown_threshold: float):
+        self.ruin_level = float(ruin_level)
+        self.drawdown_threshold = float(drawdown_threshold)
+        self.drawdown_hits = 0
+        self.ruin_hits = 0
+        self.dd_duration_sum = 0.0
+        self.dd_depth_sum = 0.0
+        self._max_dd_chunks: List[np.ndarray] = []
+
+    def begin_chunk(self, prices0: np.ndarray) -> None:
+        self._running_max = prices0.copy()
+        self._max_dd = np.zeros(prices0.size, dtype=np.float64)
+        self._cur_uw = np.zeros(prices0.size, dtype=np.int64)
+        self._max_uw = np.zeros(prices0.size, dtype=np.int64)
+        self._ruin_hit = prices0 <= self.ruin_level
+
+    def observe(self, step_i: int, prices: np.ndarray) -> None:
+        np.maximum(self._running_max, prices, out=self._running_max)
+        dd = 1.0 - prices / self._running_max
+        np.maximum(self._max_dd, dd, out=self._max_dd)
+        self._ruin_hit |= prices <= self.ruin_level
+        underwater = prices < self._running_max
+        self._cur_uw = np.where(underwater, self._cur_uw + 1, 0)
+        np.maximum(self._max_uw, self._cur_uw, out=self._max_uw)
+
+    def end_chunk(self, prices: np.ndarray) -> None:
+        self.drawdown_hits += int(
+            np.count_nonzero(self._max_dd >= self.drawdown_threshold))
+        self.ruin_hits += int(np.count_nonzero(self._ruin_hit))
+        self.dd_duration_sum += float(self._max_uw.sum())
+        self.dd_depth_sum += float(self._max_dd.sum())
+        self._max_dd_chunks.append(self._max_dd)
+
+    def values(self) -> np.ndarray:
+        """Per-path maximum drawdown fraction (PathPricer contract)."""
+        if not self._max_dd_chunks:
+            return np.asarray([], dtype=np.float64)
+        return np.concatenate(self._max_dd_chunks)
+
+
+class SampleRecorder:
+    """Streaming recorder for the bounded sample-trajectory block (Phase 5).
+
+    Fills the first ``n_sample`` paths' full trajectories, chunk by chunk —
+    the only deliberately retained 2-D array, exactly as ``simulate`` always
+    did. Duck-types the PathPricer protocol; reusable on the v2 pipeline.
+    """
+
+    def __init__(self, n_sample: int, steps: int, s0: float):
+        self.n_sample = int(n_sample)
+        self.steps = int(steps)
+        self.matrix = np.empty((self.n_sample, self.steps + 1),
+                               dtype=np.float64)
+        if self.n_sample:
+            self.matrix[:, 0] = float(s0)
+        self._produced = 0
+        self._take = 0
+
+    def begin_chunk(self, prices0: np.ndarray) -> None:
+        self._take = max(0, min(self.n_sample - self._produced, prices0.size))
+
+    def observe(self, step_i: int, prices: np.ndarray) -> None:
+        if self._take:
+            self.matrix[self._produced:self._produced + self._take, step_i] = (
+                prices[:self._take]
+            )
+
+    def end_chunk(self, prices: np.ndarray) -> None:
+        self._produced += prices.size
+
+    def values(self) -> np.ndarray:
+        """Terminal sample values (PathPricer contract)."""
+        return self.matrix[:, -1] if self.n_sample else np.asarray([])
+
+
 def simulate(config: SimulationConfig) -> SimulationResult:
     """Run a chunked Monte Carlo simulation for the configured model.
 
@@ -947,19 +1035,17 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     )
     dd_threshold = cfg.drawdown_threshold
     ruin_level = cfg.ruin_threshold * cfg.s0
-    drawdown_hits = 0
-    ruin_hits = 0
-    dd_duration_sum = 0.0       # sum over paths of each path's longest underwater run
-    dd_depth_sum = 0.0          # sum over paths of each path's max drawdown fraction
+    # Streaming observers (extracted from the loop in Phase 5; identical
+    # arithmetic, and reusable on the v2 PathGenerator pipeline).
+    dd_observer = DrawdownObserver(ruin_level, dd_threshold)
 
     final_values = np.empty(cfg.paths, dtype=np.float64)
     # Gross (pre-cost) terminal prices — used for control-variate post-process.
     gross_terminals = np.empty(cfg.paths, dtype=np.float64)
 
     n_sample = min(cfg.sample_paths, cfg.paths)
-    sample_trajectories = np.empty((n_sample, steps + 1), dtype=np.float64)
-    if n_sample:
-        sample_trajectories[:, 0] = cfg.s0
+    sampler = SampleRecorder(n_sample, steps, cfg.s0)
+    sample_trajectories = sampler.matrix
 
     memory = MemoryInfo(
         paths=cfg.paths, horizon=cfg.horizon, chunk_size=cfg.chunk_size
@@ -983,14 +1069,6 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         prices = np.full(this_chunk, cfg.s0, dtype=np.float64)
         memory.peak_vector_elements = max(memory.peak_vector_elements, prices.size)
 
-        # Per-path running peak, max drawdown depth, drawdown-duration tracking
-        # and ruin flag -- all length n (chunk), so memory stays bounded.
-        running_max = prices.copy()
-        max_dd = np.zeros(this_chunk, dtype=np.float64)
-        cur_uw = np.zeros(this_chunk, dtype=np.int64)   # current underwater length
-        max_uw = np.zeros(this_chunk, dtype=np.int64)   # longest underwater length
-        ruin_hit = prices <= ruin_level
-
         # Per-chunk model state (bounded by chunk size).
         state = init_chunk(rng, this_chunk)
         if use_sobol:
@@ -999,33 +1077,19 @@ def simulate(config: SimulationConfig) -> SimulationResult:
             sobol_seed = None if cfg.seed is None else int(cfg.seed) + chunk_idx * 1_000_003
             state = _attach_sobol_shocks(state, this_chunk, steps, sobol_seed)
 
-        # How many of this chunk's paths feed the global sample block.
-        sample_in_chunk = max(0, min(n_sample - produced, this_chunk))
+        dd_observer.begin_chunk(prices)
+        sampler.begin_chunk(prices)
 
         for step in range(1, steps + 1):
             log_ret = step_fn(rng, this_chunk, state, step)
             if step == 1 and crash_log:
                 log_ret = log_ret + crash_log
             prices *= np.exp(log_ret)
+            dd_observer.observe(step, prices)
+            sampler.observe(step, prices)
 
-            np.maximum(running_max, prices, out=running_max)
-            dd = 1.0 - prices / running_max
-            np.maximum(max_dd, dd, out=max_dd)
-            ruin_hit |= prices <= ruin_level
-
-            underwater = prices < running_max
-            cur_uw = np.where(underwater, cur_uw + 1, 0)
-            np.maximum(max_uw, cur_uw, out=max_uw)
-
-            if sample_in_chunk:
-                sample_trajectories[produced:produced + sample_in_chunk, step] = (
-                    prices[:sample_in_chunk]
-                )
-
-        drawdown_hits += int(np.count_nonzero(max_dd >= dd_threshold))
-        ruin_hits += int(np.count_nonzero(ruin_hit))
-        dd_duration_sum += float(max_uw.sum())
-        dd_depth_sum += float(max_dd.sum())
+        dd_observer.end_chunk(prices)
+        sampler.end_chunk(prices)
         gross = prices
         net = apply_costs(gross, cfg.s0, cfg.cost)
         final_values[produced:produced + this_chunk] = net
@@ -1079,7 +1143,7 @@ def simulate(config: SimulationConfig) -> SimulationResult:
     )
     stats = compute_statistics(
         final_values, cfg.s0, runtime=runtime,
-        drawdown_prob=drawdown_hits / cfg.paths,
+        drawdown_prob=dd_observer.drawdown_hits / cfg.paths,
         drawdown_threshold=dd_threshold,
     )
     if cv_mean is not None:
@@ -1090,8 +1154,8 @@ def simulate(config: SimulationConfig) -> SimulationResult:
         stats["control_variate_mean"] = cv_mean
     stats["model"] = cfg.model
     stats["drift_mode"] = cfg.drift_mode
-    # Record the engine only when v2 was requested, so default (legacy) runs
-    # keep their exact historical output schema.
+    # Phase 5: the engine is always recorded (additive schema change shipped
+    # together with the v2 default flip).
     if _effective_engine(cfg) == ENGINE_V2:
         try:
             from mc_engine import V2_SUPPORTED_MODELS
@@ -1101,14 +1165,16 @@ def simulate(config: SimulationConfig) -> SimulationResult:
             )
         except ImportError:  # pragma: no cover
             stats["engine"] = ENGINE_LEGACY
+    else:
+        stats["engine"] = ENGINE_LEGACY
     stats["variance_reduction"] = vr_requested
     stats["variance_reduction_effective"] = vr_effective
     if vr_notes:
         stats["variance_reduction_notes"] = vr_notes
     # Path-based risk metrics (averaged over paths).
-    stats["mean_max_drawdown"] = dd_depth_sum / cfg.paths
-    stats["mean_drawdown_duration"] = dd_duration_sum / cfg.paths
-    stats["prob_ruin"] = ruin_hits / cfg.paths
+    stats["mean_max_drawdown"] = dd_observer.dd_depth_sum / cfg.paths
+    stats["mean_drawdown_duration"] = dd_observer.dd_duration_sum / cfg.paths
+    stats["prob_ruin"] = dd_observer.ruin_hits / cfg.paths
     stats["ruin_threshold"] = cfg.ruin_threshold
     _augment_risk_metrics(stats, cfg)
 

@@ -67,13 +67,13 @@ def _final_values(cfg) -> np.ndarray:
 class TestPortedModelEquivalence:
     @pytest.mark.parametrize("model", PORTED)
     def test_exact_match_plain(self, model):
-        assert np.array_equal(_final_values(_cfg(model)),
+        assert np.array_equal(_final_values(_cfg(model, engine="legacy")),
                               _final_values(_cfg(model, engine="v2")))
 
     @pytest.mark.parametrize("model", PORTED)
     def test_exact_match_antithetic(self, model):
         kw = dict(variance_reduction="antithetic")
-        assert np.array_equal(_final_values(_cfg(model, **kw)),
+        assert np.array_equal(_final_values(_cfg(model, engine="legacy", **kw)),
                               _final_values(_cfg(model, engine="v2", **kw)))
 
     @pytest.mark.skipif(not mc_core.sobol_available(),
@@ -81,21 +81,21 @@ class TestPortedModelEquivalence:
     @pytest.mark.parametrize("model", PORTED)
     def test_exact_match_sobol(self, model):
         kw = dict(variance_reduction="sobol")
-        assert np.array_equal(_final_values(_cfg(model, **kw)),
+        assert np.array_equal(_final_values(_cfg(model, engine="legacy", **kw)),
                               _final_values(_cfg(model, engine="v2", **kw)))
 
     @pytest.mark.parametrize("model", PORTED)
     def test_exact_match_stress_crash(self, model):
         kw = dict(stress_enabled=True, stress_crash_pct=0.08,
                   stress_vol_multiplier=1.4, stress_drift_haircut=0.3)
-        assert np.array_equal(_final_values(_cfg(model, **kw)),
+        assert np.array_equal(_final_values(_cfg(model, engine="legacy", **kw)),
                               _final_values(_cfg(model, engine="v2", **kw)))
 
     @pytest.mark.parametrize("model", PORTED)
     def test_stats_equal_and_engine_key_semantics(self, model):
-        r_legacy = simulate(_cfg(model))
+        r_legacy = simulate(_cfg(model, engine="legacy"))
         r_v2 = simulate(_cfg(model, engine="v2"))
-        assert "engine" not in r_legacy.stats     # default schema unchanged
+        assert r_legacy.stats["engine"] == "legacy"   # always recorded (Phase 5)
         assert r_v2.stats["engine"] == "v2"
         for key in ("expected_value", "median_value", "prob_profit",
                     "std_value", "prob_ruin", "mean_max_drawdown",
