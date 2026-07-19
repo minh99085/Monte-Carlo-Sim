@@ -42,6 +42,7 @@ __all__ = [
     "AsianArithmeticPricer",
     "AsianGeometricPricer",
     "BarrierPricer",
+    "DigitalPricer",
     "LookbackPricer",
     "check_risk_neutral_drift",
     "norm_cdf",
@@ -157,6 +158,25 @@ class AsianGeometricPricer(_OptionPricer):
             raise RuntimeError("Asian pricer saw no observations")
         gmean = np.exp(self._logsum / self._count)
         self._emit(self.discount * self._intrinsic(gmean))
+
+
+class DigitalPricer(_OptionPricer):
+    """Cash-or-nothing digital: pays ``cash`` when the terminal price
+    finishes in the money (``S_T > K`` for a call, ``S_T < K`` for a put).
+
+    The payoff is **discontinuous** at the strike — pathwise Greeks are
+    invalid for it (the derivative of an indicator is a delta function);
+    use the likelihood-ratio method (mc_greeks.py) instead.
+    """
+
+    def __init__(self, *, strike: float, maturity: float, r: float,
+                 call: bool = True, cash: float = 1.0):
+        super().__init__(strike=strike, maturity=maturity, r=r, call=call)
+        self.cash = float(cash)
+
+    def end_chunk(self, prices: np.ndarray) -> None:
+        itm = (prices > self.strike) if self.call else (prices < self.strike)
+        self._emit(self.discount * self.cash * itm.astype(np.float64))
 
 
 class BarrierPricer(_OptionPricer):

@@ -266,6 +266,101 @@ class TerminalValuePricer(PathPricer):
 
 
 # ---------------------------------------------------------------------------
+# Brownian bridge (QMC dimension ordering; Phase 3, REVIEW.md §c.4)
+# ---------------------------------------------------------------------------
+
+
+class BrownianBridge:
+    """Coarse-to-fine Brownian path construction (Jäckel's algorithm,
+    *Monte Carlo Methods in Finance*, ch. 10 — reimplemented in NumPy).
+
+    Why: a Sobol sequence's low dimensions are its best-distributed ones.
+    Filling the path increment-by-increment spends dimension 1 on the first
+    tiny step. The bridge instead uses dimension 1 for the **terminal**
+    Brownian level (which carries the largest share of path variance), then
+    successive dimensions for midpoints, recursively halving. Low Sobol
+    dimensions therefore control the largest-variance features of the path,
+    which is what makes QMC converge near O(1/N) for path-dependent payoffs.
+
+    Works on an equally spaced grid of ``steps`` points ``t_i = (i+1)·dt``.
+    ``transform(z)`` maps a ``(n_paths, steps)`` matrix of independent
+    standard normals — ordered by Sobol dimension — into per-step standard
+    normal *increments* (same shape), which the generator consumes exactly
+    like plain per-step shocks. The transform allocates one extra
+    ``chunk × steps`` work array — the same footprint class as the Sobol
+    shock matrix itself, tracked by MemoryInfo.
+    """
+
+    def __init__(self, steps: int, dt: float = 1.0):
+        if steps < 1:
+            raise ValueError("steps must be >= 1")
+        self.steps = int(steps)
+        self.dt = float(dt)
+        n = self.steps
+        t = dt * (np.arange(n, dtype=np.float64) + 1.0)
+        self._t = t
+        self.bridge_index = np.zeros(n, dtype=np.int64)
+        self.left_index = np.zeros(n, dtype=np.int64)
+        self.right_index = np.zeros(n, dtype=np.int64)
+        self.left_weight = np.zeros(n, dtype=np.float64)
+        self.right_weight = np.zeros(n, dtype=np.float64)
+        self.std_dev = np.zeros(n, dtype=np.float64)
+
+        taken = np.zeros(n, dtype=bool)
+        # Dimension 0 -> the terminal point.
+        self.bridge_index[0] = n - 1
+        self.std_dev[0] = math.sqrt(t[n - 1])
+        taken[n - 1] = True
+        j = 0
+        for i in range(1, n):
+            # j: first index not yet constructed; k: next constructed index.
+            while taken[j]:
+                j += 1
+            k = j
+            while not taken[k]:
+                k += 1
+            # Bisect the unset run [j, k): l is its midpoint.
+            l = j + ((k - 1 - j) >> 1)
+            self.bridge_index[i] = l
+            self.left_index[i] = j
+            self.right_index[i] = k
+            t_l, t_k = t[l], t[k]
+            t_j = t[j - 1] if j > 0 else 0.0
+            span = t_k - t_j
+            self.left_weight[i] = (t_k - t_l) / span
+            self.right_weight[i] = (t_l - t_j) / span
+            self.std_dev[i] = math.sqrt((t_l - t_j) * (t_k - t_l) / span)
+            taken[l] = True
+            j = k + 1
+            if j >= n:
+                j = 0
+
+    def transform(self, z: np.ndarray) -> np.ndarray:
+        """(n_paths, steps) dimension-ordered normals → per-step standard
+        normal increments (n_paths, steps)."""
+        z = np.asarray(z, dtype=np.float64)
+        if z.ndim != 2 or z.shape[1] != self.steps:
+            raise ValueError(f"z must have shape (n_paths, {self.steps})")
+        n = self.steps
+        w = np.empty_like(z)  # Brownian levels W(t_i)
+        w[:, n - 1] = self.std_dev[0] * z[:, 0]
+        for i in range(1, n):
+            l = self.bridge_index[i]
+            j = self.left_index[i]
+            k = self.right_index[i]
+            mid = self.right_weight[i] * w[:, k] + self.std_dev[i] * z[:, i]
+            if j > 0:
+                mid += self.left_weight[i] * w[:, j - 1]
+            w[:, l] = mid
+        # Levels -> increments, renormalized to per-step standard normals.
+        inv_sq = 1.0 / math.sqrt(self.dt)
+        out = np.empty_like(w)
+        out[:, 0] = w[:, 0] * inv_sq
+        out[:, 1:] = np.diff(w, axis=1) * inv_sq
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Layer 2: PathGenerator — the chunk-safe driver
 # ---------------------------------------------------------------------------
 
@@ -294,10 +389,24 @@ class PathGenerator:
         seed: Optional[int] = None,
         antithetic: bool = False,
         sobol: bool = False,
+        bridge: bool = False,
         crash_log: float = 0.0,
     ):
         if paths < 1 or steps < 1 or chunk_size < 1 or s0 <= 0:
             raise ValueError("paths, steps, chunk_size must be >= 1 and s0 > 0")
+        if bridge and not sobol:
+            raise ValueError(
+                "bridge=True requires sobol=True — the Brownian bridge is a "
+                "QMC dimension-ordering device (pseudorandom shocks gain "
+                "nothing from reordering)"
+            )
+        if bridge and getattr(process, "factors", 1) > 1:
+            raise ValueError(
+                "Brownian bridge is implemented for single-factor processes "
+                "only in this phase (GBM). Multi-factor bridging (Heston's "
+                "correlated variance factor) is documented as out of scope "
+                "in REVIEW.md — use plain sobol or pseudorandom instead."
+            )
         self.process = process
         self.s0 = float(s0)
         self.paths = int(paths)
@@ -306,6 +415,11 @@ class PathGenerator:
         self.seed = seed
         self.antithetic = bool(antithetic)
         self.sobol = bool(sobol)
+        self.bridge = bool(bridge)
+        self._bridge = (
+            BrownianBridge(self.steps, getattr(process, "dt", 1.0))
+            if bridge else None
+        )
         self.crash_log = float(crash_log)
         self.memory = MemoryInfo(
             paths=self.paths, horizon=self.steps, chunk_size=self.chunk_size
@@ -327,11 +441,15 @@ class PathGenerator:
                     None if self.seed is None
                     else int(self.seed) + chunk_idx * SOBOL_CHUNK_SEED_STRIDE
                 )
-                state["sobol_z"] = _sobol_standard_normals(
-                    n, self.steps, sobol_seed
-                )
+                shocks = _sobol_standard_normals(n, self.steps, sobol_seed)
+                if self._bridge is not None:
+                    # Reorder Sobol dimensions coarse-to-fine over the time
+                    # grid; output is per-step standard normal increments.
+                    shocks = self._bridge.transform(shocks)
+                state["sobol_z"] = shocks
                 self.memory.peak_matrix_elements = max(
-                    self.memory.peak_matrix_elements, n * self.steps
+                    self.memory.peak_matrix_elements,
+                    n * self.steps * (2 if self._bridge is not None else 1),
                 )
 
             for p in pricers:

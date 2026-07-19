@@ -256,3 +256,118 @@ class TestStreamingMoments:
         assert sm.n == 0
         sm.add(np.array([3.0]))
         assert sm.n == 1 and sm.mean == 3.0 and sm.variance == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 Part B: Sobol + Brownian bridge
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not mc_core.sobol_available(),
+                    reason="SciPy Sobol not available")
+class TestBrownianBridge:
+    S0, K, R, SIG, T = 100.0, 100.0, 0.05, 0.25, 1.0
+
+    def _price(self, pricer_cls, n, steps, seed, mode, **pkw):
+        from mc_payoffs import EuropeanPricer  # noqa: F401 (import guard)
+        gen = mc_engine.PathGenerator(
+            GBMProcess(self.R, self.SIG, self.T / steps),
+            s0=self.S0, paths=n, steps=steps, chunk_size=n, seed=seed,
+            sobol=(mode in ("sobol", "bridge")), bridge=(mode == "bridge"))
+        p = pricer_cls(strike=self.K, maturity=self.T, r=self.R, **pkw)
+        gen.run([p])
+        return p.price()
+
+    def test_bridge_increments_are_standard_normal(self):
+        bb = mc_engine.BrownianBridge(16, 1.0 / 16)
+        rng = np.random.default_rng(0)
+        inc = bb.transform(rng.standard_normal((100_000, 16)))
+        assert np.abs(inc.mean(axis=0)).max() < 0.02
+        assert np.abs(inc.std(axis=0) - 1.0).max() < 0.02
+        corr = np.corrcoef(inc[:, :6].T)
+        assert np.abs(corr - np.eye(6)).max() < 0.02
+
+    def test_bridge_terminal_level_uses_first_dimension(self):
+        # With only dimension 0 nonzero, the whole path is the linear
+        # interpolation of the terminal level: W(t_i) = (t_i/T) * sqrt(T) z0.
+        steps = 8
+        bb = mc_engine.BrownianBridge(steps, 1.0 / steps)
+        z = np.zeros((1, steps))
+        z[0, 0] = 1.0
+        inc = bb.transform(z)[0]
+        w = np.cumsum(inc) * math.sqrt(1.0 / steps)
+        expect = (np.arange(1, steps + 1) / steps) * 1.0  # sqrt(T)=1
+        np.testing.assert_allclose(w, expect, atol=1e-12)
+
+    def test_bridge_single_step_is_identity(self):
+        bb = mc_engine.BrownianBridge(1, 0.25)
+        z = np.array([[1.7], [-0.3]])
+        np.testing.assert_allclose(bb.transform(z), z, atol=1e-12)
+
+    def test_european_price_matches_bs(self):
+        from mc_payoffs import EuropeanPricer, black_scholes_price
+        bs = black_scholes_price(self.S0, self.K, self.R, self.SIG, self.T)
+        price = self._price(EuropeanPricer, 8_192, 32, 3, "bridge")
+        assert abs(price - bs) < 0.05  # QMC at 8k paths is very tight
+
+    def test_convergence_slope_steeper_than_prng(self):
+        from mc_payoffs import EuropeanPricer, black_scholes_price
+        bs = black_scholes_price(self.S0, self.K, self.R, self.SIG, self.T)
+        sizes = [256, 1024, 4096]
+        reps = 8
+
+        def rmse(mode):
+            out = []
+            for n in sizes:
+                errs = [self._price(EuropeanPricer, n, 32, 1000 + i, mode) - bs
+                        for i in range(reps)]
+                out.append(float(np.sqrt(np.mean(np.square(errs)))))
+            return out
+
+        slope = lambda r: float(np.polyfit(np.log(sizes), np.log(r), 1)[0])
+        s_prng, s_bridge = slope(rmse("prng")), slope(rmse("bridge"))
+        assert -0.80 < s_prng < -0.30, s_prng          # ~ N^-0.5
+        assert s_bridge < -0.80, s_bridge              # ~ N^-1
+        assert s_bridge < s_prng - 0.25, (s_prng, s_bridge)
+
+    def test_asian_bridge_beats_plain_sobol(self):
+        # The headline: bridging front-loads variance into low Sobol
+        # dimensions, which is what path-dependent payoffs need. Exact
+        # discrete-geometric closed form as the error reference.
+        from mc_payoffs import AsianGeometricPricer, geometric_asian_call_discrete
+        ref = geometric_asian_call_discrete(self.S0, self.K, self.R,
+                                            self.SIG, self.T, 64)
+
+        def rmse(mode):
+            errs = [self._price(AsianGeometricPricer, 4_096, 64, 2000 + i,
+                                mode) - ref for i in range(8)]
+            return float(np.sqrt(np.mean(np.square(errs))))
+
+        e_sobol, e_bridge = rmse("sobol"), rmse("bridge")
+        assert e_bridge < 0.5 * e_sobol, (e_sobol, e_bridge)
+
+    def test_bridge_requires_sobol(self):
+        with pytest.raises(ValueError, match="requires sobol"):
+            mc_engine.PathGenerator(GBMProcess(0.05, 0.2, 1 / 32), s0=100,
+                                    paths=10, steps=32, bridge=True)
+
+    def test_bridge_rejects_multifactor(self):
+        with pytest.raises(ValueError, match="single-factor"):
+            mc_engine.PathGenerator(
+                HestonProcess(0.05, 1 / 32, kappa=1.5, theta=0.04, xi=0.3,
+                              rho=-0.7, v0=0.04),
+                s0=100, paths=10, steps=32, sobol=True, bridge=True)
+
+    def test_plain_sobol_unchanged_by_bridge_feature(self):
+        # bridge=False must reproduce the pre-Phase-3 plain-Sobol stream.
+        from mc_payoffs import EuropeanPricer
+        a = self._price(EuropeanPricer, 2_048, 16, 5, "sobol")
+        cfg = _cfg(paths=2_048, horizon=16, seed=5, chunk_size=2_048,
+                   variance_reduction="sobol", s0=100.0, mu=0.05, sigma=0.25)
+        # same shocks as the flagged v2 engine consumes -> same terminal set
+        import mc_core as _mc
+        legacy = simulate(cfg).final_values
+        gen = mc_engine.generator_from_config(cfg)
+        p = TerminalValuePricer(cfg.s0, cfg.cost)
+        gen.run([p])
+        assert np.array_equal(np.sort(legacy), np.sort(p.values()))

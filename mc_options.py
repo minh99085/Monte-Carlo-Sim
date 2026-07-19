@@ -110,8 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="monitoring/simulation steps per year (default 252)")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--chunk-size", type=int, default=50_000)
-    p.add_argument("--variance-reduction", choices=("none", "antithetic", "sobol"),
-                   default="none")
+    p.add_argument("--variance-reduction",
+                   choices=("none", "antithetic", "sobol", "sobol-bridge"),
+                   default="none",
+                   help="'sobol-bridge' = Sobol QMC with Brownian-bridge "
+                        "dimension ordering (single-factor/GBM only)")
     # Barrier / lookback specifics
     p.add_argument("--barrier", type=float, default=None)
     p.add_argument("--barrier-dir", choices=("up", "down"), default="down")
@@ -153,7 +156,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         sigma = float(args.sigma) if args.sigma is not None else float(mkt.sigma)
         source = mkt.source
 
-    if args.variance_reduction == "sobol" and not sobol_available():
+    if args.variance_reduction.startswith("sobol") and not sobol_available():
         print("ERROR: --variance-reduction sobol requires SciPy.",
               file=sys.stderr)
         return 2
@@ -191,7 +194,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         process, s0=s0, paths=args.paths, steps=steps,
         chunk_size=args.chunk_size, seed=args.seed,
         antithetic=(args.variance_reduction == "antithetic"),
-        sobol=(args.variance_reduction == "sobol"),
+        sobol=args.variance_reduction.startswith("sobol"),
+        bridge=(args.variance_reduction == "sobol-bridge"),
     )
     pricer = build_pricer(args, args.maturity)
     gen.run([pricer])

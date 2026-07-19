@@ -303,8 +303,9 @@ default.
 | Phase | Status | Notes |
 |---|---|---|
 | 1 — process/generator/pricer abstractions, GBM+Heston behind flag | **Done** (commit 4af95dd) | bit-identical to legacy; 23 tests |
-| 2 — payoff-agnostic engine: path-dependent pricers + Longstaff-Schwartz | **Done** (this change) | see validation below; 39 tests |
-| 3+ — remaining model ports, observers, Greeks, QMC bridge, kernels | pending | plan unchanged (§d) |
+| 2 — payoff-agnostic engine: path-dependent pricers + Longstaff-Schwartz | **Done** (commit f43cf66) | see validation below; 39 tests |
+| 3 — Greeks (PW / LRM / CRN-FD) + Sobol Brownian bridge | **Done** (this change) | see validation below; 27 tests |
+| 4+ — remaining model ports, observers, kernels | pending | plan unchanged (§d) |
 
 **Deviations from the original §c/§d plan, by request:** Phase 2 was
 re-scoped from "port the remaining 7 models" to "prove the PathPricer
@@ -333,6 +334,55 @@ invariant on identical paths under different chunk splits; a zero-vol
 process is exactly invariant end-to-end; the random pipeline is invariant
 within MC error — bit-exact invariance across chunk sizes is impossible
 with a shared sequential PRNG stream, same as the legacy engine).
+
+### Phase 3 validation — Part A: Greeks (risk-neutral GBM, S0=K=100, r=5%, σ=25%, T=1y, 100k paths, seed 42)
+
+| Check | Estimate (SE) | Closed form | Verdict |
+|---|---|---|---|
+| Pathwise delta (European) | +0.629115 (0.001924) | N(d1) = 0.627409 | 0.89 SE ✔ |
+| Pathwise vega (European) | +37.9881 (0.2531) | S0·n(d1)·√T = 37.8420 | 0.58 SE ✔ |
+| LRM delta (European) | +0.629156 (0.004742) | 0.627409 | 0.37 SE ✔ — agrees with PW within combined SE; SE 2.5× PW, as documented |
+| LRM vega (European) | +37.7589 (0.8774) | 37.8420 | 0.09 SE ✔ |
+| LRM gamma (European) — where PW is refused | +0.015104 (0.000351) | n(d1)/(S0σ√T) = 0.015137 | 0.09 SE ✔ |
+| Digital call: PW delta | **rejected** (`MethodValidityError` steering to LRM/FD) | — | validity logic ✔ |
+| Digital call: LRM delta | +0.015195 (0.000070) | e^{-rT}n(d2)/(S0σ√T) = 0.015137 | 0.83 SE ✔ |
+| CRN FD delta | +0.629329 (0.001911) | independent-seed FD: +0.648500 (0.041401) | SE ratio 21.7× ⇒ variance ratio ≈ **470×** collapsed by CRN ✔ |
+| Asian: PW delta / vega vs CRN-FD cross-check | 0.579821 / 22.2714 | FD-CRN 0.5798 / 22.2698 | agree to 4 decimals ✔ |
+
+Method-validity matrix enforced by the dispatcher: PW = delta/vega on
+smooth payoffs only (gamma and digitals **raise**); LRM = delta/vega/gamma
+on terminal payoffs (exact GBM lognormal density; per-step scores for
+path-dependent payoffs are future work); CRN-FD = universal cross-check
+(any pricer, any process incl. Heston), bias O(bump²).
+
+### Phase 3 validation — Part B: Sobol + Brownian bridge (GBM, European S0=K=100, 32 steps; Asian 64 steps)
+
+RMS pricing error over 16 scrambled-seed replications:
+
+| N (paths) | PRNG | Sobol + bridge |
+|---|---|---|
+| 256 | 1.1273 | 0.1169 |
+| 1,024 | 0.7130 | 0.0230 |
+| 4,096 | 0.3176 | 0.0053 |
+| 16,384 | 0.0938 | 0.0009 |
+| **fitted slope** | **−0.596** (≈ N^−1/2) | **−1.155** (≈ N^−1) |
+
+Headline (path-dependent payoff, N = 4,096, 64 steps — RMS error):
+
+| Payoff | PRNG | plain Sobol (per-step dims) | Sobol + bridge |
+|---|---|---|---|
+| Geometric Asian (exact discrete closed form as reference) | 0.2002 | 0.0385 | **0.0047** (8.2× better than plain Sobol) |
+| Arithmetic Asian (2^18-path reference 6.9382) | 0.1314 | 0.0202 | **0.0055** (3.7× better than plain Sobol) |
+
+The bridge assigns Sobol dimension 1 to the terminal Brownian level and
+successive dimensions to recursive midpoints (Jäckel's construction,
+reimplemented in NumPy), so the best-distributed dimensions carry the most
+path variance. Scope note: the bridge is single-factor only this phase —
+`PathGenerator(bridge=True)` **raises** for multi-factor processes
+(Heston's correlated variance shock would need a joint two-factor
+dimension allocation); plain Sobol and pseudorandom modes are unchanged
+and remain available for Heston. Greeks are likewise GBM-analytic for
+PW/LRM (the weights use the GBM density); CRN-FD covers Heston.
 
 ## Phase 1 implementation (commit 4af95dd)
 
