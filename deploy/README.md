@@ -107,6 +107,17 @@ means a locked-down egress policy silently blocks every decision.
 
 ## Operating notes
 
+- **Running a script by hand?** Always use the project's own Python, not the
+  system one — it's the only one with numpy/pandas/etc. installed:
+  ```bash
+  /opt/monte-carlo-sim/.venv/bin/python /opt/monte-carlo-sim/run_weekly_from_tv.py \
+    --calibration-dir /opt/monte-carlo-sim/calibration \
+    --data-dir /opt/monte-carlo-sim/tv_data
+  ```
+  Plain `python3 run_weekly_from_tv.py` will fail with
+  `ModuleNotFoundError: No module named 'numpy'` — that's this, not a
+  broken install. (The systemd services already do this correctly; it only
+  bites you when running a command manually.)
 - **NO_TRADE is the normal case.** The decision layer only fires TRADE when a
   bucket has statistically real edge above breakeven; expect mostly
   NO_TRADE. `mc-weekly.service` treats exit codes 0/3 as success so those
