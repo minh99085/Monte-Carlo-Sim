@@ -307,7 +307,42 @@ default.
 | 3 — Greeks (PW / LRM / CRN-FD) + Sobol Brownian bridge | **Done** | see validation below; 27 tests |
 | 4 — port the remaining 7 models (`mc_processes.py`) | **Done** | bit-identical for all 9 models × plain/antithetic/Sobol/stress; 59 tests; default engine still legacy |
 | 5 — flip the v2 default + extract observers | **Done** (this change) | `engine="v2"` is now the default; the `engine="legacy"` field and `MC_ENGINE=legacy` env var are the escape hatches. Drawdown/ruin/underwater/sample logic extracted from `simulate()` into `DrawdownObserver`/`SampleRecorder` (duck-typed PathPricers, shared with the v2 PathGenerator — option runs get drawdown metrics for free). Pre-flip golden hashes anchor all 9 models under BOTH engines, so a shared-code regression can no longer hide from pairwise tests. `stats["engine"]` is now always recorded — the one additive schema change, shipped deliberately with the flip. 32 tests |
-| 6+ — streaming quantile accumulators, Numba kernels, multi-asset process | pending | plan unchanged (§d) |
+| 6 — streaming statistics, fused kernels, multi-asset process | **Done** (this change) | see notes below; 20 tests |
+
+### Phase 6 notes
+
+* **Streaming statistics** (`mc_stats.py`): exact Welford moments +
+  `P2Quantile` (Jain-Chlamtac P², O(1) memory per quantile) +
+  `ReservoirSample` (Algorithm R, vectorized; unbiased quantile/VaR/ES
+  estimates with ~1/√k sampling error) composed into `StreamingRiskStats`,
+  and a `StreamingStatsPricer` so a v2 sweep can produce risk statistics
+  without materializing `final_values` (>10⁷-path tail studies). The
+  default `simulate()` statistics are untouched (golden anchors hold).
+* **Fused kernels** (`mc_kernels.py`) — with an honest negative result.
+  The opt-in `PathGenerator(kernel=True)` fast path (GBM, terminal-only
+  pricers) fuses the chunk evolution; the NumPy backend is **bit-identical**
+  to the streaming engine. The Numba backend was benchmarked at 0.43–0.71×
+  the streaming speed across regimes (200k×252 large-chunk and 500×5000
+  dispatch-heavy): because bit-compatible draw order pins shock generation
+  to the same per-step RNG calls, RNG dominates the runtime and the JIT
+  can't win. Conclusion recorded here so nobody re-litigates it casually:
+  the streaming engine is already memory-bandwidth-bound; real kernel gains
+  would require counter-based per-path RNG inside the kernel (breaking
+  bit-compatibility) and are deliberately out of scope. Default backend is
+  therefore `"numpy"`; numba stays optional (never a hard dependency) and
+  explicitly selectable.
+* **Multi-asset** (`mc_multiasset.py`): `simulate_portfolio` re-expressed
+  as `MultiAssetGBMProcess` + `MultiAssetPathGenerator` + streaming
+  `(n, k)`-block pricers (`BasketTerminalPricer`, `AssetTerminalPricer`),
+  parameterized by the *same* helpers (`align_returns`,
+  `shrink_covariance`, `cholesky_safe`). Reproduces
+  `simulate_portfolio`'s portfolio values **bit-identically** (same
+  inputs/seed/chunking) across drift modes — the same hard bar as every
+  other port. `simulate_portfolio` itself is unchanged (its callers and
+  schema keep working); it can be thinned to a façade in a later cleanup.
+* Remaining ideas beyond the original plan: per-step LRM Greeks,
+  two-factor Brownian bridge, Streamlit exposure of the options entry
+  point. |
 
 **Deviations from the original §c/§d plan, by request:** Phase 2 was
 re-scoped from "port the remaining 7 models" to "prove the PathPricer

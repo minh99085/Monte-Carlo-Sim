@@ -438,6 +438,7 @@ class PathGenerator:
         sobol: bool = False,
         bridge: bool = False,
         crash_log: float = 0.0,
+        kernel: bool = False,
     ):
         if paths < 1 or steps < 1 or chunk_size < 1 or s0 <= 0:
             raise ValueError("paths, steps, chunk_size must be >= 1 and s0 > 0")
@@ -470,17 +471,50 @@ class PathGenerator:
             if bridge else None
         )
         self.crash_log = float(crash_log)
+        # Opt-in fused-kernel fast path (Phase 6, mc_kernels.py): GBM,
+        # non-Sobol, and every pricer terminal-only. Preconditions are
+        # re-checked per run; ``kernel_used`` records what actually ran.
+        self.kernel = bool(kernel)
+        self.kernel_used = False
         self.memory = MemoryInfo(
             paths=self.paths, horizon=self.steps, chunk_size=self.chunk_size
         )
 
+    def _kernel_eligible(self, pricers) -> bool:
+        if not self.kernel or self.sobol or self.crash_log:
+            return False
+        if type(self.process) is not GBMProcess:
+            return False
+        return all(type(p).observe is PathPricer.observe for p in pricers)
+
     def run(self, pricers: Sequence[PathPricer]) -> MemoryInfo:
         rng = np.random.default_rng(self.seed)
+        self.kernel_used = self._kernel_eligible(pricers)
         produced = 0
         chunk_idx = 0
         while produced < self.paths:
             n = min(self.chunk_size, self.paths - produced)
             prices = np.full(n, self.s0, dtype=np.float64)
+            if self.kernel_used:
+                # Fused fast path: pre-draw the chunk's shocks with the
+                # exact per-step sequence, evolve to terminal in one call.
+                from mc_kernels import fused_gbm_chunk
+                z = np.empty((self.steps, n), dtype=np.float64)
+                for i in range(self.steps):
+                    z[i] = _draw_gauss(rng, n, self.antithetic)
+                self.memory.peak_vector_elements = max(
+                    self.memory.peak_vector_elements, n)
+                self.memory.peak_matrix_elements = max(
+                    self.memory.peak_matrix_elements, n * self.steps)
+                for p in pricers:
+                    p.begin_chunk(prices)
+                fused_gbm_chunk(prices, self.process._drift_dt,
+                                self.process._vol_sqdt, z)
+                for p in pricers:
+                    p.end_chunk(prices)
+                produced += n
+                chunk_idx += 1
+                continue
             self.memory.peak_vector_elements = max(
                 self.memory.peak_vector_elements, prices.size
             )
