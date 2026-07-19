@@ -17,10 +17,24 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Installing system packages"
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip git caddy || {
-	echo "NOTE: 'caddy' not found in apt. Install it from"
-	echo "      https://caddyserver.com/docs/install then re-run."
-}
+# Core packages only. Caddy (TLS reverse proxy) is optional and installed
+# separately below — most deployments now use a plain http://IP:PORT/webhook
+# address (no domain, no TLS), matching common TradingView bot setups, so a
+# missing/unavailable 'caddy' package must never block the Python install.
+apt-get install -y -qq python3 python3-venv python3-pip git ufw
+
+if [[ "${WITH_CADDY:-0}" == "1" ]]; then
+	echo "==> Installing Caddy (WITH_CADDY=1: TLS reverse proxy requested)"
+	apt-get install -y -qq caddy || {
+		echo "NOTE: 'caddy' not found in apt. Install it from"
+		echo "      https://caddyserver.com/docs/install then re-run,"
+		echo "      or skip it entirely — see deploy/README.md for the"
+		echo "      no-domain/no-TLS setup (default path)."
+	}
+else
+	echo "==> Skipping Caddy (default: plain http://IP:PORT setup)."
+	echo "    Re-run with WITH_CADDY=1 sudo bash deploy/install.sh for HTTPS."
+fi
 
 echo "==> Service user ($SVC_USER)"
 id -u "$SVC_USER" &>/dev/null || useradd --system --home "$APP_DIR" \
@@ -53,6 +67,23 @@ else
 	echo "    Exists — left untouched."
 fi
 
+echo "==> Firewall (ufw)"
+if command -v ufw &>/dev/null; then
+	# Always allow SSH first so we can never lock ourselves out.
+	ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1
+	ufw allow 5001/tcp >/dev/null 2>&1
+	if ufw status | grep -q "Status: active"; then
+		echo "    ufw already active — SSH + port 5001 allowed."
+	else
+		echo "    ufw installed but not enabled. Enable it yourself with:"
+		echo "      ufw enable   (it will ask to confirm — say yes)"
+		echo "    SSH (22) and port 5001 are pre-allowed either way."
+	fi
+else
+	echo "    ufw not found — check your VPS provider's firewall/security"
+	echo "    group in their web dashboard and allow inbound TCP 5001."
+fi
+
 echo "==> systemd units"
 install -m 644 "$HERE"/systemd/*.service "$HERE"/systemd/*.timer \
 	/etc/systemd/system/
@@ -61,28 +92,32 @@ systemctl daemon-reload
 echo "==> Enabling timers (not the bridge yet — fill in the secret first)"
 systemctl enable mc-weekly.timer mc-settle.timer mc-calibrate.timer
 
+SERVER_IP="$(curl -s -4 ifconfig.me 2>/dev/null || echo YOUR_SERVER_IP)"
+
 cat <<EOF
 
 Done. Remaining manual steps:
 
   1. Edit secrets + watchlist:
-       sudoedit $ETC_DIR/mcsim.env
+       nano $ETC_DIR/mcsim.env
+     (set TV_BRIDGE_SECRET to a long random value, and MC_TICKERS to your
+     watchlist. Save with Ctrl+O, Enter, then exit with Ctrl+X.)
 
-  2. Point a DNS record at this host, edit domain/email in the Caddyfile,
-     then install it:
-       cp $HERE/Caddyfile /etc/caddy/Caddyfile
-       systemctl reload caddy
-
-  3. Seed calibration and start the bridge:
+  2. Seed calibration and start the bridge:
        systemctl start mc-calibrate.service   # one-time seed
        systemctl enable --now tv-bridge.service
-       systemctl start mc-weekly.timer mc-settle.timer mc-calibrate.timer
+       systemctl enable --now mc-weekly.timer mc-settle.timer mc-calibrate.timer
 
-  4. Point the TradingView alert webhook at:
-       https://YOUR_DOMAIN/webhook?secret=YOUR_TV_BRIDGE_SECRET
+  3. Point the TradingView alert webhook at (replace YOUR_SECRET with what
+     you set in step 1):
+       http://$SERVER_IP:5001/webhook?secret=YOUR_SECRET
+
+     This is a plain (unencrypted) address — same pattern as many
+     TradingView bot setups. For an HTTPS version instead, see
+     deploy/README.md's "optional: add HTTPS" section.
 
   Verify:
        systemctl status tv-bridge
-       curl https://YOUR_DOMAIN/health
+       curl http://127.0.0.1:5001/health
        journalctl -u mc-weekly -f
 EOF
