@@ -102,7 +102,12 @@ class TestFlaggedEquivalence:
         assert r.stats["engine"] == "v2"
         assert np.array_equal(legacy, r.final_values)
 
-    def test_unported_model_falls_back_to_legacy(self):
+    def test_unported_model_falls_back_to_legacy(self, monkeypatch):
+        # All shipped models are ported as of Phase 4, so simulate an
+        # unported one to prove the fallback mechanism still works.
+        monkeypatch.setattr(mc_engine, "process_from_config", lambda cfg: None)
+        monkeypatch.setattr(mc_engine, "V2_SUPPORTED_MODELS",
+                            (mc_core.MODEL_GBM,))
         kw = dict(model=mc_core.MODEL_STUDENT_T, t_df=5.0)
         legacy = _final_values(_cfg(**kw))
         r = simulate(_cfg(engine="v2", **kw))
@@ -143,7 +148,10 @@ class TestStandalonePipeline:
         assert abs(float(np.mean(v)) - legacy.stats["expected_value"]) < 6 * se
         assert np.std(v) == pytest.approx(legacy.stats["std_value"], rel=0.05)
 
-    def test_unported_model_raises(self):
+    def test_unported_model_raises(self, monkeypatch):
+        # GARCH is ported as of Phase 4 — fake an unported model to keep the
+        # standalone pipeline's refusal path covered.
+        monkeypatch.setattr(mc_engine, "process_from_config", lambda cfg: None)
         with pytest.raises(ValueError, match="not ported"):
             generator_from_config(_cfg(model=mc_core.MODEL_GARCH))
 
@@ -227,7 +235,10 @@ class TestProcessContracts:
         # theta/v0 default to effective sigma^2, as in the legacy closure
         assert p.theta == pytest.approx(0.04)
         assert p.v0 == pytest.approx(0.04)
-        assert process_from_config(_cfg(model=mc_core.MODEL_KOU)) is None
+        # Kou is ported as of Phase 4 and now resolves to a process.
+        from mc_processes import KouJumpProcess
+        assert isinstance(process_from_config(_cfg(model=mc_core.MODEL_KOU)),
+                          KouJumpProcess)
 
     def test_generator_rejects_bad_args(self):
         p = GBMProcess(0.05, 0.2, 1 / 252)

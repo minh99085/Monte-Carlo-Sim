@@ -304,15 +304,26 @@ default.
 |---|---|---|
 | 1 — process/generator/pricer abstractions, GBM+Heston behind flag | **Done** (commit 4af95dd) | bit-identical to legacy; 23 tests |
 | 2 — payoff-agnostic engine: path-dependent pricers + Longstaff-Schwartz | **Done** (commit f43cf66) | see validation below; 39 tests |
-| 3 — Greeks (PW / LRM / CRN-FD) + Sobol Brownian bridge | **Done** (this change) | see validation below; 27 tests |
-| 4+ — remaining model ports, observers, kernels | pending | plan unchanged (§d) |
+| 3 — Greeks (PW / LRM / CRN-FD) + Sobol Brownian bridge | **Done** | see validation below; 27 tests |
+| 4 — port the remaining 7 models (`mc_processes.py`) | **Done** (this change) | bit-identical for all 9 models × plain/antithetic/Sobol/stress; 59 tests; default engine still legacy |
+| 5+ — flip v2 default (gated), observers extraction, kernels | pending | plan unchanged (§d) |
 
 **Deviations from the original §c/§d plan, by request:** Phase 2 was
 re-scoped from "port the remaining 7 models" to "prove the PathPricer
-abstraction" (originally Phases 3 and 5); the model ports move to Phase 3+.
-File names differ from the §c sketch: `mc_payoffs.py` (was `mc_pricers.py`)
-and `mc_lsm.py` (was `mc_lsmc.py`); `mc_options.py` is the options entry
-point. The LSM pricer stores a documented `paths × K` exercise-date matrix
+abstraction" (originally Phases 3 and 5); the model ports landed in
+Phase 4 instead (`mc_processes.py`, matching the §c layout). File names
+differ from the §c sketch: `mc_payoffs.py` (was `mc_pricers.py`) and
+`mc_lsm.py` (was `mc_lsmc.py`); `mc_options.py` is the options entry
+point. One contract addition the original design under-specified:
+`StochasticProcess.gauss_mode` ("full" / "plain" / "none") encodes which
+of the legacy engine's three shock channels a model uses — the shared
+Sobol-eligible gauss (GBM, Heston, GARCH), the antithetic-only gauss
+(Kou), or fully self-drawn randomness in legacy order (Student-t, Merton,
+regime, bootstraps). Without it, bit-identical draw order across all nine
+models is impossible. The Brownian bridge accordingly restricts itself to
+single-factor "full" processes (GBM, GARCH). The bootstraps implement no
+`drift()`/`diffusion()` (empirical resampling has no Gaussian
+decomposition) — they override `evolve()` wholesale, as §b anticipated. The LSM pricer stores a documented `paths × K` exercise-date matrix
 (assembled chunk-by-chunk, calibration matrix freed before the pricing
 pass) — the one agreed exception to full streaming; everything else
 (`Asian`, barrier, lookback) is running-statistic streaming as designed.

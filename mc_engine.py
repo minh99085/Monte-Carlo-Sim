@@ -38,8 +38,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 import numpy as np
 
 from mc_core import (
+    MODEL_BLOCK_BOOTSTRAP,
+    MODEL_GARCH,
     MODEL_GBM,
     MODEL_HESTON,
+    MODEL_HIST_BOOTSTRAP,
+    MODEL_KOU,
+    MODEL_MERTON,
+    MODEL_REGIME,
+    MODEL_STUDENT_T,
     MemoryInfo,
     SimulationConfig,
     _draw_gauss,
@@ -47,9 +54,20 @@ from mc_core import (
     apply_costs,
 )
 
-# Models the v2 engine can run in Phase 1. Anything else falls back to the
+# Models the v2 engine can run. Phase 1 ported GBM/Heston; Phase 4 ported the
+# remaining seven (mc_processes.py). Anything not listed falls back to the
 # legacy closures (recorded by mc_core in stats["engine"]).
-V2_SUPPORTED_MODELS = (MODEL_GBM, MODEL_HESTON)
+V2_SUPPORTED_MODELS = (
+    MODEL_GBM,
+    MODEL_HESTON,
+    MODEL_STUDENT_T,
+    MODEL_HIST_BOOTSTRAP,
+    MODEL_BLOCK_BOOTSTRAP,
+    MODEL_MERTON,
+    MODEL_KOU,
+    MODEL_GARCH,
+    MODEL_REGIME,
+)
 
 # Per-chunk Sobol seed stride — must match mc_core.simulate so the flagged
 # path reproduces the legacy shock stream bit-for-bit.
@@ -74,6 +92,20 @@ class StochasticProcess:
 
     #: independent random factors consumed per step (QuantLib: factors())
     factors: int = 1
+
+    #: how this process consumes the generator's shared Gaussian shock —
+    #: this is the contract that keeps v2 bit-identical to the legacy
+    #: closures, whose models draw randomness through three different
+    #: channels:
+    #:   "full"  – z comes from the loop's gauss(rng, n, state, i):
+    #:             antithetic-aware AND Sobol-aware (GBM, Heston z1, GARCH)
+    #:   "plain" – z comes from gauss(rng, n): antithetic-aware but NEVER
+    #:             Sobol, matching legacy Kou exactly
+    #:   "none"  – the process draws all of its own randomness from ``rng``
+    #:             inside evolve() in legacy order; the generator must not
+    #:             touch the RNG for it (Student-t, Merton, regime,
+    #:             bootstraps)
+    gauss_mode: str = "full"
 
     def __init__(self, dt: float):
         self.dt = float(dt)
@@ -186,7 +218,9 @@ def process_from_config(cfg: SimulationConfig) -> Optional[StochasticProcess]:
             rho=float(cfg.heston_rho),
             v0=v0,
         )
-    return None
+    # Phase 4 ports live in mc_processes.py (REVIEW.md §c file layout).
+    from mc_processes import extended_process_from_config
+    return extended_process_from_config(cfg)
 
 
 def legacy_engine_from_config(
@@ -203,14 +237,25 @@ def legacy_engine_from_config(
     process = process_from_config(cfg)
     if process is None:
         return None
+    mode = getattr(process, "gauss_mode", "full")
 
     def init_chunk(rng, n):
         state = process.init_state(n)
         return state if state else None  # legacy loop expects None or dict
 
-    def step(rng, n, state, i):
-        z = gauss(rng, n, state, i)
-        return process.evolve(rng, state, z, n)
+    if mode == "full":
+        def step(rng, n, state, i):
+            z = gauss(rng, n, state, i)
+            return process.evolve(rng, state, z, n)
+    elif mode == "plain":
+        # Legacy Kou calls gauss(rng, n) without state/step: antithetic
+        # applies but Sobol never does — reproduce that call exactly.
+        def step(rng, n, state, i):
+            z = gauss(rng, n)
+            return process.evolve(rng, state, z, n)
+    else:  # "none": the process draws everything itself, in legacy order
+        def step(rng, n, state, i):
+            return process.evolve(rng, state, None, n)
 
     return init_chunk, step
 
@@ -400,12 +445,14 @@ class PathGenerator:
                 "QMC dimension-ordering device (pseudorandom shocks gain "
                 "nothing from reordering)"
             )
-        if bridge and getattr(process, "factors", 1) > 1:
+        if bridge and (getattr(process, "factors", 1) > 1
+                       or getattr(process, "gauss_mode", "full") != "full"):
             raise ValueError(
-                "Brownian bridge is implemented for single-factor processes "
-                "only in this phase (GBM). Multi-factor bridging (Heston's "
-                "correlated variance factor) is documented as out of scope "
-                "in REVIEW.md — use plain sobol or pseudorandom instead."
+                "Brownian bridge is implemented for single-factor, "
+                "Gaussian-shock processes only (GBM, GARCH). Multi-factor "
+                "bridging (Heston) and non-Gaussian-driven models are "
+                "documented as out of scope in REVIEW.md — use plain sobol "
+                "or pseudorandom instead."
             )
         self.process = process
         self.s0 = float(s0)
@@ -436,7 +483,9 @@ class PathGenerator:
                 self.memory.peak_vector_elements, prices.size
             )
             state: Dict[str, Any] = self.process.init_state(n) or {}
-            if self.sobol:
+            gauss_mode = getattr(self.process, "gauss_mode", "full")
+            use_sobol = self.sobol and gauss_mode == "full"
+            if use_sobol:
                 sobol_seed = (
                     None if self.seed is None
                     else int(self.seed) + chunk_idx * SOBOL_CHUNK_SEED_STRIDE
@@ -455,7 +504,13 @@ class PathGenerator:
             for p in pricers:
                 p.begin_chunk(prices)
             for i in range(1, self.steps + 1):
-                if self.sobol:
+                # Shock policy mirrors the legacy closures exactly:
+                # "full" models take the (Sobol-eligible) shared shock,
+                # "plain" models take antithetic-only draws (legacy Kou),
+                # "none" models draw everything inside evolve().
+                if gauss_mode == "none":
+                    z = None
+                elif use_sobol:
                     z = state["sobol_z"][:, i - 1]
                 else:
                     z = _draw_gauss(rng, n, self.antithetic)

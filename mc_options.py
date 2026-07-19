@@ -38,8 +38,9 @@ from typing import List, Optional
 
 import numpy as np
 
-from mc_core import estimate_parameters_from_history, sobol_available
+from mc_core import REGIME_PRESETS, estimate_parameters_from_history, sobol_available
 from mc_engine import GBMProcess, HestonProcess, PathGenerator, StochasticProcess
+from mc_processes import MertonJumpProcess, RegimeSwitchingProcess
 from mc_lsm import longstaff_schwartz_price
 from mc_payoffs import (
     AsianArithmeticPricer,
@@ -51,13 +52,31 @@ from mc_payoffs import (
 
 OPTION_KINDS = ("european", "asian", "asian-geometric", "barrier",
                 "lookback", "american")
-MODELS = ("gbm", "heston")
+MODELS = ("gbm", "heston", "merton", "regime")
 
 
 def build_process(args, sigma: float, dt: float) -> StochasticProcess:
-    """Risk-neutral process: drift is always the risk-free rate."""
+    """Risk-neutral process: the base drift is always the risk-free rate.
+
+    Merton's jump compensator keeps E[S_T] = S0·e^{rT} exactly. Regime
+    switching scales the base drift by the preset's per-regime factors, so
+    its measure is only approximately risk-neutral — the CLI prints a note.
+    """
     if args.model == "gbm":
         return GBMProcess(args.r, sigma, dt)
+    if args.model == "merton":
+        return MertonJumpProcess(args.r, sigma, dt,
+                                 intensity=args.jump_intensity,
+                                 jump_mean=args.jump_mean,
+                                 jump_vol=args.jump_vol)
+    if args.model == "regime":
+        preset = REGIME_PRESETS[args.regime_preset]
+        return RegimeSwitchingProcess(
+            args.r, sigma, dt,
+            mu_factors=preset["mu_factors"],
+            sigma_factors=preset["sigma_factors"],
+            transition=preset["transition"],
+        )
     theta = args.heston_theta if args.heston_theta is not None else sigma ** 2
     v0 = args.heston_v0 if args.heston_v0 is not None else sigma ** 2
     return HestonProcess(
@@ -121,6 +140,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--barrier-knock", choices=("in", "out"), default="out")
     p.add_argument("--lookback-kind", choices=("fixed", "floating"),
                    default="floating")
+    # Merton jump parameters (annualized intensity; log-space per-jump moments)
+    p.add_argument("--jump-intensity", type=float, default=1.0)
+    p.add_argument("--jump-mean", type=float, default=-0.02)
+    p.add_argument("--jump-vol", type=float, default=0.05)
+    # Regime switching
+    p.add_argument("--regime-preset", choices=tuple(REGIME_PRESETS),
+                   default="stock")
     # Heston parameters (theta/v0 default to sigma^2)
     p.add_argument("--heston-kappa", type=float, default=1.5)
     p.add_argument("--heston-theta", type=float, default=None)
@@ -167,6 +193,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"S0={s0:.4f}  sigma={sigma:.4%}  (source={source})")
     print(f"strike={args.strike}  maturity={args.maturity}y  r={args.r:.4%}  "
           f"drift=risk-neutral (mu=r)")
+    if args.model == "regime":
+        print("note: regime factors scale the risk-free drift per regime — "
+              "pricing under this measure is approximate, not strictly "
+              "risk-neutral")
 
     # ---- American / Bermudan via Longstaff-Schwartz ---------------------
     if args.option == "american":
