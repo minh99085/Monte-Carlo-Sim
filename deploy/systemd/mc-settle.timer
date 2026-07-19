@@ -1,0 +1,15 @@
+# Settle verdicts daily after the US close (21:30 UTC ≈ 16:30 ET). Realized
+# close-to-close returns are only available once the day has settled.
+# Install: /etc/systemd/system/mc-settle.timer
+#   systemctl daemon-reload && systemctl enable --now mc-settle.timer
+
+[Unit]
+Description=Schedule daily settlement of Monte-Carlo-Sim verdicts
+
+[Timer]
+OnCalendar=*-*-* 21:30 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

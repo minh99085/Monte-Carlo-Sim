@@ -1,0 +1,46 @@
+# Caddyfile — TLS termination + reverse proxy for the TradingView webhook
+# bridge. Caddy auto-provisions and renews a Let's Encrypt certificate, which
+# TradingView requires (it only posts to https:// endpoints).
+#
+# 1. Replace tv.example.com with your real domain (an A/AAAA record must
+#    already point at this VPS).
+# 2. Replace the email with yours (used for ACME expiry notices).
+# 3. Install to /etc/caddy/Caddyfile, then: systemctl reload caddy
+#
+# The bridge listens on 127.0.0.1:5001 (see mcsim.env); only Caddy talks to
+# it, so the shared secret / HMAC key never cross the public network in the
+# clear.
+
+{
+	email you@example.com
+}
+
+tv.example.com {
+	encode zstd gzip
+
+	# Only the webhook and health endpoints are exposed publicly.
+	@webhook path /webhook
+	handle @webhook {
+		reverse_proxy 127.0.0.1:5001
+	}
+
+	handle /health {
+		reverse_proxy 127.0.0.1:5001
+	}
+
+	# The /latest endpoint returns stored signals (secret-guarded by the
+	# bridge itself). Uncomment to expose it; otherwise it stays private.
+	# handle /latest {
+	# 	reverse_proxy 127.0.0.1:5001
+	# }
+
+	# Everything else is denied — no directory listing, no /latest leak.
+	handle {
+		respond "not found" 404
+	}
+
+	log {
+		output file /var/log/caddy/tv-bridge.log
+		format json
+	}
+}

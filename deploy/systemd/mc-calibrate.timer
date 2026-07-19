@@ -1,0 +1,18 @@
+# Recalibrate on the 1st of each month at 06:00 UTC (pre-market, low load).
+# Well inside the 30-day staleness warning window.
+# Install: /etc/systemd/system/mc-calibrate.timer
+#   systemctl daemon-reload && systemctl enable --now mc-calibrate.timer
+#
+# Run once by hand right after install to seed the tables:
+#   systemctl start mc-calibrate.service && journalctl -u mc-calibrate -n 50
+
+[Unit]
+Description=Schedule monthly Monte-Carlo-Sim drift recalibration
+
+[Timer]
+OnCalendar=*-*-01 06:00 UTC
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

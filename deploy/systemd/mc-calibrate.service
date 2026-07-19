@@ -1,0 +1,32 @@
+# (Re)calibrate signal-conditioned drift for every ticker in MC_TICKERS.
+# Monthly oneshot; calibration tables warn at 30 days old and hard-error at
+# 120, so running well inside that window keeps every watched ticker fresh.
+# Install: /etc/systemd/system/mc-calibrate.service
+
+[Unit]
+Description=Monte-Carlo-Sim monthly drift recalibration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mcsim
+Group=mcsim
+WorkingDirectory=/opt/monte-carlo-sim
+EnvironmentFile=/etc/monte-carlo-sim/mcsim.env
+# Loop over the watchlist; keep going if one ticker's download fails so a
+# single bad symbol doesn't block the rest.
+ExecStart=/bin/bash -c 'rc=0; for t in $MC_TICKERS; do \
+	/opt/monte-carlo-sim/.venv/bin/python signal_calibration.py "$t" \
+		--years "$MC_YEARS" --calibration-dir calibration || rc=1; \
+	done; exit $rc'
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/monte-carlo-sim/calibration
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

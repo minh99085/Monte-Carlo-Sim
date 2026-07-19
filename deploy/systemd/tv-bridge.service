@@ -1,0 +1,40 @@
+# TradingView webhook bridge — long-running service behind Caddy.
+# Install: /etc/systemd/system/tv-bridge.service
+#   systemctl daemon-reload && systemctl enable --now tv-bridge
+# Logs: journalctl -u tv-bridge -f
+
+[Unit]
+Description=Monte-Carlo-Sim TradingView webhook bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mcsim
+Group=mcsim
+WorkingDirectory=/opt/monte-carlo-sim
+EnvironmentFile=/etc/monte-carlo-sim/mcsim.env
+# Secret + HMAC key come from the environment (TV_BRIDGE_SECRET /
+# TV_BRIDGE_HMAC_KEY), so they never appear in `ps` or the unit file.
+ExecStart=/opt/monte-carlo-sim/.venv/bin/python tv_webhook_bridge.py \
+	--host ${TV_BRIDGE_HOST} \
+	--port ${TV_BRIDGE_PORT} \
+	--data-dir tv_data \
+	--dedupe-window ${TV_BRIDGE_DEDUPE_WINDOW} \
+	--log-level INFO
+Restart=on-failure
+RestartSec=3
+
+# Hardening — the bridge only needs to read the repo and write tv_data/.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/monte-carlo-sim/tv_data
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

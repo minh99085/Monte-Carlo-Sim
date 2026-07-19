@@ -1,0 +1,41 @@
+# Weekly trade decision — consumes the freshest bridge signal and writes a
+# verdict. Oneshot, driven by mc-weekly.timer. A stale signal (older than
+# MC_MAX_AGE_HOURS) or synthetic fallback market data produces no verdict,
+# by design.
+# Install: /etc/systemd/system/mc-weekly.service
+
+[Unit]
+Description=Monte-Carlo-Sim weekly trade decision from latest TV signal
+After=network-online.target tv-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mcsim
+Group=mcsim
+WorkingDirectory=/opt/monte-carlo-sim
+EnvironmentFile=/etc/monte-carlo-sim/mcsim.env
+ExecStart=/opt/monte-carlo-sim/.venv/bin/python run_weekly_from_tv.py \
+	--data-dir tv_data \
+	--calibration-dir calibration \
+	--max-age-hours ${MC_MAX_AGE_HOURS} \
+	--paths ${MC_PATHS} \
+	--cost ${MC_COST} \
+	--account ${MC_ACCOUNT} \
+	--stop-mult ${MC_STOP_MULT}
+# Exit 0 = a verdict was produced (TRADE *or* NO_TRADE — both are normal).
+# Exit 3 = no fresh signal (stale/missing) — also an expected, non-failure
+# outcome. Exit 2 (synthetic fallback market data — usually a blocked egress
+# policy) and exit 1 are left as genuine failures so they surface in
+# `systemctl status` / the journal instead of being silently masked.
+SuccessExitStatus=0 3
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/monte-carlo-sim/outputs
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

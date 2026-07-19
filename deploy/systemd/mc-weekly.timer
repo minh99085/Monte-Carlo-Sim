@@ -1,0 +1,17 @@
+# Fire the weekly decision once per trading week. Monday 14:35 UTC ≈ 09:35
+# ET, a few minutes after the US cash open, so the latest signal reflects
+# the fresh session. Adjust OnCalendar for your market / cadence.
+# Persistent=true reruns a missed firing (e.g. VPS was down) on next boot.
+# Install: /etc/systemd/system/mc-weekly.timer
+#   systemctl daemon-reload && systemctl enable --now mc-weekly.timer
+
+[Unit]
+Description=Schedule the Monte-Carlo-Sim weekly trade decision
+
+[Timer]
+OnCalendar=Mon 14:35 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

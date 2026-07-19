@@ -1,0 +1,29 @@
+# Settle matured verdicts (fetch realized outcomes, replay the recorded
+# stop/TP rule) and print the kill-switch state. Daily oneshot; idempotent —
+# it only touches entries whose holding window has completed.
+# Install: /etc/systemd/system/mc-settle.service
+
+[Unit]
+Description=Monte-Carlo-Sim settle matured trade verdicts
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mcsim
+Group=mcsim
+WorkingDirectory=/opt/monte-carlo-sim
+EnvironmentFile=/etc/monte-carlo-sim/mcsim.env
+ExecStart=/opt/monte-carlo-sim/.venv/bin/python outcome_tracker.py settle
+# Rolling calibration report to the journal after settling.
+ExecStart=/opt/monte-carlo-sim/.venv/bin/python outcome_tracker.py report
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/monte-carlo-sim/outputs
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
