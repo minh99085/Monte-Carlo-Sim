@@ -37,6 +37,17 @@ if command -v docker >/dev/null 2>&1; then
 		live="$(grep -E '^RH_LIVE_TRADING_ENABLED=' "$PLUGIN_DIR/.env" 2>/dev/null | cut -d= -f2)"
 		echo "live trading: ${live:-unknown}  (0 = OFF / paper-safe)"
 	fi
+	echo
+	echo "-------- MC → bot paper bridge --------"
+	if docker ps --filter "name=hermes-mc-bridge" --format '{{.Names}}' 2>/dev/null | grep -q .; then
+		docker ps --filter "name=hermes-mc-bridge" --format '  {{.Names}}  {{.Status}}'
+		echo "last bridge ledger entries (paper decisions, no orders placed):"
+		docker exec hermes-mc-bridge sh -c \
+			'tail -n 3 /data/mc_bridge_ledger.jsonl 2>/dev/null' \
+			| sed 's/^/  /' || echo "  (ledger empty — no verdicts processed yet)"
+	else
+		echo "  bridge container not running (re-run install-robinhood.sh)"
+	fi
 else
 	echo "docker not installed — run deploy/cohost/install-robinhood.sh"
 fi

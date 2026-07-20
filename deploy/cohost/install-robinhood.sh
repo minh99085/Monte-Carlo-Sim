@@ -87,14 +87,42 @@ chmod 600 "$ENV_FILE"
 log "Safety defaults enforced: RH_LIVE_TRADING_ENABLED=0, RH_API_PUBLISH=127.0.0.1:8810"
 
 # ---------------------------------------------------------------------------
-# 4. Build + start the container(s)
+# 4. Install the Monte-Carlo-Sim → Robinhood paper bridge
 # ---------------------------------------------------------------------------
-log "Building and starting the bot (docker compose --profile robinhood up -d --build)"
-cd "$PLUGIN_DIR"
-docker compose --profile robinhood up -d --build
+# The bridge code lives in the Monte-Carlo-Sim repo (deploy/cohost/bridge/)
+# and is copied into the bot's checkout here, then baked into the image by
+# the plugin's Dockerfile (COPY engine/ scripts/ tests/). Phase 1 makes NO
+# Robinhood calls — it maps verdict files through the local safety gates and
+# writes a paper ledger only.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$HERE/bridge" ]]; then
+	log "Installing MC→Robinhood paper bridge into the bot checkout"
+	install -m 644 "$HERE/bridge/mc_bridge.py" \
+		"$PLUGIN_DIR/engine/robinhood/mc_bridge.py"
+	install -m 644 "$HERE/bridge/run_mc_bridge.py" \
+		"$PLUGIN_DIR/scripts/run_mc_bridge.py"
+	install -m 644 "$HERE/bridge/test_mc_bridge.py" \
+		"$PLUGIN_DIR/tests/test_mc_bridge.py"
+	install -m 644 "$HERE/bridge/docker-compose.override.yml" \
+		"$PLUGIN_DIR/docker-compose.override.yml"
+else
+	echo "NOTE: $HERE/bridge not found — skipping the MC bridge (pull the" >&2
+	echo "      Monte-Carlo-Sim repo to get it)." >&2
+fi
 
 # ---------------------------------------------------------------------------
-# 5. Health check + next steps
+# 5. Build + start the container(s)
+# ---------------------------------------------------------------------------
+log "Building and starting the bot + bridge"
+cd "$PLUGIN_DIR"
+if [[ -f "$PLUGIN_DIR/docker-compose.override.yml" ]]; then
+	docker compose --profile robinhood --profile mc-bridge up -d --build
+else
+	docker compose --profile robinhood up -d --build
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Health check + next steps
 # ---------------------------------------------------------------------------
 log "Waiting for the API health endpoint (up to ~40s)"
 ok=0
@@ -116,6 +144,11 @@ fi
 cat <<'EOF'
 
 Robinhood bot is installed alongside Monte-Carlo-Sim. Live trading is OFF.
+
+The MC→bot paper bridge is also running: it reads the sim's verdict files,
+rehearses each fresh TRADE through the bot's safety gates, and records the
+outcome to a paper ledger — placing NOTHING. Watch it with:
+  docker exec hermes-mc-bridge sh -c 'tail -n 5 /data/mc_bridge_ledger.jsonl'
 
 Remaining manual steps (only you can do these):
 

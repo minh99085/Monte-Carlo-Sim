@@ -98,9 +98,47 @@ verification you run on the VPS (Step 1 health check + Step 3 status) is the
 real end-to-end test. If anything doesn't match what's described, paste the
 output back and it'll get fixed.
 
-## Not included yet (next milestone)
+## The MC → bot paper bridge (included)
 
-This gets both programs living on one box. It does **not** yet wire the sim's
-verdicts into the bot — that's the separate "verdict → order" adapter, built
-when you're ready to connect trading (and to choose how `short` verdicts are
-handled, since Robinhood can't short shares directly).
+The installer also wires the first connection between the two programs: a
+**paper bridge** (`hermes-mc-bridge` container) that watches the sim's
+verdict files (`outputs/verdicts/` and `outputs/paper_verdicts/`) and, for
+every fresh `TRADE`, rehearses it through the bot's own safety gates —
+notional cap, daily-loss halt, day-trade limit — then records the outcome to
+an append-only paper ledger.
+
+What it deliberately does **not** do (phase 1):
+
+- **No Robinhood calls at all.** No OAuth needed; nothing can be placed or
+  even reviewed against your account. It is a full-dress rehearsal on paper.
+- **No shorts.** Robinhood can't short shares; `short` verdicts are logged
+  and skipped (turning them into long puts is a possible later phase).
+- **No repeats.** Each verdict file is processed exactly once, even across
+  restarts.
+- **No stale orders.** Verdicts older than 48 hours are skipped.
+
+Watch what it's deciding:
+
+```
+docker exec hermes-mc-bridge sh -c 'tail -n 5 /data/mc_bridge_ledger.jsonl'
+```
+
+Each line shows the verdict, how it mapped to an order plan (symbol, buy,
+quantity, limit price), the gate result, and the outcome. Note: the bot's
+per-order cap (`RH_MAX_ORDER_NOTIONAL_USD`, default $100) is far below one
+share of expensive symbols like SPY — those show up as skips with a message
+telling you what to raise the cap to. That's the cap working, not a bug.
+
+**Where the bridge code lives:** in THIS repo (`deploy/cohost/bridge/`), and
+the installer copies it into the bot's checkout at
+`/opt/Robinhood-Bot/.../engine/robinhood/mc_bridge.py` before building the
+image. (This session's GitHub access can only push to Monte-Carlo-Sim, not to
+the Robinhood-Bot repo, so MC is the source of truth; re-running the
+installer always refreshes the copy. If you later want it committed upstream
+in Robinhood-Bot, commit those copied files there yourself.)
+
+## Next milestone (not built yet)
+
+Connecting the bridge's *paper plans* to Robinhood's real `review_*` /
+`place_*` calls — only after OAuth is done, the paper ledger looks healthy
+over multiple weekly cycles, and you deliberately enable live trading.
