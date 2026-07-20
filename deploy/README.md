@@ -68,6 +68,15 @@ summarized below.
    (install.sh prints your server's IP at the end). The alert message body
    should be the JSON the Pine template emits.
 
+## Optional: co-host the Robinhood execution bot
+
+To run the Robinhood order-execution bot on the *same* VPS (the brain and the
+hands on one box), see [`cohost/README.md`](cohost/README.md). It ships an
+idempotent installer (`cohost/install-robinhood.sh`), a one-time OAuth helper
+(`cohost/oauth-login.sh`), and a both-systems health check (`cohost/status.sh`).
+Live trading stays OFF by default; the two programs share only decision files
+and use different ports (MC `5001`, bot `8810`/`53682` on localhost).
+
 ## Optional: add HTTPS later
 
 If you later want an encrypted `https://` address (e.g. a domain-based
