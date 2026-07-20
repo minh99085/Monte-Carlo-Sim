@@ -98,6 +98,17 @@ verification you run on the VPS (Step 1 health check + Step 3 status) is the
 real end-to-end test. If anything doesn't match what's described, paste the
 output back and it'll get fixed.
 
+## Reviewed bot fixes (`patches/`)
+
+A full quant-team review of the Robinhood plugin found and fixed 10 issues —
+including a dead daily-loss halt, safety counters that reset on restart, and
+option orders whose dollar exposure was under-counted 100× by the per-order
+cap. The audited fixes live in `deploy/cohost/patches/` and the installer
+overlays them onto the bot checkout before every build (this session's
+GitHub access can't push to the Robinhood-Bot repo directly). Full findings
+and the improvement roadmap: [`BOT_REVIEW.md`](BOT_REVIEW.md). The plugin's
+test suite with patches applied: 56/56 passing.
+
 ## The MC → bot paper bridge (included)
 
 The installer also wires the first connection between the two programs: a

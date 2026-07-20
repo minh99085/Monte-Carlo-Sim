@@ -95,6 +95,21 @@ log "Safety defaults enforced: RH_LIVE_TRADING_ENABLED=0, RH_API_PUBLISH=127.0.0
 # Robinhood calls — it maps verdict files through the local safety gates and
 # writes a paper ledger only.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Reviewed fixes for the bot itself (see deploy/cohost/BOT_REVIEW.md): this
+# session can only push to Monte-Carlo-Sim, so audited patches for the
+# Robinhood plugin ship here and are overlaid onto the checkout before the
+# image build. Re-running the installer always refreshes them.
+if [[ -d "$HERE/patches" ]]; then
+	log "Applying reviewed bot patches from deploy/cohost/patches/"
+	(cd "$HERE/patches" && find . -type f -name '*.py' -print0) \
+		| while IFS= read -r -d '' rel; do
+			install -D -m 644 "$HERE/patches/${rel#./}" \
+				"$PLUGIN_DIR/${rel#./}"
+			echo "    patched ${rel#./}"
+		done
+fi
+
 if [[ -d "$HERE/bridge" ]]; then
 	log "Installing MC→Robinhood paper bridge into the bot checkout"
 	install -m 644 "$HERE/bridge/mc_bridge.py" \
