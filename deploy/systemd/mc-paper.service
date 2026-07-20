@@ -1,0 +1,37 @@
+# Paper-training pass: run the full decision across the whole watchlist and
+# log every verdict to a dedicated paper log (outputs/paper_log.jsonl), then
+# settle whatever has matured. This accumulates a training track record far
+# faster than the once-weekly live pipeline — the kill-switch needs 20
+# settled TRADE verdicts before it activates. No orders are placed anywhere;
+# a "paper trade" is a logged verdict settled against real forward prices.
+# Install: /etc/systemd/system/mc-paper.service
+#
+# MC_TICKERS is the same watchlist used for calibration. MC_PAPER_PATHS keeps
+# the per-ticker Monte Carlo lighter than the live 100k (a training pass
+# touches the whole list); override in mcsim.env if desired.
+
+[Unit]
+Description=Monte-Carlo-Sim paper-training pass (decide watchlist + settle)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=mcsim
+Group=mcsim
+WorkingDirectory=/opt/monte-carlo-sim
+EnvironmentFile=/etc/monte-carlo-sim/mcsim.env
+Environment=MC_PAPER_PATHS=40000
+ExecStart=/bin/bash -c '/opt/monte-carlo-sim/.venv/bin/python paper_train.py \
+	$MC_TICKERS --calibration-dir calibration \
+	--paths "$MC_PAPER_PATHS"'
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/monte-carlo-sim/outputs
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

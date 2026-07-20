@@ -90,7 +90,7 @@ install -m 644 "$HERE"/systemd/*.service "$HERE"/systemd/*.timer \
 systemctl daemon-reload
 
 echo "==> Enabling timers (not the bridge yet — fill in the secret first)"
-systemctl enable mc-weekly.timer mc-settle.timer mc-calibrate.timer
+systemctl enable mc-weekly.timer mc-settle.timer mc-calibrate.timer mc-paper.timer
 
 SERVER_IP="$(curl -s -4 ifconfig.me 2>/dev/null || echo YOUR_SERVER_IP)"
 
@@ -107,6 +107,7 @@ Done. Remaining manual steps:
        systemctl start mc-calibrate.service   # one-time seed
        systemctl enable --now tv-bridge.service
        systemctl enable --now mc-weekly.timer mc-settle.timer mc-calibrate.timer
+       systemctl enable --now mc-paper.timer   # paper-training track record
 
   3. Point the TradingView alert webhook at (replace YOUR_SECRET with what
      you set in step 1):

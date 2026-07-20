@@ -1,0 +1,16 @@
+# Run a paper-training pass every weekday after the US close so each pass
+# decides on fully-formed daily bars. Weekly-horizon trades settle ~5
+# trading days later via this same service's settle step (and mc-settle).
+# Install: /etc/systemd/system/mc-paper.timer
+#   systemctl daemon-reload && systemctl enable --now mc-paper.timer
+
+[Unit]
+Description=Schedule weekday Monte-Carlo-Sim paper-training passes
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 21:45 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

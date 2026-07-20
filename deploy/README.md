@@ -118,6 +118,18 @@ means a locked-down egress policy silently blocks every decision.
   `ModuleNotFoundError: No module named 'numpy'` — that's this, not a
   broken install. (The systemd services already do this correctly; it only
   bites you when running a command manually.)
+- **Paper training (`mc-paper`).** The live pipeline only produces a verdict
+  when a TradingView alert arrives (~one per week), which is far too slow to
+  build the settled-trade sample the kill-switch and calibration stats need.
+  `mc-paper.timer` runs the full decision across the whole `MC_TICKERS`
+  watchlist every weekday, logging every verdict to a **dedicated paper log**
+  (`outputs/paper_log.jsonl`, kept separate from the live
+  `outputs/trade_log.jsonl`) and settling matured trades against real prices.
+  No orders are placed — a "paper trade" is a logged verdict scored the same
+  way the live pipeline is. Watch the track record grow with
+  `python paper_train.py --report-only` or `journalctl -u mc-paper -n 50`.
+  Run one by hand any time with
+  `/opt/monte-carlo-sim/.venv/bin/python paper_train.py $MC_TICKERS`.
 - **Two lenses + agreement filter.** Calibration writes two tables per
   ticker: `{T}_5d.json` (EMA/RSI trend lens) and `{T}_5d_mom.json` (12-1
   momentum lens). A TRADE verdict requires the momentum lens to
@@ -167,6 +179,7 @@ systemctl list-timers 'mc-*'          # next scheduled runs
 | `systemd/mc-weekly.{service,timer}` | Weekly decision |
 | `systemd/mc-settle.{service,timer}` | Daily settlement + report |
 | `systemd/mc-calibrate.{service,timer}` | Monthly recalibration |
+| `systemd/mc-paper.{service,timer}` | Weekday paper-training pass over the watchlist |
 
 ## Alternative: event-driven decisions
 
