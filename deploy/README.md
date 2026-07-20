@@ -118,6 +118,19 @@ means a locked-down egress policy silently blocks every decision.
   `ModuleNotFoundError: No module named 'numpy'` — that's this, not a
   broken install. (The systemd services already do this correctly; it only
   bites you when running a command manually.)
+- **Two lenses + agreement filter.** Calibration writes two tables per
+  ticker: `{T}_5d.json` (EMA/RSI trend lens) and `{T}_5d_mom.json` (12-1
+  momentum lens). A TRADE verdict requires the momentum lens to
+  independently verify an edge in the same direction; if the momentum
+  table is missing (e.g. before the first recalibration after upgrading),
+  the filter is inactive and the verdict records why — run
+  `systemctl start mc-calibrate.service` to create the tables. Both
+  lenses are walk-forward validated: a bucket's edge must also hold on
+  the most recent ~2 years the calibration never trained on, or it is
+  zeroed (shown in the `wf` column of the calibration output).
+- **Cost stress.** A TRADE must beat breakeven at the assumed cost *and*
+  at 2× that cost (`--cost-stress-mult`, default 2.0), so marginal edges
+  that only work with perfect fills stay NO_TRADE.
 - **NO_TRADE is the normal case.** The decision layer only fires TRADE when a
   bucket has statistically real edge above breakeven; expect mostly
   NO_TRADE. `mc-weekly.service` treats exit codes 0/3 as success so those

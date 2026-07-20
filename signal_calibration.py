@@ -71,6 +71,32 @@ TRENDS = (TREND_BULLISH, TREND_BEARISH)
 RSI_TERCILES = ("low", "mid", "high")
 ALL_BUCKETS = tuple(f"{t}_{m}" for t in TRENDS for m in RSI_TERCILES)
 
+# Momentum lens: 12-1 time-series momentum (Moskowitz–Ooi–Pedersen spec) —
+# the trailing ~12-month return excluding the most recent month (the skip
+# avoids contamination by short-term reversal). Sign-based buckets keep the
+# researcher degrees of freedom at zero: no tunable thresholds to overfit.
+MOM_LOOKBACK_DAYS = 252
+MOM_SKIP_DAYS = 21
+MOM_BUCKET_UP = "mom_up"
+MOM_BUCKET_DOWN = "mom_down"
+MOM_BUCKETS = (MOM_BUCKET_UP, MOM_BUCKET_DOWN)
+
+# Independent signal families ("lenses"). Each gets its own calibration
+# table; the decision layer can require them to agree before trading.
+FEATURE_SET_EMA_RSI = "ema_rsi"
+FEATURE_SET_MOMENTUM = "momentum"
+FEATURE_SETS = (FEATURE_SET_EMA_RSI, FEATURE_SET_MOMENTUM)
+
+# Walk-forward validation: hold out the final WF_OOS_FRACTION of history,
+# calibrate on the earlier part only, and require each verified bucket's
+# out-of-sample mean forward return to keep the same sign. A bucket that was
+# verified in-sample but flips sign out-of-sample is hard-zeroed in the
+# final table. Buckets with fewer than WF_MIN_OOS_N held-out samples cannot
+# sit the exam and keep their full-sample verdict (recorded as unverified).
+WF_OOS_FRACTION = 0.25
+WF_MIN_OOS_N = 8
+WF_MIN_TEST_TOTAL = 20
+
 # Shrinkage: shrunk_mu = raw_mu * n_eff / (n_eff + k) with an *adaptive*
 # prior strength
 #     k = K_PRIOR + n_eff * T_PRIOR / t**2
@@ -205,6 +231,65 @@ def compute_features(prices: np.ndarray) -> pd.DataFrame:
     )
 
 
+def momentum_12_1(prices: np.ndarray) -> np.ndarray:
+    """Per-day 12-1 momentum: ``log(P[t - skip] / P[t - lookback])``.
+
+    NaN during the first ``MOM_LOOKBACK_DAYS`` warm-up days.
+    """
+    p = np.asarray(prices, dtype=float).ravel()
+    out = np.full(p.size, np.nan)
+    lb, sk = MOM_LOOKBACK_DAYS, MOM_SKIP_DAYS
+    if p.size > lb:
+        idx = np.arange(lb, p.size)
+        out[idx] = np.log(p[idx - sk] / p[idx - lb])
+    return out
+
+
+def momentum_bucket(mom_value: float) -> str:
+    """Sign-based momentum bucket: positive → ``mom_up``, else ``mom_down``.
+
+    Raises ValueError for non-finite input (callers treat that as
+    "undefined bucket" → zero drift).
+    """
+    m = float(mom_value)
+    if not math.isfinite(m):
+        raise ValueError(f"momentum must be finite, got {mom_value!r}")
+    return MOM_BUCKET_UP if m > 0.0 else MOM_BUCKET_DOWN
+
+
+def compute_momentum_features(prices: np.ndarray) -> pd.DataFrame:
+    """Momentum-lens features on daily closes.
+
+    Returns a DataFrame with columns:
+        close, mom_12_1, bucket (``mom_up``/``mom_down`` or None during the
+        ~12-month warm-up).
+    """
+    p = np.asarray(prices, dtype=float).ravel()
+    mom = momentum_12_1(p)
+    buckets = [momentum_bucket(m) if np.isfinite(m) else None for m in mom]
+    return pd.DataFrame({"close": p, "mom_12_1": mom, "bucket": buckets})
+
+
+def buckets_for(feature_set: str) -> Tuple[str, ...]:
+    """The bucket universe of a feature set."""
+    if feature_set == FEATURE_SET_EMA_RSI:
+        return ALL_BUCKETS
+    if feature_set == FEATURE_SET_MOMENTUM:
+        return MOM_BUCKETS
+    raise ValueError(f"unknown feature_set {feature_set!r} "
+                     f"(expected one of {FEATURE_SETS})")
+
+
+def _features_and_warmup(feature_set: str, p: np.ndarray,
+                         ) -> Tuple[pd.DataFrame, int]:
+    if feature_set == FEATURE_SET_EMA_RSI:
+        return compute_features(p), EMA_SLOW_LEN
+    if feature_set == FEATURE_SET_MOMENTUM:
+        return compute_momentum_features(p), MOM_LOOKBACK_DAYS
+    raise ValueError(f"unknown feature_set {feature_set!r} "
+                     f"(expected one of {FEATURE_SETS})")
+
+
 # ---------------------------------------------------------------------------
 # Buckets
 # ---------------------------------------------------------------------------
@@ -317,6 +402,13 @@ class BucketStats:
     t_stat: float = float("nan")
     raw_mu_annual: float = 0.0            # weekly * (252 / horizon)
     shrunk_mu_annual: float = 0.0
+    # Walk-forward validation (None until a walk-forward pass has run;
+    # wf_pass False on a verified bucket means its shrunk_mu was hard-zeroed
+    # because the pattern failed out-of-sample).
+    wf_pass: Optional[bool] = None
+    wf_oos_mu_weekly: Optional[float] = None
+    wf_oos_n: int = 0
+    wf_note: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -336,6 +428,8 @@ class CalibrationTable:
     hard_zero_t: float = HARD_ZERO_T
     method: str = ("overlapping forward log returns, Newey-West SE "
                    "(Bartlett, lag=horizon_days-1)")
+    feature_set: str = FEATURE_SET_EMA_RSI
+    walk_forward: Optional[Dict[str, Any]] = None
     buckets: Dict[str, BucketStats] = field(default_factory=dict)
 
     @property
@@ -358,6 +452,8 @@ class CalibrationTable:
             "t_prior": self.t_prior,
             "hard_zero_t": self.hard_zero_t,
             "method": self.method,
+            "feature_set": self.feature_set,
+            "walk_forward": self.walk_forward,
             "annualization": self.annualization,
             "buckets": {k: v.as_dict() for k, v in self.buckets.items()},
         }
@@ -381,13 +477,16 @@ class CalibrationTable:
             t_prior=float(d.get("t_prior", T_PRIOR)),
             hard_zero_t=float(d.get("hard_zero_t", HARD_ZERO_T)),
             method=d.get("method", ""),
+            feature_set=d.get("feature_set", FEATURE_SET_EMA_RSI),
+            walk_forward=d.get("walk_forward"),
             buckets=buckets,
         )
 
     # ---- persistence ------------------------------------------------------
 
     def path(self, calibration_dir: Path | str = DEFAULT_CALIBRATION_DIR) -> Path:
-        return calibration_path(self.ticker, self.horizon_days, calibration_dir)
+        return calibration_path(self.ticker, self.horizon_days, calibration_dir,
+                                feature_set=self.feature_set)
 
     def save(self, calibration_dir: Path | str = DEFAULT_CALIBRATION_DIR) -> Path:
         path = self.path(calibration_dir)
@@ -399,33 +498,51 @@ class CalibrationTable:
     # ---- display ----------------------------------------------------------
 
     def table_text(self) -> str:
+        wf = self.walk_forward or {}
+        wf_txt = ""
+        if wf.get("applied"):
+            wf_txt = (f"  walk-forward: train {wf.get('train_days', '?')}d / "
+                      f"test {wf.get('test_days', '?')}d")
+        elif wf:
+            wf_txt = f"  walk-forward: {wf.get('reason', 'not applied')}"
         lines = [
-            f"Calibration: {self.ticker}  horizon={self.horizon_days}d  "
+            f"Calibration: {self.ticker}  lens={self.feature_set}  "
+            f"horizon={self.horizon_days}d  "
             f"data {self.data_start} .. {self.data_end} ({self.n_days} days)",
             f"created_at={self.created_at}  k_prior={self.k_prior:.0f}  "
-            f"t_prior={self.t_prior:.0f}  hard-zero |t|<{self.hard_zero_t:.1f}",
+            f"t_prior={self.t_prior:.0f}  hard-zero |t|<{self.hard_zero_t:.1f}"
+            + wf_txt,
             f"{'bucket':<14}{'n':>6}{'n_eff':>8}{'raw_mu/wk':>11}"
-            f"{'shrunk/wk':>11}{'NW se':>9}{'t':>7}{'shrunk/yr':>11}",
+            f"{'shrunk/wk':>11}{'NW se':>9}{'t':>7}{'shrunk/yr':>11}{'wf':>7}",
         ]
-        for name in ALL_BUCKETS:
+        for name in buckets_for(self.feature_set):
             b = self.buckets.get(name)
             if b is None:
                 lines.append(f"{name:<14}{'—':>6}")
                 continue
+            if b.wf_pass is True:
+                wf_mark = "pass"
+            elif b.wf_pass is False:
+                wf_mark = "FAIL"
+            else:
+                wf_mark = "—"
             lines.append(
                 f"{name:<14}{b.n:>6d}{b.n_eff:>8.1f}"
                 f"{b.raw_mu_weekly:>+11.4%}{b.shrunk_mu_weekly:>+11.4%}"
                 f"{b.se_weekly:>9.4%}"
                 f"{(b.t_stat if math.isfinite(b.t_stat) else float('nan')):>7.2f}"
-                f"{b.shrunk_mu_annual:>+11.2%}"
+                f"{b.shrunk_mu_annual:>+11.2%}{wf_mark:>7}"
             )
         return "\n".join(lines)
 
 
 def calibration_path(ticker: str, horizon_days: int,
                      calibration_dir: Path | str = DEFAULT_CALIBRATION_DIR,
+                     feature_set: str = FEATURE_SET_EMA_RSI,
                      ) -> Path:
-    return Path(calibration_dir) / f"{ticker.upper()}_{int(horizon_days)}d.json"
+    suffix = "" if feature_set == FEATURE_SET_EMA_RSI else "_mom"
+    return (Path(calibration_dir)
+            / f"{ticker.upper()}_{int(horizon_days)}d{suffix}.json")
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +589,9 @@ def calibrate(
     prices: Optional[np.ndarray] = None,
     dates: Optional[pd.DatetimeIndex] = None,
     now: Optional[datetime] = None,
+    feature_set: str = FEATURE_SET_EMA_RSI,
+    walk_forward: bool = True,
+    oos_fraction: float = WF_OOS_FRACTION,
 ) -> CalibrationTable:
     """Build a signal-conditioned drift calibration table.
 
@@ -480,6 +600,20 @@ def calibrate(
     Samples are **overlapping** (one per day) and the per-bucket standard
     error uses Newey-West with lag = ``horizon_days - 1`` (see
     :func:`newey_west_stats`); ``n_eff`` reflects the overlap.
+
+    ``feature_set`` selects the signal lens: ``"ema_rsi"`` (EMA 9/21 trend x
+    RSI terciles, the TradingView contract) or ``"momentum"`` (12-1
+    time-series momentum, sign buckets).
+
+    ``walk_forward`` (default on) holds out the final ``oos_fraction`` of
+    history as an exam the calibration never trained on: a bucket verified
+    on the training window whose held-out mean flips sign is hard-zeroed in
+    the final table (``wf_pass`` False records why). The ``h`` days
+    straddling the split boundary belong to neither window (a natural
+    purge), and buckets with too few held-out samples keep their full-sample
+    verdict with ``wf_pass`` None — an exam you couldn't sit is not a fail.
+    Walk-forward is skipped entirely (recorded in ``table.walk_forward``)
+    when the data is too short to split honestly.
 
     ``prices``/``dates`` may be supplied directly (tests, offline use);
     otherwise history is downloaded via yfinance (auto_adjust=True).
@@ -491,27 +625,89 @@ def calibrate(
     p = np.asarray(prices, dtype=float).ravel()
     if np.any(~np.isfinite(p)) or np.any(p <= 0):
         raise CalibrationDataError("prices must be finite and positive")
-    if p.size < EMA_SLOW_LEN + horizon_days + 2:
+    feats, warmup = _features_and_warmup(feature_set, p)
+    if p.size < warmup + horizon_days + 2:
         raise CalibrationDataError(
-            f"need more than {EMA_SLOW_LEN + horizon_days + 2} prices, "
-            f"got {p.size}"
+            f"need more than {warmup + horizon_days + 2} prices for "
+            f"feature_set={feature_set!r}, got {p.size}"
         )
 
-    feats = compute_features(p)
     log_p = np.log(p)
     h = int(horizon_days)
     fwd = np.full(p.size, np.nan)
     fwd[:-h] = log_p[h:] - log_p[:-h]
     feats["fwd_ret"] = fwd
+    bucket_names = buckets_for(feature_set)
+    fwd_finite = np.isfinite(fwd)
+
+    def sample_of(name: str, extra_mask: np.ndarray) -> np.ndarray:
+        m = (feats["bucket"] == name).to_numpy() & fwd_finite & extra_mask
+        return fwd[m]
+
+    # ---- walk-forward validation (train on the past, exam on the holdout) --
+    wf_meta: Dict[str, Any] = {
+        "applied": False,
+        "oos_fraction": float(oos_fraction),
+        "min_oos_n": WF_MIN_OOS_N,
+    }
+    wf_results: Dict[str, Dict[str, Any]] = {}
+    if walk_forward:
+        idx = np.arange(p.size)
+        split = int(round(p.size * (1.0 - float(oos_fraction))))
+        train_mask = idx <= split - h - 1   # forward window fully pre-split
+        test_mask = idx >= split
+        n_test_total = int(np.sum(test_mask & fwd_finite))
+        if split < warmup + h + 2 or n_test_total < WF_MIN_TEST_TOTAL:
+            wf_meta["reason"] = (
+                f"skipped: too little data for a "
+                f"{1 - oos_fraction:.0%} train / {oos_fraction:.0%} test split"
+            )
+        else:
+            wf_meta.update(applied=True, split_index=split,
+                           train_days=int(split),
+                           test_days=int(p.size - split))
+            for name in bucket_names:
+                tr = sample_of(name, train_mask)
+                te = sample_of(name, test_mask)
+                st_tr = newey_west_stats(tr, lag=h - 1)
+                raw_tr = (st_tr["mean"]
+                          if math.isfinite(st_tr["mean"]) else 0.0)
+                shrunk_tr = shrink_mu(raw_tr, st_tr["n_eff"],
+                                      st_tr["t_stat"])
+                oos_mu = float(np.mean(te)) if te.size else float("nan")
+                if te.size < WF_MIN_OOS_N:
+                    ok: Optional[bool] = None
+                    note = (f"only {te.size} held-out samples "
+                            f"(< {WF_MIN_OOS_N}) — exam not sat, "
+                            "full-sample verdict kept")
+                elif shrunk_tr == 0.0:
+                    ok = False
+                    note = ("not verified on the training window — pattern "
+                            "only appears once the holdout era is included")
+                elif (oos_mu > 0.0) == (shrunk_tr > 0.0):
+                    ok = True
+                    note = (f"held-out mean {oos_mu:+.4%} confirms the "
+                            "training-window sign")
+                else:
+                    ok = False
+                    note = (f"held-out mean {oos_mu:+.4%} flips sign vs "
+                            f"training {shrunk_tr:+.4%}")
+                wf_results[name] = {"pass": ok, "oos_mu": oos_mu,
+                                    "oos_n": int(te.size), "note": note}
 
     ann = TRADING_DAYS_PER_YEAR / float(h)
     buckets: Dict[str, BucketStats] = {}
-    for name in ALL_BUCKETS:
-        mask = (feats["bucket"] == name) & np.isfinite(feats["fwd_ret"])
-        sample = feats.loc[mask, "fwd_ret"].to_numpy(dtype=float)
+    for name in bucket_names:
+        sample = sample_of(name, np.ones(p.size, dtype=bool))
         st = newey_west_stats(sample, lag=h - 1)
         raw_mu = st["mean"] if math.isfinite(st["mean"]) else 0.0
         shrunk = shrink_mu(raw_mu, st["n_eff"], st["t_stat"])
+        wf = wf_results.get(name)
+        wf_pass = wf["pass"] if wf else None
+        wf_note = wf["note"] if wf else ""
+        if wf and shrunk != 0.0 and wf_pass is False:
+            wf_note = f"hard-zeroed by walk-forward: {wf_note}"
+            shrunk = 0.0
         buckets[name] = BucketStats(
             bucket=name,
             n=int(st["n"]),
@@ -523,6 +719,11 @@ def calibrate(
             t_stat=float(st["t_stat"]),
             raw_mu_annual=float(raw_mu) * ann,
             shrunk_mu_annual=float(shrunk) * ann,
+            wf_pass=wf_pass,
+            wf_oos_mu_weekly=(
+                wf["oos_mu"] if wf and math.isfinite(wf["oos_mu"]) else None),
+            wf_oos_n=wf["oos_n"] if wf else 0,
+            wf_note=wf_note,
         )
 
     ts_now = (now or datetime.now(timezone.utc)).replace(microsecond=0)
@@ -539,6 +740,8 @@ def calibrate(
         data_end=end_s,
         n_days=int(p.size),
         years=float(years),
+        feature_set=feature_set,
+        walk_forward=wf_meta,
         buckets=buckets,
     )
 
@@ -548,6 +751,7 @@ def load_calibration(
     horizon_days: int = 5,
     calibration_dir: Path | str = DEFAULT_CALIBRATION_DIR,
     *,
+    feature_set: str = FEATURE_SET_EMA_RSI,
     warn_stale_days: int = STALE_WARN_DAYS,
     error_stale_days: int = STALE_ERROR_DAYS,
     now: Optional[datetime] = None,
@@ -559,7 +763,8 @@ def load_calibration(
     ``error_stale_days`` (drift edges decay; stale tables must not be
     trusted silently).
     """
-    path = calibration_path(ticker, horizon_days, calibration_dir)
+    path = calibration_path(ticker, horizon_days, calibration_dir,
+                            feature_set=feature_set)
     if not path.is_file():
         raise FileNotFoundError(
             f"No calibration for {ticker.upper()} at {path}. "
@@ -601,24 +806,44 @@ def load_calibration(
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="Calibrate signal-conditioned drift from history "
-                    "(EMA 9/21 trend x RSI 14 terciles).",
+                    "(EMA 9/21 trend x RSI terciles, plus the 12-1 momentum "
+                    "lens; walk-forward validated by default).",
     )
     ap.add_argument("ticker")
     ap.add_argument("--years", type=float, default=8.0)
     ap.add_argument("--horizon", type=int, default=5,
                     help="forward-return horizon in trading days (default 5)")
     ap.add_argument("--calibration-dir", default=str(DEFAULT_CALIBRATION_DIR))
+    ap.add_argument("--feature-set", default="both",
+                    choices=["both", *FEATURE_SETS],
+                    help="which signal lens(es) to calibrate (default both)")
+    ap.add_argument("--no-walk-forward", action="store_true",
+                    help="disable the held-out walk-forward validation")
     args = ap.parse_args(argv)
 
+    lenses = (list(FEATURE_SETS) if args.feature_set == "both"
+              else [args.feature_set])
     try:
-        table = calibrate(args.ticker, years=args.years,
-                          horizon_days=args.horizon)
+        prices, dates = download_history(args.ticker, args.years)
     except CalibrationError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    path = table.save(args.calibration_dir)
-    print(table.table_text())
-    print(f"\nWrote {path}")
+
+    wrote = []
+    for fs in lenses:
+        try:
+            table = calibrate(args.ticker, years=args.years,
+                              horizon_days=args.horizon,
+                              prices=prices, dates=dates,
+                              feature_set=fs,
+                              walk_forward=not args.no_walk_forward)
+        except CalibrationError as exc:
+            print(f"ERROR ({fs}): {exc}", file=sys.stderr)
+            return 2
+        wrote.append(table.save(args.calibration_dir))
+        print(table.table_text())
+        print()
+    print("Wrote " + ", ".join(str(p) for p in wrote))
     return 0
 
 

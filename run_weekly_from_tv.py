@@ -150,6 +150,108 @@ def fmt_pct(x: Optional[float], nd: int = 2) -> str:
     return f"{100.0 * x:.{nd}f}%"
 
 
+def momentum_lens_check(
+    ticker: str,
+    daily_log_returns: Optional[np.ndarray],
+    side: str,
+    horizon_days: int,
+    calibration_dir: Path | str,
+) -> Dict[str, Any]:
+    """Second, independent witness: the 12-1 time-series-momentum lens.
+
+    Computes today's momentum state from the resolved price history and looks
+    it up in the momentum calibration table. ``active`` is False (with the
+    reason in ``note``) when the check cannot run — missing table, manual
+    market override, short history — so deployments without momentum tables
+    keep working until the next recalibration. When active, ``agrees`` is
+    True only for a verified edge in the trade direction.
+    """
+    from signal_calibration import (
+        FEATURE_SET_MOMENTUM,
+        MOM_LOOKBACK_DAYS,
+        CalibrationError,
+        CalibrationStaleError,
+        load_calibration,
+        momentum_12_1,
+        momentum_bucket,
+    )
+
+    lens: Dict[str, Any] = {
+        "active": False, "bucket": None, "mom_12_1": None,
+        "shrunk_mu_weekly": None, "shrunk_mu_annual": None,
+        "t_stat": None, "n_eff": None, "direction": "none",
+        "agrees": None, "note": "",
+    }
+    if daily_log_returns is None:
+        lens["note"] = ("no price history (manual market override) — "
+                        "momentum lens inactive")
+        return lens
+    r = np.asarray(daily_log_returns, dtype=float).ravel()
+    if r.size < MOM_LOOKBACK_DAYS:
+        lens["note"] = (f"history too short for 12-1 momentum "
+                        f"({r.size} < {MOM_LOOKBACK_DAYS} returns) — "
+                        "momentum lens inactive")
+        return lens
+    # Momentum uses price *ratios* only, so a relative path reconstructed
+    # from returns is exact.
+    rel_prices = np.exp(np.concatenate([[0.0], np.cumsum(r)]))
+    mom = float(momentum_12_1(rel_prices)[-1])
+    lens["mom_12_1"] = mom
+    try:
+        bucket = momentum_bucket(mom)
+    except ValueError as exc:
+        lens["note"] = f"undefined momentum bucket: {exc}"
+        return lens
+    lens["bucket"] = bucket
+    try:
+        table = load_calibration(ticker, horizon_days, calibration_dir,
+                                 feature_set=FEATURE_SET_MOMENTUM)
+    except FileNotFoundError:
+        lens["note"] = (f"no momentum calibration table for {ticker.upper()} "
+                        f"({horizon_days}d) — run signal_calibration.py to "
+                        "activate the agreement filter")
+        return lens
+    except CalibrationStaleError as exc:
+        lens["note"] = f"momentum calibration too stale: {exc}"
+        return lens
+    except CalibrationError as exc:
+        lens["note"] = f"momentum calibration unreadable: {exc}"
+        return lens
+
+    stats = table.get(bucket)
+    if stats is None or stats.n < 2:
+        lens.update(active=True, agrees=False,
+                    note=f"momentum bucket {bucket} has no usable samples — "
+                         "second witness cannot confirm")
+        return lens
+    mu_w = float(stats.shrunk_mu_weekly)
+    direction = "long" if mu_w > 0 else ("short" if mu_w < 0 else "none")
+    lens.update(
+        active=True,
+        shrunk_mu_weekly=mu_w,
+        shrunk_mu_annual=float(stats.shrunk_mu_annual),
+        t_stat=float(stats.t_stat),
+        n_eff=float(stats.n_eff),
+        direction=direction,
+    )
+    if mu_w == 0.0:
+        lens["agrees"] = False
+        lens["note"] = (f"momentum lens sees no verified edge in {bucket} "
+                        f"(t={stats.t_stat:.2f}, n_eff={stats.n_eff:.0f}) — "
+                        "second witness says noise")
+    elif direction != side:
+        lens["agrees"] = False
+        lens["note"] = (f"momentum lens points {direction} "
+                        f"({stats.shrunk_mu_annual:+.1%}/yr in {bucket}) "
+                        f"but the trade side is {side}")
+    else:
+        lens["agrees"] = True
+        lens["note"] = (f"momentum lens agrees: {direction} "
+                        f"{stats.shrunk_mu_annual:+.1%}/yr in {bucket} "
+                        f"[t={stats.t_stat:.2f}, n_eff={stats.n_eff:.0f}]")
+    return lens
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -181,6 +283,13 @@ class PipelineSettings:
     # disable for speed in bulk runs/tests).
     noise_sweep: bool = True
     sweep_stop_mults: tuple = (0.5, 1.0, 1.5, 2.0)
+    # Cost stress: a TRADE must also beat the breakeven computed at
+    # cost_stress_mult × the assumed per-side cost (<=1 disables).
+    cost_stress_mult: float = 2.0
+    # Agreement filter: require the independent 12-1 momentum lens to show a
+    # verified same-direction edge before TRADE (inactive with a recorded
+    # reason when no momentum table / history is available).
+    agreement_filter: bool = True
 
 
 def _resolve_market(settings: PipelineSettings, ticker: str,
@@ -193,6 +302,7 @@ def _resolve_market(settings: PipelineSettings, ticker: str,
             "sigma": float(settings.sigma),
             "source": "manual",
             "sigma_method": "manual override",
+            "daily_log_returns": None,
         }
 
     mkt = estimate_parameters_from_history(ticker, years=settings.years_history)
@@ -220,6 +330,7 @@ def _resolve_market(settings: PipelineSettings, ticker: str,
         "sigma": sigma,
         "source": mkt.source,
         "sigma_method": sigma_method,
+        "daily_log_returns": returns,
     }
 
 
@@ -321,6 +432,15 @@ def run_pipeline(settings: PipelineSettings) -> Dict[str, Any]:
     edge_weekly = drift.mu_weekly if side == "long" else -drift.mu_weekly
     edge_annual = drift.mu_annual if side == "long" else -drift.mu_annual
 
+    # ---- second witness: 12-1 momentum lens ------------------------------
+    if settings.agreement_filter:
+        mom_lens = momentum_lens_check(
+            ticker, market["daily_log_returns"], side,
+            settings.horizon_days, settings.calibration_dir)
+    else:
+        mom_lens = {"active": False, "agrees": None,
+                    "note": "agreement filter disabled by settings"}
+
     # ---- kill-switch -----------------------------------------------------
     ks_tripped, ks_reason = outcome_tracker.check_kill_switch(
         settings.trade_log)
@@ -328,6 +448,9 @@ def run_pipeline(settings: PipelineSettings) -> Dict[str, Any]:
     # ---- verdict ---------------------------------------------------------
     verdict = "NO_TRADE"
     reason = ""
+    stress_mult = float(settings.cost_stress_mult or 0.0)
+    be_annual_stress: Optional[float] = None
+    be_weekly_stress: Optional[float] = None
     if drift.source != "calibration":
         reason = f"no calibrated drift ({drift.reason})"
     elif edge_weekly <= 0.0:
@@ -346,11 +469,38 @@ def run_pipeline(settings: PipelineSettings) -> Dict[str, Any]:
             f"expectancy under calibrated drift is {fmt_pct(expectancy)} ≤ 0"
         )
     else:
-        verdict = "TRADE"
-        reason = (
-            f"edge {fmt_pct(edge_weekly)} weekly > breakeven "
-            f"{fmt_pct(be_weekly)} (margin {fmt_pct(edge_weekly - be_weekly)})"
-        )
+        # Cost stress: the edge must also clear the breakeven computed at
+        # stressed costs, so a slightly-worse-than-assumed fill can't turn
+        # a marginal TRADE negative. (Computed lazily — only for edges that
+        # already beat the base breakeven.)
+        if stress_mult > 1.0:
+            be_annual_stress = breakeven_edge(
+                ticker, s0, sigma, rule, side, be_paths,
+                settings.cost * stress_mult, settings.seed)
+            be_weekly_stress = (be_annual_stress * settings.horizon_days
+                                / TRADING_DAYS_PER_YEAR)
+        if (be_weekly_stress is not None
+                and edge_weekly <= be_weekly_stress):
+            reason = (
+                f"fails cost stress: edge {fmt_pct(edge_weekly)} weekly ≤ "
+                f"breakeven {fmt_pct(be_weekly_stress)} at "
+                f"{stress_mult:.1f}× costs "
+                f"({settings.cost * stress_mult * 1e4:.0f} bps/side)"
+            )
+        else:
+            verdict = "TRADE"
+            reason = (
+                f"edge {fmt_pct(edge_weekly)} weekly > breakeven "
+                f"{fmt_pct(be_weekly)} (margin "
+                f"{fmt_pct(edge_weekly - be_weekly)})"
+                + (f"; survives {stress_mult:.1f}× cost stress"
+                   if be_weekly_stress is not None else "")
+            )
+
+    if (verdict == "TRADE" and mom_lens.get("active")
+            and not mom_lens.get("agrees")):
+        verdict = "NO_TRADE"
+        reason = f"agreement filter: {mom_lens['note']}"
 
     if verdict == "TRADE" and ks_tripped and not settings.override_killswitch:
         verdict = "NO_TRADE"
@@ -408,6 +558,10 @@ def run_pipeline(settings: PipelineSettings) -> Dict[str, Any]:
         # decision numbers
         "breakeven_mu_annual": be_annual,
         "breakeven_mu_weekly": be_weekly,
+        "cost_stress_mult": stress_mult,
+        "breakeven_mu_annual_stress": be_annual_stress,
+        "breakeven_mu_weekly_stress": be_weekly_stress,
+        "momentum_lens": mom_lens,
         "edge_weekly": edge_weekly,
         "edge_annual": edge_annual,
         "expectancy_pct": expectancy,
@@ -488,7 +642,16 @@ def verdict_text(v: Dict[str, Any]) -> str:
             if v.get("noise_stop_sweep") else []
         ),
         f"Breakeven: μ={fmt_pct(v['breakeven_mu_annual'], 1)}/yr "
-        f"≈ {fmt_pct(v['breakeven_mu_weekly'])}/week",
+        f"≈ {fmt_pct(v['breakeven_mu_weekly'])}/week"
+        + (
+            f"  |  at {v['cost_stress_mult']:.1f}× costs: "
+            f"{fmt_pct(v['breakeven_mu_weekly_stress'])}/week"
+            if v.get("breakeven_mu_weekly_stress") is not None else ""
+        ),
+        *(
+            [f"Momentum lens: {v['momentum_lens']['note']}"]
+            if v.get("momentum_lens", {}).get("note") else []
+        ),
         f"Under calibrated drift {drift_tag}: "
         f"expectancy {fmt_pct(v['expectancy_pct'])}/trade, "
         f"P(win) {fmt_pct(v['p_win'], 1)}, "
@@ -545,6 +708,11 @@ def build_parser() -> argparse.ArgumentParser:
                    default=str(outcome_tracker.DEFAULT_TRADE_LOG))
     p.add_argument("--verdict-dir", default=str(DEFAULT_VERDICT_DIR))
     p.add_argument("--override-killswitch", action="store_true")
+    p.add_argument("--cost-stress-mult", type=float, default=2.0,
+                   help="TRADE must also beat breakeven at this multiple of "
+                        "--cost (default 2.0; <=1 disables)")
+    p.add_argument("--no-agreement-filter", action="store_true",
+                   help="disable the 12-1 momentum second-witness filter")
     # Demo helpers
     p.add_argument("--demo", action="store_true",
                    help="write a demo signal into --data-dir first (offline)")
@@ -586,6 +754,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         trade_log=Path(args.trade_log),
         verdict_dir=Path(args.verdict_dir),
         override_killswitch=bool(args.override_killswitch),
+        cost_stress_mult=float(args.cost_stress_mult),
+        agreement_filter=not args.no_agreement_filter,
     )
 
     try:
