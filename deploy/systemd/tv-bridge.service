@@ -25,6 +25,13 @@ ExecStart=/opt/monte-carlo-sim/.venv/bin/python tv_webhook_bridge.py \
 Restart=on-failure
 RestartSec=3
 
+# TradingView only allows port 80 for plain-HTTP webhook URLs. The service
+# runs as the unprivileged mcsim user, so grant just the capability to bind
+# low ports — this lets TV_BRIDGE_PORT=80 work without running as root.
+# (Harmless when TV_BRIDGE_PORT is a high port like 5001.)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
 # Hardening — the bridge only needs to read the repo and write tv_data/.
 NoNewPrivileges=true
 PrivateTmp=true

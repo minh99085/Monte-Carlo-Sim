@@ -72,6 +72,9 @@ if command -v ufw &>/dev/null; then
 	# Always allow SSH first so we can never lock ourselves out.
 	ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null 2>&1
 	ufw allow 5001/tcp >/dev/null 2>&1
+	# TradingView permits only port 80 for plain-HTTP webhook URLs; allow it
+	# so TV_BRIDGE_PORT=80 works (harmless if the bridge stays on 5001).
+	ufw allow 80/tcp >/dev/null 2>&1
 	if ufw status | grep -q "Status: active"; then
 		echo "    ufw already active — SSH + port 5001 allowed."
 	else
