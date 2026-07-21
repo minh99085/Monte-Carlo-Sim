@@ -348,6 +348,9 @@ class BridgeState:
         data_dir: Path,
         hmac_key: str = "",
         dedupe_window: float = DEDUPE_WINDOW_SECONDS,
+        dashboard_html_path: Optional[Path] = None,
+        dashboard_app_dir: Optional[Path] = None,
+        dashboard_bot_api: str = "http://127.0.0.1:8810",
     ):
         self.secret = secret
         self.data_dir = data_dir
@@ -355,6 +358,12 @@ class BridgeState:
         self.dedupe_window = float(dedupe_window)
         self.received_count = 0
         self.lock = threading.Lock()
+        # Dashboard file paths default to the module dir so a checkout run
+        # with default flags finds the HTML alongside this file.
+        module_dir = Path(__file__).resolve().parent
+        self.dashboard_html_path = dashboard_html_path or (module_dir / "dashboard.html")
+        self.dashboard_app_dir = dashboard_app_dir or module_dir
+        self.dashboard_bot_api = dashboard_bot_api
 
 
 def make_handler(state: BridgeState):
@@ -374,9 +383,43 @@ def make_handler(state: BridgeState):
         def _headers_dict(self) -> Dict[str, str]:
             return {k: v for k, v in self.headers.items()}
 
+        def _send_html(self, code: int, body: str) -> None:
+            raw = body.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(raw)
+
         def do_GET(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
+
+            # Dashboard: HTML page and its JSON API. Both are unauthenticated
+            # because they carry only *derived* status (no signal contents,
+            # no secrets); the raw /latest endpoint remains secret-gated.
+            if path == "/dashboard":
+                try:
+                    html = state.dashboard_html_path.read_text(encoding="utf-8")
+                except OSError:
+                    self._send_html(500, "<h1>Dashboard HTML not installed</h1>")
+                    return
+                self._send_html(200, html)
+                return
+            if path == "/dashboard/api":
+                try:
+                    from dashboard import build_snapshot
+                    snap = build_snapshot(
+                        app_dir=state.dashboard_app_dir,
+                        bot_api=state.dashboard_bot_api,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json(500, {"error": "aggregate_failed",
+                                          "detail": str(exc)})
+                    return
+                self._send_json(200, snap)
+                return
 
             if path in ("/", "/health"):
                 latest = load_latest(state.data_dir)
@@ -403,7 +446,9 @@ def make_handler(state: BridgeState):
                     self._send_json(200, latest)
                 return
 
-            self._send_json(404, {"error": "not_found", "paths": ["/", "/health", "/webhook", "/latest"]})
+            self._send_json(404, {"error": "not_found",
+                "paths": ["/", "/health", "/webhook", "/latest",
+                          "/dashboard", "/dashboard/api"]})
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -511,16 +556,25 @@ def run_server(
     data_dir: Path,
     hmac_key: str = "",
     dedupe_window: float = DEDUPE_WINDOW_SECONDS,
+    dashboard_html_path: Optional[Path] = None,
+    dashboard_app_dir: Optional[Path] = None,
+    dashboard_bot_api: str = "http://127.0.0.1:8810",
 ) -> None:
     ensure_data_dir(data_dir)
-    state = BridgeState(secret=secret, data_dir=data_dir,
-                        hmac_key=hmac_key, dedupe_window=dedupe_window)
+    state = BridgeState(
+        secret=secret, data_dir=data_dir,
+        hmac_key=hmac_key, dedupe_window=dedupe_window,
+        dashboard_html_path=dashboard_html_path,
+        dashboard_app_dir=dashboard_app_dir,
+        dashboard_bot_api=dashboard_bot_api,
+    )
     handler = make_handler(state)
     httpd = ThreadingHTTPServer((host, port), handler)
     logger.info("TradingView webhook bridge listening on http://%s:%s", host, port)
-    logger.info("  POST webhook : http://%s:%s/webhook?secret=<your-secret>", host, port)
-    logger.info("  GET  health  : http://%s:%s/health", host, port)
-    logger.info("  GET  latest  : http://%s:%s/latest?secret=<your-secret>", host, port)
+    logger.info("  POST webhook  : http://%s:%s/webhook?secret=<your-secret>", host, port)
+    logger.info("  GET  health   : http://%s:%s/health", host, port)
+    logger.info("  GET  latest   : http://%s:%s/latest?secret=<your-secret>", host, port)
+    logger.info("  GET  dashboard: http://%s:%s/dashboard", host, port)
     logger.info("  Data folder  : %s", data_dir.resolve())
     try:
         httpd.serve_forever()
@@ -578,6 +632,24 @@ def build_parser() -> argparse.ArgumentParser:
              "0 disables).",
     )
     p.add_argument(
+        "--dashboard-html",
+        default=os.environ.get("TV_BRIDGE_DASHBOARD_HTML", ""),
+        help="Path to dashboard.html (default: alongside this script).",
+    )
+    p.add_argument(
+        "--dashboard-app-dir",
+        default=os.environ.get("TV_BRIDGE_DASHBOARD_APP_DIR", ""),
+        help="Monte-Carlo-Sim app dir the dashboard reads outputs from "
+             "(default: this script's parent dir).",
+    )
+    p.add_argument(
+        "--dashboard-bot-api",
+        default=os.environ.get("TV_BRIDGE_DASHBOARD_BOT_API",
+                               "http://127.0.0.1:8810"),
+        help="Robinhood bot API URL the dashboard aggregates from "
+             "(default http://127.0.0.1:8810).",
+    )
+    p.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -608,6 +680,10 @@ def main(argv: Optional[list] = None) -> int:
         data_dir,
         hmac_key=(args.hmac_key or "").strip(),
         dedupe_window=float(args.dedupe_window),
+        dashboard_html_path=Path(args.dashboard_html) if args.dashboard_html else None,
+        dashboard_app_dir=Path(args.dashboard_app_dir) if args.dashboard_app_dir else None,
+        dashboard_bot_api=(args.dashboard_bot_api or "").strip()
+                          or "http://127.0.0.1:8810",
     )
     return 0
 

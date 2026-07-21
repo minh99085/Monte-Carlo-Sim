@@ -21,6 +21,8 @@ ExecStart=/opt/monte-carlo-sim/.venv/bin/python tv_webhook_bridge.py \
 	--port ${TV_BRIDGE_PORT} \
 	--data-dir tv_data \
 	--dedupe-window ${TV_BRIDGE_DEDUPE_WINDOW} \
+	--dashboard-html /opt/monte-carlo-sim/dashboard.html \
+	--dashboard-app-dir /opt/monte-carlo-sim \
 	--log-level INFO
 Restart=on-failure
 RestartSec=3

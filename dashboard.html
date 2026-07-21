@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Trading Console — Monte Carlo + Robinhood</title>
+<style>
+:root {
+  --bg: #0B0E13;
+  --surface: #131822;
+  --surface-2: #171D28;
+  --hairline: #1E2632;
+  --text: #E8ECF3;
+  --muted: #8892A6;
+  --dim: #56607A;
+  --good: #6EE7B7;
+  --info: #6BA9F5;
+  --warn: #F5C97B;
+  --critical: #FF7B7B;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", Roboto, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body {
+  font: 14px/1.5 var(--sans);
+  font-feature-settings: "cv09", "ss01";
+  padding: 32px 40px 80px;
+  min-height: 100vh;
+}
+@media (max-width: 720px) { body { padding: 24px 18px 64px; } }
+
+/* ------- header ------- */
+header {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 24px; flex-wrap: wrap;
+  padding-bottom: 20px; margin-bottom: 28px;
+  border-bottom: 1px solid var(--hairline);
+}
+.title { display: flex; align-items: baseline; gap: 14px; }
+.title h1 {
+  font: 500 22px/1 var(--sans); margin: 0;
+  letter-spacing: -0.01em;
+}
+.title .dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--good); box-shadow: 0 0 12px currentColor;
+}
+.title[data-state="warn"] .dot { color: var(--warn); background: currentColor; }
+.title[data-state="info"] .dot { color: var(--info); background: currentColor; }
+.title[data-state="critical"] .dot { color: var(--critical); background: currentColor; }
+.title[data-state="good"] .dot { color: var(--good); background: currentColor; }
+.title .kicker {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--muted);
+}
+.meta {
+  display: flex; align-items: center; gap: 18px;
+  font-family: var(--mono); font-size: 12px; color: var(--muted);
+}
+.meta code {
+  background: var(--surface); padding: 3px 8px; border-radius: 4px;
+  color: var(--text);
+}
+
+/* ------- strip of 4 tiles ------- */
+.strip {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(4, 1fr);
+  margin-bottom: 28px;
+}
+@media (max-width: 900px) { .strip { grid-template-columns: repeat(2, 1fr); } }
+.tile {
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 10px; padding: 16px 18px;
+  position: relative; overflow: hidden;
+  transition: border-color .15s;
+}
+.tile::before {
+  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+  background: var(--muted);
+}
+.tile[data-state="good"]::before { background: var(--good); }
+.tile[data-state="info"]::before { background: var(--info); }
+.tile[data-state="warn"]::before { background: var(--warn); }
+.tile[data-state="critical"]::before { background: var(--critical); }
+.tile .label {
+  font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: 8px;
+}
+.tile .name {
+  font-size: 16px; font-weight: 500;
+  margin: 0 0 4px; letter-spacing: -0.005em;
+}
+.tile .detail {
+  font-size: 12.5px; color: var(--muted); line-height: 1.45;
+}
+.tile .pill {
+  display: inline-block; margin-top: 12px;
+  font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 3px;
+}
+.tile[data-state="good"] .pill { background: rgba(110,231,183,.08); color: var(--good); }
+.tile[data-state="info"] .pill { background: rgba(107,169,245,.09); color: var(--info); }
+.tile[data-state="warn"] .pill { background: rgba(245,201,123,.09); color: var(--warn); }
+.tile[data-state="critical"] .pill { background: rgba(255,123,123,.09); color: var(--critical); }
+
+/* ------- section headings ------- */
+h2 {
+  font: 500 12.5px/1 var(--mono); letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--muted);
+  margin: 32px 0 14px;
+}
+h2 .aux { color: var(--dim); margin-left: 10px; }
+
+/* ------- grid card ------- */
+.grid {
+  display: grid; gap: 18px;
+  grid-template-columns: 1fr 1fr;
+}
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+.card {
+  background: var(--surface); border: 1px solid var(--hairline);
+  border-radius: 10px; padding: 20px 22px;
+}
+.card h3 {
+  font: 500 15px/1 var(--sans); margin: 0 0 14px;
+}
+
+/* ------- key/value ------- */
+.kv { display: grid; gap: 8px; grid-template-columns: 1fr auto; align-items: baseline; }
+.kv .k { color: var(--muted); font-size: 13px; }
+.kv .v { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.kv .v.good { color: var(--good); }
+.kv .v.info { color: var(--info); }
+.kv .v.warn { color: var(--warn); }
+.kv .v.critical { color: var(--critical); }
+
+/* ------- large numeric hero (track record) ------- */
+.record { display: flex; gap: 32px; flex-wrap: wrap; align-items: flex-end; }
+.record .fig {
+  font-family: var(--mono); font-variant-numeric: tabular-nums;
+  font-size: 34px; letter-spacing: -0.01em; line-height: 1;
+  color: var(--text);
+}
+.record .fig .unit { font-size: 15px; color: var(--muted); margin-left: 4px; }
+.record .cap {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--muted); margin-top: 8px;
+}
+
+/* ------- tables ------- */
+table {
+  width: 100%; border-collapse: collapse;
+  font-family: var(--mono); font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+th, td {
+  text-align: left; padding: 8px 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+th {
+  font: 500 10.5px/1 var(--mono); letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--muted);
+  border-bottom-color: var(--hairline);
+}
+td.ticker { color: var(--text); font-weight: 500; }
+td.trade { color: var(--good); }
+td.no_trade { color: var(--muted); }
+td.dim { color: var(--dim); }
+tr:last-child td { border-bottom: 0; }
+.scroll { overflow-x: auto; margin: 0 -6px; }
+
+/* ------- empty state ------- */
+.empty {
+  text-align: center; padding: 28px 0;
+  color: var(--dim); font-size: 13px;
+}
+
+/* ------- footer ------- */
+footer {
+  margin-top: 40px; padding-top: 20px;
+  border-top: 1px solid var(--hairline);
+  font-family: var(--mono); font-size: 11px;
+  color: var(--dim); display: flex; justify-content: space-between;
+  flex-wrap: wrap; gap: 12px;
+}
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ------- accessibility ------- */
+@media (prefers-reduced-motion: reduce) {
+  .title .dot { box-shadow: none; }
+}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="title" id="title" data-state="info">
+    <span class="dot" aria-hidden="true"></span>
+    <div>
+      <div class="kicker">Trading console</div>
+      <h1>Monte Carlo &nbsp;<span style="color: var(--dim); font-weight: 300;">+</span>&nbsp; Robinhood</h1>
+    </div>
+  </div>
+  <div class="meta">
+    <span>Auto-refresh <code>15s</code></span>
+    <span id="clock">—</span>
+  </div>
+</header>
+
+<section class="strip" id="strip"></section>
+
+<h2>Track record <span class="aux">— paper training verdicts settled against real prices</span></h2>
+<div class="card" id="record-card">
+  <div class="record" id="record"></div>
+  <div style="margin-top: 22px; display: grid; gap: 8px; grid-template-columns: 1fr auto;" id="record-detail"></div>
+</div>
+
+<div class="grid" style="margin-top: 22px;">
+  <div class="card">
+    <h3>Latest TradingView alert</h3>
+    <div id="signal-detail"></div>
+  </div>
+  <div class="card">
+    <h3>Robinhood safety state</h3>
+    <div id="bot-detail"></div>
+  </div>
+</div>
+
+<h2>Latest decisions <span class="aux">— what the brain said, newest first</span></h2>
+<div class="card">
+  <div class="scroll">
+    <table id="verdicts">
+      <thead><tr>
+        <th>Time (UTC)</th><th>Ticker</th><th>Verdict</th>
+        <th>Side</th><th>Shares</th><th>Source</th><th>Reason</th>
+      </tr></thead>
+      <tbody><tr><td class="dim" colspan="7">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<h2>Bot bridge ledger <span class="aux">— what the paper bridge decided about each verdict</span></h2>
+<div class="card">
+  <div class="scroll">
+    <table id="ledger">
+      <thead><tr>
+        <th>Verdict file</th><th>Ticker</th><th>Verdict</th><th>Outcome</th>
+      </tr></thead>
+      <tbody><tr><td class="dim" colspan="4">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+
+<footer>
+  <span>Data reload every 15s · No orders are placed while paper mode is on</span>
+  <span>
+    <a href="/dashboard/api">JSON</a> ·
+    <a href="/health">Bridge health</a>
+  </span>
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const stateOf = (v) => (v && v.state) || "info";
+const STATES = ["good", "info", "warn", "critical"];
+
+function pct(x, digits=1) {
+  if (x === null || x === undefined || !isFinite(x)) return "—";
+  return (x * 100).toFixed(digits) + "%";
+}
+function fmt(x, digits=2) {
+  if (x === null || x === undefined || !isFinite(x)) return "—";
+  return Number(x).toFixed(digits);
+}
+function int(x) {
+  if (x === null || x === undefined) return "—";
+  return Number(x).toLocaleString();
+}
+function shortTime(iso) {
+  if (!iso) return "—";
+  return iso.replace("T", " ").replace("+00:00", "").replace("Z", "");
+}
+function pillLabel(state) {
+  return { good: "Healthy", info: "Idle", warn: "Attention", critical: "Critical" }[state] || state;
+}
+function esc(s) {
+  if (s === null || s === undefined) return "";
+  return String(s).replace(/[&<>"']/g, c => (
+    { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]
+  ));
+}
+
+function renderStrip(data) {
+  const tiles = [
+    {
+      name: "Brain",
+      label: "Monte Carlo sim",
+      state: data.brain.state,
+      detail: data.brain.detail,
+    },
+    {
+      name: "Signal",
+      label: "TradingView alert",
+      state: data.signal.state,
+      detail: data.signal.detail,
+    },
+    {
+      name: "Bridge",
+      label: "MC → Bot handoff",
+      state: data.bridge.state,
+      detail: data.bridge.detail,
+    },
+    {
+      name: "Bot",
+      label: "Robinhood executor",
+      state: data.bot.state,
+      detail: data.bot.detail,
+    },
+  ];
+  $("strip").innerHTML = tiles.map(t => `
+    <div class="tile" data-state="${t.state}">
+      <div class="label">${t.label}</div>
+      <div class="name">${t.name}</div>
+      <div class="detail">${esc(t.detail)}</div>
+      <div class="pill">${pillLabel(t.state)}</div>
+    </div>
+  `).join("");
+  $("title").dataset.state = data.overall_state;
+}
+
+function renderRecord(data) {
+  const s = data.brain.stats || {};
+  const settled = s.n_settled_trades || 0;
+  const traded = s.n_trade_verdicts || 0;
+  const logged = s.n_logged || 0;
+  const hit = s.hit_rate;
+  const realized = s.mean_realized_pnl_pct;
+  const calibRatio = s.calibration_ratio;
+
+  $("record").innerHTML = `
+    <div>
+      <div class="fig">${int(logged)}<span class="unit">verdicts</span></div>
+      <div class="cap">Total decisions logged</div>
+    </div>
+    <div>
+      <div class="fig">${int(traded)}<span class="unit">trades</span></div>
+      <div class="cap">TRADE verdicts (not NO_TRADE)</div>
+    </div>
+    <div>
+      <div class="fig">${int(settled)}<span class="unit">settled</span></div>
+      <div class="cap">Matured against real prices</div>
+    </div>
+    <div>
+      <div class="fig">${hit === null || hit === undefined ? "—" : pct(hit, 0)}</div>
+      <div class="cap">Hit rate (settled)</div>
+    </div>
+    <div>
+      <div class="fig">${realized === null || realized === undefined ? "—" : pct(realized, 2)}</div>
+      <div class="cap">Mean realized P&L per trade</div>
+    </div>
+  `;
+
+  const ks = data.brain.kill_switch || {};
+  const ksClass = ks.tripped ? "critical" : (settled >= 20 ? "good" : "info");
+  const ksText = ks.tripped ? "TRIPPED" : (settled >= 20 ? "Clear" : `Inactive (needs 20 settled, have ${settled})`);
+
+  const calibDays = data.brain.calibration_age_days;
+  const calibClass = calibDays === null ? "warn" : (calibDays > 30 ? "warn" : "good");
+  const calibText = calibDays === null ? "no tables" : `${calibDays.toFixed(1)} days ago`;
+
+  const calRatio = calibRatio === null || calibRatio === undefined ? "—" : calibRatio.toFixed(2);
+
+  $("record-detail").innerHTML = `
+    <div class="kv" style="grid-column: 1 / -1;">
+      <span class="k">Kill switch</span>
+      <span class="v ${ksClass}">${ksText}</span>
+    </div>
+    <div class="kv" style="grid-column: 1 / -1;">
+      <span class="k">Calibration tables</span>
+      <span class="v ${calibClass}">${data.brain.calibration_files} tables · last built ${calibText}</span>
+    </div>
+    <div class="kv" style="grid-column: 1 / -1;">
+      <span class="k">Calibration ratio (realized ÷ predicted)</span>
+      <span class="v">${calRatio}<span style="color: var(--dim); margin-left: 6px; letter-spacing: 0.05em;">1.0 = perfectly calibrated</span></span>
+    </div>
+  `;
+}
+
+function renderSignal(data) {
+  const s = data.signal;
+  const rows = [
+    ["Ticker", s.ticker || "—", ""],
+    ["Trend", s.trend || "—", ""],
+    ["RSI", s.rsi === null || s.rsi === undefined ? "—" : fmt(s.rsi, 1), ""],
+    ["Price", s.price ? "$" + fmt(s.price) : "—", ""],
+    ["Received", shortTime(s.received_at_utc) || "never", ""],
+    ["Age", s.age_hours === null || s.age_hours === undefined ? "—" : s.age_hours.toFixed(1) + " h",
+      s.age_hours !== null && s.age_hours > 30 ? "warn" : ""],
+  ];
+  $("signal-detail").innerHTML = rows.map(([k, v, cls]) => `
+    <div class="kv"><span class="k">${k}</span><span class="v ${cls}">${esc(v)}</span></div>
+  `).join("");
+}
+
+function renderBot(data) {
+  const b = data.bot;
+  const live = b.live_trading_enabled;
+  const rows = [
+    ["Bot API", b.reachable ? "Reachable" : "Not reachable", b.reachable ? "good" : "warn"],
+    ["Live trading", live ? "ON" : "OFF (paper)", live ? "critical" : "good"],
+    ["Robinhood MCP", b.mcp_connected ? "Connected" : "Not connected (OAuth pending)", b.mcp_connected ? "good" : "info"],
+    ["Tools available", int(b.tool_count), ""],
+  ];
+  $("bot-detail").innerHTML = rows.map(([k, v, cls]) => `
+    <div class="kv"><span class="k">${k}</span><span class="v ${cls}">${esc(v)}</span></div>
+  `).join("");
+}
+
+function renderVerdicts(data) {
+  const rows = data.verdicts || [];
+  const tbody = $("verdicts").querySelector("tbody");
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td class="dim" colspan="7">No verdicts yet — run <code>paper_train.py</code> or wait for the timer.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(v => `
+    <tr>
+      <td class="dim">${shortTime(v.timestamp_utc)}</td>
+      <td class="ticker">${esc(v.ticker || "—")}</td>
+      <td class="${v.verdict === "TRADE" ? "trade" : "no_trade"}">${esc(v.verdict || "—")}</td>
+      <td>${esc(v.side || "—")}</td>
+      <td>${v.shares ? int(v.shares) : "—"}</td>
+      <td class="dim">${esc(v.source || "")}</td>
+      <td class="dim" title="${esc(v.reason || "")}">${esc((v.reason || "").slice(0, 84))}${v.reason && v.reason.length > 84 ? "…" : ""}</td>
+    </tr>
+  `).join("");
+}
+
+function renderLedger(data) {
+  const rows = (data.bridge.recent || []).slice().reverse();
+  const tbody = $("ledger").querySelector("tbody");
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td class="dim" colspan="4">No bridge decisions yet — verdict files haven't been processed.</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td class="dim">${esc((r.verdict_id || "").replace(".json", ""))}</td>
+      <td class="ticker">${esc(r.ticker || "—")}</td>
+      <td class="${r.mc_verdict === "TRADE" ? "trade" : "no_trade"}">${esc(r.mc_verdict || "—")}</td>
+      <td>${esc(r.outcome || "")}</td>
+    </tr>
+  `).join("");
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/dashboard/api", { cache: "no-store" });
+    const data = await r.json();
+    renderStrip(data);
+    renderRecord(data);
+    renderSignal(data);
+    renderBot(data);
+    renderVerdicts(data);
+    renderLedger(data);
+    $("clock").textContent = shortTime(data.generated_at_utc);
+  } catch (e) {
+    $("clock").textContent = "reload failed";
+  }
+}
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>
