@@ -108,11 +108,12 @@ def fetch_ohlc(ticker: str, years: float = 8.0) -> OHLC:
 # ---------------------------------------------------------------------------
 
 
-def _bucket_shrunk_drift(fwd: np.ndarray, mask: np.ndarray) -> float:
+def _bucket_shrunk_drift(fwd: np.ndarray, mask: np.ndarray,
+                         horizon_days: int = WEEK) -> float:
     """Shrunk forward-return drift for the days selected by ``mask`` (uses the
     same Newey-West + shrinkage contract as calibration)."""
     sample = fwd[mask & np.isfinite(fwd)]
-    st = newey_west_stats(sample, lag=WEEK - 1)
+    st = newey_west_stats(sample, lag=horizon_days - 1)
     raw = st["mean"] if math.isfinite(st["mean"]) else 0.0
     return shrink_mu(raw, st["n_eff"], st["t_stat"])
 
@@ -131,11 +132,14 @@ class Trade:
 def walk_forward_trades(
     ohlc: OHLC,
     *,
+    horizon_days: int = WEEK,
     min_train_days: int = MOM_LOOKBACK_DAYS + 60,
     require_agreement: bool = True,
 ) -> List[Trade]:
-    """Replay the strategy weekly with point-in-time calibration and record
-    each trade's signal-close vs. executable-fill return."""
+    """Replay the strategy at the given holding horizon with point-in-time
+    calibration; record each trade's signal-close vs. executable-fill return.
+    Rebalance cadence == ``horizon_days`` so trades never overlap in time."""
+    h = int(horizon_days)
     close = ohlc.close
     op = ohlc.open
     n = close.size
@@ -147,19 +151,19 @@ def walk_forward_trades(
 
     log_c = np.log(close)
     trades: List[Trade] = []
-    # Decide at t (a "Friday" close); need open[t+1] and open[t+1+WEEK].
-    t = max(min_train_days, EMA_SLOW_LEN + WEEK + 2)
-    while t + WEEK + 1 < n:
+    # Decide at t (a "Friday" close); need open[t+1] and open[t+1+h].
+    t = max(min_train_days, EMA_SLOW_LEN + h + 2)
+    while t + h + 1 < n:
         bkt = buckets[t]
         trend = trends[t]
         if isinstance(bkt, str) and isinstance(trend, str):
             side = "long" if trend == "bullish" else "short"
             # Point-in-time forward returns available strictly before t.
             fwd = np.full(t, np.nan)
-            if t > WEEK:
-                fwd[:t - WEEK] = log_c[WEEK:t] - log_c[:t - WEEK]
+            if t > h:
+                fwd[:t - h] = log_c[h:t] - log_c[:t - h]
             bmask = np.array([buckets[i] == bkt for i in range(t)], dtype=bool)
-            drift = _bucket_shrunk_drift(fwd, bmask)
+            drift = _bucket_shrunk_drift(fwd, bmask, horizon_days=h)
             edge_dir = drift if side == "long" else -drift
             # Momentum lens agreement (point-in-time sign bucket at t).
             mom_ok = True
@@ -168,10 +172,10 @@ def walk_forward_trades(
                 mom_side = ("long" if ms > 0 else "short") if np.isfinite(ms) else None
                 mom_ok = (mom_side == side)
             if edge_dir > 0.0 and (mom_ok or not require_agreement):
-                # signal-close fill: close[t] -> close[t+WEEK]
-                rc = close[t + WEEK] / close[t] - 1.0
-                # executable fill: open[t+1] -> open[t+1+WEEK]
-                re = op[t + 1 + WEEK] / op[t + 1] - 1.0
+                # signal-close fill: close[t] -> close[t+h]
+                rc = close[t + h] / close[t] - 1.0
+                # executable fill: open[t+1] -> open[t+1+h]
+                re = op[t + 1 + h] / op[t + 1] - 1.0
                 if side == "short":
                     rc, re = -rc, -re
                 trades.append(Trade(
@@ -180,7 +184,7 @@ def walk_forward_trades(
                     year=int(ohlc.dates[t].year),
                     both_lenses=bool(mom_ok),
                 ))
-        t += WEEK
+        t += h
     return trades
 
 
@@ -581,6 +585,81 @@ def run_full(
     }
 
 
+def tax_for_horizon(horizon_days: int, short_rate: float,
+                    long_rate: float) -> float:
+    """Long-term cap-gains rate applies only when the position is held longer
+    than one year (~252 trading days); otherwise the ordinary short-term rate."""
+    return long_rate if horizon_days >= 252 else short_rate
+
+
+def run_turnover_sweep(
+    tickers: Sequence[str],
+    *,
+    horizons: Sequence[int] = (5, 21, 63, 126, 252),
+    benchmark: str = "QQQ",
+    years: float = 8.0,
+    cost_side: float = 0.0020,
+    short_tax: float = 0.35,
+    long_tax: float = 0.15,
+    fetch: Callable[[str, float], OHLC] = fetch_ohlc,
+) -> Dict[str, Any]:
+    """Test the Option-B hypothesis: does the (real, pre-cost) signal survive
+    once you trade LESS often? Sweeps holding horizons and reports, for each,
+    the after-cost/after-tax annualized edge and the strategy Sharpe vs the
+    benchmark. Trading frequency = 252/horizon, so cost drag falls with longer
+    holds, and holds >1yr get the long-term tax rate.
+
+    HONEST CAVEAT baked into the output: testing several horizons is itself a
+    multiple-comparisons risk. A single horizon squeaking past is NOT proof.
+    """
+    ohlc_by_ticker = {tk: fetch(tk, years) for tk in tickers}
+    bench = fetch(benchmark, years)
+    bench_stats = benchmark_buy_hold(bench)
+    rows: List[Dict[str, Any]] = []
+    for h in horizons:
+        per_ticker = {tk: walk_forward_trades(ohlc_by_ticker[tk], horizon_days=h)
+                      for tk in tickers}
+        all_tr = [t for ts in per_ticker.values() for t in ts]
+        tpy = TRADING_DAYS_PER_YEAR / float(h)         # trades per year
+        tax = tax_for_horizon(h, short_tax, long_tax)
+        ct = cost_tax_table(all_tr, cost_sides=[cost_side], tax_rate=tax,
+                            trades_per_year=tpy)[0]
+        wk = portfolio_weekly_returns(per_ticker, cost_side=cost_side,
+                                      tax_rate=tax)
+        perf = perf_stats(wk, tpy)
+        beats = (perf["sharpe"] is not None
+                 and math.isfinite(perf["sharpe"])
+                 and math.isfinite(bench_stats["pre_tax"]["sharpe"])
+                 and perf["sharpe"] > bench_stats["pre_tax"]["sharpe"])
+        rows.append({
+            "horizon_days": h,
+            "trades_per_year": tpy,
+            "n_trades": ct["n_trades"],
+            "tax_rate": tax,
+            "gross_annual": ct["gross_annual"],
+            "net_annual": ct["net_annual"],
+            "after_tax_annual": ct["after_tax_annual"],
+            "sharpe": perf["sharpe"],
+            "cagr": perf["cagr"],
+            "max_drawdown": perf["max_drawdown"],
+            "beats_benchmark_riskadj": bool(beats),
+        })
+    any_survivor = any(r["after_tax_annual"] > 0 and r["beats_benchmark_riskadj"]
+                       for r in rows)
+    return {
+        "tickers": list(tickers),
+        "benchmark": benchmark,
+        "benchmark_sharpe": bench_stats["pre_tax"]["sharpe"],
+        "benchmark_cagr": bench_stats["pre_tax"]["cagr"],
+        "cost_side": cost_side,
+        "short_tax": short_tax,
+        "long_tax": long_tax,
+        "rows": rows,
+        "any_survivor": any_survivor,
+        "n_horizons_tested": len(horizons),
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--tickers", nargs="+", default=["SPY", "QQQ", "NVDA", "AAPL"])
@@ -588,8 +667,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--years", type=float, default=8.0)
     ap.add_argument("--tax-rate", type=float, default=0.35)
     ap.add_argument("--out", default="VALIDATION.md")
+    ap.add_argument("--sweep", action="store_true",
+                    help="Option B: sweep holding horizons (weekly→annual) to "
+                         "test whether trading LESS often survives cost+tax.")
+    ap.add_argument("--horizons", type=int, nargs="+",
+                    default=[5, 21, 63, 126, 252],
+                    help="holding horizons in trading days (with --sweep)")
     args = ap.parse_args(argv)
+
     try:
+        if args.sweep:
+            sweep = run_turnover_sweep(
+                args.tickers, horizons=args.horizons, benchmark=args.benchmark,
+                years=args.years, short_tax=args.tax_rate)
+            from validation_report import write_turnover_report
+            path = write_turnover_report(sweep, Path(args.out))
+            print(f"Wrote {path}")
+            return 0
         result = run_full(args.tickers, benchmark=args.benchmark,
                           years=args.years, tax_rate=args.tax_rate)
     except Exception as exc:  # noqa: BLE001

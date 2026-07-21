@@ -248,6 +248,76 @@ def test_zero_edge_world_does_not_survive(tmp_path: Path):
     assert "do not deploy" in text.lower()
 
 
+def test_horizon_changes_cadence_and_trade_count():
+    ohlc = regime_ohlc(2000, seed=21)
+    weekly = ve.walk_forward_trades(ohlc, horizon_days=5, require_agreement=False)
+    monthly = ve.walk_forward_trades(ohlc, horizon_days=21, require_agreement=False)
+    # trading less often -> fewer trades, and cadence == horizon
+    assert len(monthly) < len(weekly)
+    idxs = [list(ohlc.dates).index(pd.Timestamp(t.entry_date)) for t in monthly]
+    assert np.all(np.diff(idxs) >= 21)
+
+
+def test_tax_rate_switches_to_long_term_over_one_year():
+    assert ve.tax_for_horizon(21, 0.35, 0.15) == 0.35     # monthly = short-term
+    assert ve.tax_for_horizon(252, 0.35, 0.15) == 0.15    # annual = long-term
+    assert ve.tax_for_horizon(126, 0.35, 0.15) == 0.35    # <1yr still short
+
+
+def test_cost_drag_falls_with_fewer_trades():
+    # same per-trade gross, but annualizing over 12 vs 52 trades/yr means the
+    # annual cost drag is far smaller for the monthly cadence.
+    trades = [ve.Trade(pd.Timestamp("2020-01-01"), "long", "b", 0.02, 0.02,
+                       2020, True)]
+    weekly = ve.cost_tax_table(trades, cost_sides=[0.002], tax_rate=0.35,
+                               trades_per_year=52.0)[0]
+    monthly = ve.cost_tax_table(trades, cost_sides=[0.002], tax_rate=0.35,
+                                trades_per_year=12.0)[0]
+    weekly_drag = weekly["gross_annual"] - weekly["net_annual"]
+    monthly_drag = monthly["gross_annual"] - monthly["net_annual"]
+    assert monthly_drag < weekly_drag
+
+
+def test_turnover_sweep_zero_edge_has_no_survivor(tmp_path: Path):
+    fetch = _fetch_factory(lambda s: gbm_ohlc(2200, seed=s, mu_annual=0.0))
+
+    def f(ticker, years):
+        return (gbm_ohlc(2200, seed=999, mu_annual=0.10) if ticker == "QQQ"
+                else gbm_ohlc(2200, seed=abs(hash(ticker)) % 9999, mu_annual=0.0))
+
+    sweep = ve.run_turnover_sweep(["AAA", "BBB"], horizons=[5, 21, 63],
+                                  benchmark="QQQ", years=8.0, fetch=f)
+    assert sweep["any_survivor"] is False
+    out = vr.write_turnover_report(sweep, tmp_path / "T.md")
+    assert "No holding horizon survives" in out.read_text()
+
+
+def test_turnover_report_renders_survivor_path(tmp_path: Path):
+    # hand-built sweep with a clear survivor row -> report must flag it as a
+    # LEAD, not a green light, and still print the caveats.
+    sweep = {
+        "tickers": ["AAA"], "benchmark": "QQQ",
+        "benchmark_sharpe": 0.8, "benchmark_cagr": 0.15,
+        "cost_side": 0.002, "short_tax": 0.35, "long_tax": 0.15,
+        "n_horizons_tested": 3,
+        "rows": [
+            {"horizon_days": 5, "trades_per_year": 52, "n_trades": 400,
+             "tax_rate": 0.35, "gross_annual": 0.28, "net_annual": -0.05,
+             "after_tax_annual": -0.10, "sharpe": -0.5, "cagr": -0.1,
+             "max_drawdown": -0.3, "beats_benchmark_riskadj": False},
+            {"horizon_days": 252, "trades_per_year": 1, "n_trades": 30,
+             "tax_rate": 0.15, "gross_annual": 0.20, "net_annual": 0.18,
+             "after_tax_annual": 0.16, "sharpe": 1.1, "cagr": 0.16,
+             "max_drawdown": -0.2, "beats_benchmark_riskadj": True},
+        ],
+        "any_survivor": True,
+    }
+    out = vr.write_turnover_report(sweep, tmp_path / "T.md")
+    text = out.read_text()
+    assert "lead" in text.lower() and "NOT a green light" in text
+    assert "Multiple testing" in text
+
+
 def test_planted_edge_can_survive(tmp_path: Path):
     # Strong planted conditional edge, benchmark is flat noise → strategy
     # should clear the (low-friction synthetic) bar. Proves the harness is

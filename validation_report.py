@@ -188,3 +188,78 @@ def write_report(result: Dict[str, Any], out: Path,
 
     out.write_text("\n".join(L) + "\n", encoding="utf-8")
     return out
+
+
+_HORIZON_NAME = {5: "weekly", 21: "monthly", 63: "quarterly",
+                 126: "semi-annual", 252: "annual (long-term tax)"}
+
+
+def write_turnover_report(sweep: Dict[str, Any], out: Path) -> Path:
+    """Render the Option-B holding-horizon sweep. The verdict is computed:
+    a horizon 'works' only if its after-tax edge > 0 AND it beats the
+    benchmark's Sharpe. Multiple-testing risk is stated, not hidden."""
+    L: list[str] = []
+    A = L.append
+    A("# VALIDATION_TURNOVER.md — does trading LESS often survive? (paper only)\n")
+    A(f"*Tickers: {', '.join(sweep['tickers'])} · benchmark {sweep['benchmark']} "
+      f"(Sharpe {_num(sweep['benchmark_sharpe'])}, CAGR "
+      f"{_pct(sweep['benchmark_cagr'])}) · cost {sweep['cost_side']*100:.2f}%/side · "
+      f"short-term tax {sweep['short_tax']:.0%}, long-term {sweep['long_tax']:.0%}.*\n")
+
+    survivors = [r for r in sweep["rows"]
+                 if r["after_tax_annual"] > 0 and r["beats_benchmark_riskadj"]]
+
+    A("## VERDICT\n")
+    if not survivors:
+        A("**No holding horizon survives.** Trading less often reduces the cost "
+          "and tax drag, but at no tested horizon does the after-tax edge turn "
+          "positive AND beat the benchmark on a risk-adjusted basis. The "
+          "signal's pre-cost edge is real but too small to clear real-world "
+          "frictions at any turnover. **Recommendation: do not deploy at any "
+          "frequency — hold the index.**\n")
+    else:
+        names = ", ".join(f"{_HORIZON_NAME.get(r['horizon_days'], str(r['horizon_days'])+'d')}"
+                          for r in survivors)
+        A(f"**{len(survivors)} of {sweep['n_horizons_tested']} tested horizons "
+          f"clear the bar** ({names}): after-tax edge > 0 AND Sharpe beats "
+          f"{sweep['benchmark']}. **This is a lead, NOT a green light** — see "
+          f"the multiple-testing caveat below before believing it.\n")
+
+    A("## Horizon sweep\n")
+    A("| Hold | Trades/yr | N | Tax | Gross ann. | After cost | After cost+tax | "
+      "Sharpe | Beats bench? |")
+    A("|---|---|---|---|---|---|---|---|---|")
+    for r in sweep["rows"]:
+        name = _HORIZON_NAME.get(r["horizon_days"], f"{r['horizon_days']}d")
+        A(f"| {name} ({r['horizon_days']}d) | {r['trades_per_year']:.0f} | "
+          f"{r['n_trades']} | {r['tax_rate']:.0%} | {_pct(r['gross_annual'])} | "
+          f"{_pct(r['net_annual'])} | {_pct(r['after_tax_annual'])} | "
+          f"{_num(r['sharpe'])} | {'YES' if r['beats_benchmark_riskadj'] else 'no'} |")
+    A("")
+
+    A("## The honest caveats (read before acting)\n")
+    A(f"1. **Multiple testing.** {sweep['n_horizons_tested']} horizons were "
+      "tried. If one squeaks past, that can be luck from taking several shots "
+      "at the same data — the same trap the walk-forward is meant to avoid. A "
+      "result is only believable if it wins by a **clear margin**, not a "
+      "knife-edge, and ideally at more than one adjacent horizon.")
+    A("2. **Fewer trades = weaker statistics.** A yearly hold over 8 years is "
+      "~8 non-overlapping bets per name. 'It beat the benchmark' on a handful "
+      "of bets is barely distinguishable from chance — check the trade count "
+      "(N) column and distrust any row with a small N.")
+    A("3. **Longer holds ≈ closet index.** As the hold lengthens the strategy "
+      "increasingly just owns the same trending names the benchmark owns; a "
+      "narrow win may be leverage/selection noise, not a distinct edge.")
+    A("4. **Still no bear evidence.** Longer holds don't create downturn "
+      "history that isn't in the 2018–2026 window. A horizon that 'wins' here "
+      "is still untested in a sustained bear market.\n")
+
+    A("## What a real 'yes' would require (not done here)\n")
+    A("- The winning horizon holds up on a **held-out later slice** it was not "
+      "chosen on.\n- It wins by a margin that survives a multiple-testing "
+      "correction (e.g. Bonferroni across the horizons tried).\n- The trade "
+      "count is large enough that the Sharpe has a tight confidence interval.\n"
+      "Until then, treat any survivor as a hypothesis to test further, not a "
+      "system to fund.\n")
+    out.write_text("\n".join(L) + "\n", encoding="utf-8")
+    return out
