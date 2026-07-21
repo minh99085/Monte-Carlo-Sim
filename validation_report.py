@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""
+validation_report.py — render a run_full() result dict into VALIDATION.md.
+
+The verdict paragraph is computed from the numbers, not written by hand: the
+edge "survives" only if, after executable fills + mid-level (0.20%/side) cost
++ tax, the strategy's after-tax risk-adjusted return beats the benchmark's.
+If it does not, the report says so at the top, unsoftened.
+"""
+
+from __future__ import annotations
+
+import math
+from pathlib import Path
+from typing import Any, Dict
+
+
+def _pct(x, nd: int = 2) -> str:
+    if x is None or (isinstance(x, float) and not math.isfinite(x)):
+        return "n/a"
+    return f"{100 * x:+.{nd}f}%"
+
+
+def _num(x, nd: int = 2) -> str:
+    if x is None or (isinstance(x, float) and not math.isfinite(x)):
+        return "n/a"
+    return f"{x:.{nd}f}"
+
+
+def compute_verdict(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Derive the pass/fail verdict from the numbers."""
+    ct = result["cost_tax"]
+    mid = next((r for r in ct if abs(r["cost_per_side"] - 0.0020) < 1e-9), ct[0])
+    strat = result["strategy_perf"]
+    bench = result["benchmark_perf"]["pre_tax"]
+    after_tax_edge = mid["after_tax_annual"]
+    strat_sharpe = strat.get("sharpe")
+    bench_sharpe = bench.get("sharpe")
+
+    beats_bench = (
+        strat_sharpe is not None and bench_sharpe is not None
+        and math.isfinite(strat_sharpe) and math.isfinite(bench_sharpe)
+        and strat_sharpe > bench_sharpe
+    )
+    positive_after_tax = after_tax_edge > 0.0
+    down = result["regime"]["down_tape"]
+    has_bear_evidence = bool(down.get("n")) and (down.get("mean_net") or 0) > 0
+
+    survives = bool(positive_after_tax and beats_bench)
+    return {
+        "survives": survives,
+        "after_tax_annual_edge": after_tax_edge,
+        "beats_benchmark_riskadj": beats_bench,
+        "strat_sharpe": strat_sharpe,
+        "bench_sharpe": bench_sharpe,
+        "has_bear_evidence": has_bear_evidence,
+        "fill_decay_annual": result["edge"]["fill_decay"] * 52,
+    }
+
+
+def write_report(result: Dict[str, Any], out: Path,
+                 *, tax_rate: float = 0.35) -> Path:
+    v = compute_verdict(result)
+    e = result["edge"]
+    L: list[str] = []
+    A = L.append
+
+    # ---- verdict (top) ----
+    A("# VALIDATION.md — edge validity (paper only)\n")
+    A(f"*Tickers: {', '.join(result['tickers'])} · benchmark {result['benchmark']} "
+      f"· {result['n_trades']} walk-forward trades · tax {tax_rate:.0%} (short-term).*\n")
+    A("## VERDICT\n")
+    if v["survives"]:
+        A(f"**The edge SURVIVES the honest tests** (provisionally). After "
+          f"executable next-open fills, 0.20%/side round-trip cost, and a "
+          f"{tax_rate:.0%} short-term tax drag, the annualized after-tax edge is "
+          f"**{_pct(v['after_tax_annual_edge'])}**, and the strategy's Sharpe "
+          f"({_num(v['strat_sharpe'])}) exceeds {result['benchmark']} buy-hold "
+          f"({_num(v['bench_sharpe'])}). This is necessary but NOT sufficient: "
+          f"note the fill decay, the bear-market evidence, and the sizing "
+          f"section before risking capital.\n")
+    else:
+        A(f"**The edge does NOT survive.** After executable next-open fills, "
+          f"0.20%/side cost, and a {tax_rate:.0%} short-term tax drag, the "
+          f"annualized after-tax edge is **{_pct(v['after_tax_annual_edge'])}** "
+          f"and the strategy's risk-adjusted return (Sharpe "
+          f"{_num(v['strat_sharpe'])}) does {'' if v['beats_benchmark_riskadj'] else 'NOT '}"
+          f"beat {result['benchmark']} buy-hold (Sharpe {_num(v['bench_sharpe'])}). "
+          f"**Recommendation: do not deploy.** Trading this costs money and "
+          f"underperforms simply holding the index. The apparent edge in the "
+          f"paper log is an artifact of clean-close fills and untaxed, "
+          f"cost-free settlement.\n")
+
+    # ---- item 1 ----
+    A("## 1 — Executable fills\n")
+    A("| Fill | Mean/trade | Annualized |")
+    A("|---|---|---|")
+    A(f"| Signal-bar close | {_pct(e['signal_close_mean'])} | {_pct(e['signal_close_annual'])} |")
+    A(f"| Next executable open | {_pct(e['executable_mean'])} | {_pct(e['executable_annual'])} |")
+    A(f"\nFill decay (close − executable): **{_pct(e['fill_decay'])}/trade "
+      f"≈ {_pct(v['fill_decay_annual'])}/yr**. This is the return the paper "
+      f"log claims but the bot cannot capture.\n")
+
+    # ---- item 2 ----
+    A("## 2 — Full cost + tax model (executable fills)\n")
+    A("| Cost/side | Round trip | Gross ann. | Net ann. | After-tax ann. |")
+    A("|---|---|---|---|---|")
+    for r in result["cost_tax"]:
+        A(f"| {r['cost_per_side']*100:.2f}% | {r['cost_per_side']*200:.2f}% | "
+          f"{_pct(r['gross_annual'])} | {_pct(r['net_annual'])} | "
+          f"{_pct(r['after_tax_annual'])} |")
+    A("")
+
+    # ---- item 3 ----
+    A("## 3 — Benchmark, risk-adjusted, after-tax\n")
+    s, b = result["strategy_perf"], result["benchmark_perf"]
+    bp = b["pre_tax"]
+    A("| Metric | Strategy (net+tax) | " + result["benchmark"] + " buy-hold (pre-tax) |")
+    A("|---|---|---|")
+    A(f"| Sharpe | {_num(s['sharpe'])} | {_num(bp['sharpe'])} |")
+    A(f"| Sortino | {_num(s['sortino'])} | {_num(bp['sortino'])} |")
+    A(f"| Max drawdown | {_pct(s['max_drawdown'])} | {_pct(bp['max_drawdown'])} |")
+    A(f"| CAGR | {_pct(s['cagr'])} | {_pct(bp['cagr'])} |")
+    A(f"\n{result['benchmark']} after a single terminal long-term cap-gains tax: "
+      f"CAGR {_pct(b['after_tax_cagr'])} (buy-hold defers tax until sale — the "
+      f"weekly strategy pays the ordinary rate every trade). "
+      f"**One sentence: after costs and taxes, the strategy "
+      f"{'DOES' if v['beats_benchmark_riskadj'] else 'does NOT'} beat holding "
+      f"{result['benchmark']} on a risk-adjusted basis.**\n")
+
+    # ---- item 4 ----
+    A("## 4 — Regime / downside evidence\n")
+    A("| Year | Trades | Mean net/trade | Hit rate | Year total |")
+    A("|---|---|---|---|---|")
+    for y, row in result["regime"]["by_year"].items():
+        A(f"| {y} | {row['n']} | {_pct(row['mean_net'])} | "
+          f"{row['hit_rate']*100:.0f}% | {_pct(row['total'])} |")
+    d = result["regime"]["down_tape"]
+    A(f"\n**Bear tape** ({result['benchmark']} drawdown > 10%): "
+      f"{d['n']} trades, mean net {_pct(d['mean_net'])}, "
+      f"hit rate {(_num(d['hit_rate']*100,0)+'%') if d['hit_rate'] is not None else 'n/a'}, "
+      f"total {_pct(d['total'])}.")
+    if not d["n"]:
+        A("\n**There is essentially NO bear-market evidence** — the strategy "
+          "barely trades in downturns, so the entire edge is a bull-phase "
+          "phenomenon. Treat any positive headline number as untested where "
+          "it matters most.\n")
+    else:
+        A("")
+
+    # ---- item 5 ----
+    A("## 5 — Statistical honesty\n")
+    lc = result["lens_corr"]
+    A(f"**(a) Lens independence.** EMA/RSI-trend vs 12-1 momentum: "
+      f"Pearson **{_num(lc.get('pearson'))}**, sign-agreement "
+      f"**{(_num(lc.get('sign_agreement')*100,0)+'%') if lc.get('sign_agreement') is not None else 'n/a'}**. "
+      f"They are NOT independent — both are trend proxies.")
+    al = result["agreement_lift"]
+    A(f"Agreement filter marginal lift over one lens: mean "
+      f"{_pct(al.get('marginal_mean_lift'))}, hit-rate "
+      f"{(_num(al.get('marginal_hit_lift')*100,0)+'pp') if al.get('marginal_hit_lift') is not None else 'n/a'}. "
+      f"If the lift is small, 'two witnesses' is really one witness wearing two hats.\n")
+    en = result["effective_n"]
+    A(f"**(b) Effective bets behind the 20-trade kill-switch.** Avg pairwise "
+      f"correlation of concurrent names **{_num(en.get('rho_bar'))}** → "
+      f"**N_effective ≈ {_num(en.get('n_eff'),1)}** independent bets, not 20. "
+      f"The kill-switch is a comfort blanket at roughly "
+      f"{_num(en.get('n_eff'),0)}-bet resolution.\n")
+    k = result["kelly"]
+    if "edge_point" in k:
+        A(f"**(c) Edge CI + Kelly under uncertainty.** Per-trade edge "
+          f"{_pct(k['edge_point'])} (95% CI {_pct(k['edge_ci_lo'])} … "
+          f"{_pct(k['edge_ci_hi'])}). Kelly f* at the point estimate "
+          f"{_num(k['f_star_point'])}, at the CI lower bound "
+          f"{_num(k['f_star_ci_lo'])}, at half-edge {_num(k['f_star_half'])}, "
+          f"at zero-edge 0. Deployed quarter-Kelly of the point estimate = "
+          f"{_num(k['deployed_quarter_kelly'])}. **If the true edge is half the "
+          f"estimate, current sizing over-bets by "
+          f"{_num(k['overbet_factor_if_true_edge_half'],1)}×** — and if the CI "
+          f"lower bound is ≤ 0, the honest Kelly fraction is 0 (do not bet).\n")
+
+    A("## Out of scope (flagged, not built)\n")
+    A("- **shorts→puts** is NOT implemented. A long put does not pay off "
+      "linearly with the underlying (delta<1, theta, vega); mapping an "
+      "equity-calibrated edge onto options is a silent category error. If "
+      "options are ever pursued they need their own option-level calibration "
+      "— a separate project.\n")
+
+    out.write_text("\n".join(L) + "\n", encoding="utf-8")
+    return out
