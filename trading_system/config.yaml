@@ -5,7 +5,9 @@ DRY_RUN: true
 universe:
   tickers: [SPY, QQQ, XLK, NVDA, AAPL, MSFT]
   benchmark: SPY
-  years: 8.0
+  # 12y so the reconstructed EMA-cross stream clears the 100-signal minimum
+  # per symbol (8y yields ~80-95 after feature warm-up — under the bar).
+  years: 12.0
 
 signals:
   # Minimum historical signals per symbol before ANY modeling is allowed.

@@ -466,8 +466,10 @@ def main(argv=None) -> int:
     ap.add_argument("--workdir", default=".")
     args = ap.parse_args(argv)
     report = run_gauntlet(evaluate_holdout=args.holdout, workdir=args.workdir)
-    print(json.dumps({k: report[k] for k in ("gates", "ready", "verdict")
-                      if k in report}, indent=2, default=str))
+    keys = ("stopped", "details", "insufficient_symbols", "auc_by_symbol",
+            "gates", "risk_overlay", "ready", "verdict")
+    print(json.dumps({k: report[k] for k in keys if k in report},
+                     indent=2, default=str))
     return 0 if report.get("ready") else 1
 
 
