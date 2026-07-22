@@ -660,6 +660,85 @@ def run_turnover_sweep(
     }
 
 
+def run_horizon_confirm(
+    tickers: Sequence[str],
+    *,
+    horizon_days: int,
+    benchmark: str = "QQQ",
+    years: float = 8.0,
+    cost_side: float = 0.0003,
+    short_tax: float = 0.35,
+    long_tax: float = 0.15,
+    fetch: Callable[[str, float], OHLC] = fetch_ohlc,
+) -> Dict[str, Any]:
+    """Stability confirmation for ONE pre-chosen horizon.
+
+    The sweep picked this horizon using the whole window — a multiple-testing
+    risk. This check asks: does it beat the benchmark in BOTH halves of the
+    period independently? A real edge should show up in each half; a lucky
+    stretch shows up in one. Also reports the consistency profile the owner
+    actually cares about: win rate together with the size of the losses.
+    """
+    h = int(horizon_days)
+    tax = tax_for_horizon(h, short_tax, long_tax)
+    per_ticker = {tk: walk_forward_trades(fetch(tk, years), horizon_days=h)
+                  for tk in tickers}
+    bench = fetch(benchmark, years)
+    all_trades = sorted((t for ts in per_ticker.values() for t in ts),
+                        key=lambda t: t.entry_date)
+    if len(all_trades) < 8:
+        return {"error": f"only {len(all_trades)} trades — too few to split"}
+    mid_date = all_trades[len(all_trades) // 2].entry_date
+
+    def half_stats(trades: List[Trade], bench_ohlc: OHLC,
+                   date_lo, date_hi) -> Dict[str, Any]:
+        per = {tk: [t for t in ts if date_lo <= t.entry_date < date_hi]
+               for tk, ts in per_ticker.items()}
+        wk = portfolio_weekly_returns(per, cost_side=cost_side, tax_rate=tax)
+        st = perf_stats(wk, TRADING_DAYS_PER_YEAR / h)
+        b_mask = (bench_ohlc.dates >= date_lo) & (bench_ohlc.dates < date_hi)
+        b_close = bench_ohlc.close[np.asarray(b_mask)]
+        b_r = b_close[1:] / b_close[:-1] - 1.0 if b_close.size > 2 else np.array([])
+        b_st = perf_stats(b_r, TRADING_DAYS_PER_YEAR)
+        nets = [(1.0 + t.r_executable) * (1.0 - cost_side) ** 2 - 1.0
+                for t in trades]
+        nets_arr = np.array(nets, dtype=float)
+        losses = np.sort(nets_arr[nets_arr < 0])
+        return {
+            "n_trades": len(trades),
+            "strategy": st,
+            "benchmark": b_st,
+            "beats": bool(math.isfinite(st["sharpe"])
+                          and math.isfinite(b_st["sharpe"])
+                          and st["sharpe"] > b_st["sharpe"]),
+            "win_rate": float(np.mean(nets_arr > 0)) if nets_arr.size else None,
+            "avg_win": float(np.mean(nets_arr[nets_arr > 0]))
+            if (nets_arr > 0).any() else None,
+            "avg_loss": float(np.mean(losses)) if losses.size else None,
+            "worst_losses": [float(x) for x in losses[:5]],
+        }
+
+    lo = min(t.entry_date for t in all_trades)
+    hi = max(t.entry_date for t in all_trades) + pd.Timedelta(days=1)
+    first = half_stats([t for t in all_trades if t.entry_date < mid_date],
+                       bench, lo, mid_date)
+    second = half_stats([t for t in all_trades if t.entry_date >= mid_date],
+                        bench, mid_date, hi)
+    overall = half_stats(all_trades, bench, lo, hi)
+    return {
+        "tickers": list(tickers),
+        "benchmark": benchmark,
+        "horizon_days": h,
+        "cost_side": cost_side,
+        "tax_rate": tax,
+        "split_date": str(pd.Timestamp(mid_date).date()),
+        "first_half": first,
+        "second_half": second,
+        "overall": overall,
+        "stable": bool(first["beats"] and second["beats"]),
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     ap.add_argument("--tickers", nargs="+", default=["SPY", "QQQ", "NVDA", "AAPL"])
@@ -678,9 +757,22 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "= 0.20%%). Robinhood is commission-free; for liquid "
                          "ETFs/megacaps the realistic cost is the half-spread, "
                          "~0.0002-0.0005 (0.02-0.05%%).")
+    ap.add_argument("--confirm", type=int, default=None, metavar="HORIZON",
+                    help="stability check for ONE horizon (trading days): "
+                         "must beat the benchmark in BOTH halves of history "
+                         "independently, else the sweep pick was luck.")
     args = ap.parse_args(argv)
 
     try:
+        if args.confirm:
+            res = run_horizon_confirm(
+                args.tickers, horizon_days=args.confirm,
+                benchmark=args.benchmark, years=args.years,
+                cost_side=args.cost_side, short_tax=args.tax_rate)
+            from validation_report import write_confirm_report
+            path = write_confirm_report(res, Path(args.out))
+            print(f"Wrote {path}")
+            return 0
         if args.sweep:
             sweep = run_turnover_sweep(
                 args.tickers, horizons=args.horizons, benchmark=args.benchmark,

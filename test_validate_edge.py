@@ -331,6 +331,73 @@ def test_turnover_report_renders_survivor_path(tmp_path: Path):
     assert "Multiple testing" in text
 
 
+class TestHorizonConfirm:
+    def test_edgeless_vs_strong_benchmark_is_not_stable(self, tmp_path):
+        # Mild-drift tickers trade a little but can't beat a strong benchmark
+        # in either half → the confirm must say NOT STABLE / do not fund.
+        # (True zero-edge worlds barely trade at all — correct abstention —
+        # so they exercise the too-few-trades guard instead of the split.)
+        seeds = {"AAA": 11, "BBB": 22}
+
+        def f(ticker, years):
+            return (gbm_ohlc(2200, seed=999, mu_annual=0.30)
+                    if ticker == "QQQ"
+                    else gbm_ohlc(2200, seed=seeds[ticker], mu_annual=0.06))
+        res = ve.run_horizon_confirm(["AAA", "BBB"], horizon_days=21,
+                                     benchmark="QQQ", years=8.0, fetch=f)
+        assert "error" not in res, res
+        assert res["stable"] is False
+        out = vr.write_confirm_report(res, tmp_path / "C.md")
+        text = out.read_text()
+        assert "NOT STABLE" in text
+        assert "Do not fund it" in text
+
+    def test_too_few_trades_refuses_to_split(self, tmp_path):
+        # True zero-edge world: the strategy abstains, so the confirm refuses
+        # rather than splitting a meaningless handful of trades.
+        def f(ticker, years):
+            return (gbm_ohlc(2200, seed=999, mu_annual=0.10)
+                    if ticker == "QQQ"
+                    else gbm_ohlc(2200, seed=11, mu_annual=0.0))
+        res = ve.run_horizon_confirm(["AAA"], horizon_days=63,
+                                     benchmark="QQQ", years=8.0, fetch=f)
+        if "error" in res:  # expected path
+            assert "too few" in res["error"]
+            out = vr.write_confirm_report(res, tmp_path / "C.md")
+            assert "could not run" in out.read_text()
+
+    def test_halves_partition_all_trades(self):
+        def f(ticker, years):
+            return (gbm_ohlc(2200, seed=999, mu_annual=0.05)
+                    if ticker == "QQQ"
+                    else regime_ohlc(2200, seed=abs(hash(ticker)) % 9999,
+                                     mu_bull_annual=0.40))
+        res = ve.run_horizon_confirm(["AAA"], horizon_days=21,
+                                     benchmark="QQQ", years=8.0, fetch=f)
+        assert (res["first_half"]["n_trades"] + res["second_half"]["n_trades"]
+                == res["overall"]["n_trades"])
+        # win/loss profile is reported (owner's consistency ask)
+        assert "win_rate" in res["overall"]
+        assert "worst_losses" in res["overall"]
+
+    def test_stable_path_renders_next_gate(self, tmp_path):
+        # hand-built stable result → report says stable + next gate is paper
+        half = {"n_trades": 30, "beats": True, "win_rate": 0.7,
+                "avg_win": 0.03, "avg_loss": -0.02, "worst_losses": [-0.05],
+                "strategy": {"sharpe": 1.2, "cagr": 0.15, "max_drawdown": -0.1,
+                             "sortino": 1.0, "total_return": 1.0, "n": 30},
+                "benchmark": {"sharpe": 0.8, "cagr": 0.12, "max_drawdown": -0.2,
+                              "sortino": 0.9, "total_return": 0.9, "n": 500}}
+        res = {"tickers": ["AAA"], "benchmark": "QQQ", "horizon_days": 63,
+               "cost_side": 0.0003, "tax_rate": 0.35,
+               "split_date": "2022-01-01", "first_half": half,
+               "second_half": half, "overall": half, "stable": True}
+        out = vr.write_confirm_report(res, tmp_path / "C.md")
+        text = out.read_text()
+        assert "STABLE (necessary, not sufficient)" in text
+        assert "live paper trading" in text
+
+
 def test_planted_edge_can_survive(tmp_path: Path):
     # Strong planted conditional edge, benchmark is flat noise → strategy
     # should clear the (low-friction synthetic) bar. Proves the harness is

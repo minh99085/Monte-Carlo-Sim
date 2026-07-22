@@ -194,6 +194,68 @@ _HORIZON_NAME = {5: "weekly", 21: "monthly", 63: "quarterly",
                  126: "semi-annual", 252: "annual (long-term tax)"}
 
 
+def write_confirm_report(res: Dict[str, Any], out: Path) -> Path:
+    """Render the one-horizon stability confirmation."""
+    L: list[str] = []
+    A = L.append
+    if "error" in res:
+        A("# CONFIRM — could not run\n")
+        A(res["error"])
+        out.write_text("\n".join(L) + "\n", encoding="utf-8")
+        return out
+    name = _HORIZON_NAME.get(res["horizon_days"], f"{res['horizon_days']}d")
+    A(f"# CONFIRM — is the {name} edge stable, or one lucky stretch?\n")
+    A(f"*Tickers: {', '.join(res['tickers'])} · benchmark {res['benchmark']} · "
+      f"cost {res['cost_side']*100:.2f}%/side · tax {res['tax_rate']:.0%} · "
+      f"history split at {res['split_date']}.*\n")
+
+    A("## VERDICT\n")
+    if res["stable"]:
+        A(f"**STABLE (necessary, not sufficient).** The {name} strategy beats "
+          f"{res['benchmark']} risk-adjusted in BOTH halves of history "
+          f"independently. That survives the 'one lucky stretch' objection — "
+          f"but both halves are still the same bull decade, so the honest "
+          f"next gate is live paper trading at this cadence, not real money.\n")
+    else:
+        which = ("first" if not res["first_half"]["beats"] else "second")
+        A(f"**NOT STABLE.** The {name} strategy fails to beat "
+          f"{res['benchmark']} in the {which} half of history. The sweep's "
+          f"'winner' was carried by one stretch — treat it as luck, not edge. "
+          f"**Do not fund it.**\n")
+
+    def half_block(title: str, hb: Dict[str, Any]) -> None:
+        s, b = hb["strategy"], hb["benchmark"]
+        A(f"## {title}\n")
+        A("| Metric | Strategy | " + res["benchmark"] + " |")
+        A("|---|---|---|")
+        A(f"| Sharpe | {_num(s['sharpe'])} | {_num(b['sharpe'])} |")
+        A(f"| CAGR | {_pct(s['cagr'])} | {_pct(b['cagr'])} |")
+        A(f"| Max drawdown | {_pct(s['max_drawdown'])} | {_pct(b['max_drawdown'])} |")
+        A(f"| Beats benchmark? | **{'YES' if hb['beats'] else 'no'}** | — |")
+        wr = hb.get("win_rate")
+        aw, al = hb.get("avg_win"), hb.get("avg_loss")
+        A(f"\nTrades {hb['n_trades']} · win rate "
+          f"{(str(round(wr*100)) + '%') if wr is not None else 'n/a'} · "
+          f"avg win {_pct(aw)} · avg loss {_pct(al)} · worst losses: "
+          + (", ".join(_pct(x) for x in hb.get("worst_losses") or []) or "none")
+          + "\n")
+
+    half_block(f"First half (→ {res['split_date']})", res["first_half"])
+    half_block(f"Second half ({res['split_date']} →)", res["second_half"])
+    half_block("Overall", res["overall"])
+
+    A("## What this does and does not prove\n")
+    A("- Passing means the edge was not carried by a single stretch of the "
+      "2018–2026 window. It does NOT create bear-market evidence, and it does "
+      "not remove the closet-index concern — the strategy owns the same "
+      "trending mega-caps the benchmark owns.\n"
+      "- The only remaining honest gate before small real money: **live paper "
+      "trading at this cadence**, scored by the same settlement machinery, "
+      "matching the backtest's predictions within reason.\n")
+    out.write_text("\n".join(L) + "\n", encoding="utf-8")
+    return out
+
+
 def write_turnover_report(sweep: Dict[str, Any], out: Path) -> Path:
     """Render the Option-B holding-horizon sweep. The verdict is computed:
     a horizon 'works' only if its after-tax edge > 0 AND it beats the
