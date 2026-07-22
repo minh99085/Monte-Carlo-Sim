@@ -200,7 +200,7 @@ def _annualize_per_trade(mean_per_trade: float, trades_per_year: float) -> float
 def cost_tax_table(
     trades: Sequence[Trade],
     *,
-    cost_sides: Sequence[float] = (0.0010, 0.0020, 0.0040),
+    cost_sides: Sequence[float] = (0.0005, 0.0010, 0.0020, 0.0040),
     tax_rate: float = 0.35,
     trades_per_year: float = 52.0,
     fill: str = "executable",
@@ -673,13 +673,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--horizons", type=int, nargs="+",
                     default=[5, 21, 63, 126, 252],
                     help="holding horizons in trading days (with --sweep)")
+    ap.add_argument("--cost-side", type=float, default=0.0020,
+                    help="one-way trading cost as a fraction (default 0.0020 "
+                         "= 0.20%%). Robinhood is commission-free; for liquid "
+                         "ETFs/megacaps the realistic cost is the half-spread, "
+                         "~0.0002-0.0005 (0.02-0.05%%).")
     args = ap.parse_args(argv)
 
     try:
         if args.sweep:
             sweep = run_turnover_sweep(
                 args.tickers, horizons=args.horizons, benchmark=args.benchmark,
-                years=args.years, short_tax=args.tax_rate)
+                years=args.years, short_tax=args.tax_rate,
+                cost_side=args.cost_side)
             from validation_report import write_turnover_report
             path = write_turnover_report(sweep, Path(args.out))
             print(f"Wrote {path}")

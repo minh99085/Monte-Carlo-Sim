@@ -278,6 +278,19 @@ def test_cost_drag_falls_with_fewer_trades():
     assert monthly_drag < weekly_drag
 
 
+def test_sweep_lower_cost_never_hurts_net_edge():
+    def f(ticker, years):
+        return (gbm_ohlc(1800, seed=999, mu_annual=0.10) if ticker == "QQQ"
+                else regime_ohlc(1800, seed=abs(hash(ticker)) % 9999,
+                                 mu_bull_annual=0.40))
+    cheap = ve.run_turnover_sweep(["AAA"], horizons=[5, 21], benchmark="QQQ",
+                                  years=7.0, cost_side=0.0003, fetch=f)
+    dear = ve.run_turnover_sweep(["AAA"], horizons=[5, 21], benchmark="QQQ",
+                                 years=7.0, cost_side=0.0020, fetch=f)
+    for rc, rd in zip(cheap["rows"], dear["rows"]):
+        assert rc["net_annual"] > rd["net_annual"]  # same trades, lower drag
+
+
 def test_turnover_sweep_zero_edge_has_no_survivor(tmp_path: Path):
     fetch = _fetch_factory(lambda s: gbm_ohlc(2200, seed=s, mu_annual=0.0))
 
