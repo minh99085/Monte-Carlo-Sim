@@ -87,54 +87,27 @@ chmod 600 "$ENV_FILE"
 log "Safety defaults enforced: RH_LIVE_TRADING_ENABLED=0, RH_API_PUBLISH=127.0.0.1:8810"
 
 # ---------------------------------------------------------------------------
-# 4. Install the Monte-Carlo-Sim → Robinhood paper bridge
+# 4. The reviewed fixes and the MC→bot paper bridge now live natively in the
+#    Robinhood-Bot repo (on main), so the `git pull` in step 2 already brought
+#    them — the plugin's own docker-compose.yml defines the `mc-bridge`
+#    profile. No file overlay: the old deploy/cohost/{patches,bridge} copy
+#    step was retired once this session gained push access to the bot repo
+#    (overlaying tracked files was also what caused `git pull` collisions on
+#    the VPS). A stale docker-compose.override.yml from an earlier install is
+#    now redundant and is removed so it can't shadow the committed compose.
 # ---------------------------------------------------------------------------
-# The bridge code lives in the Monte-Carlo-Sim repo (deploy/cohost/bridge/)
-# and is copied into the bot's checkout here, then baked into the image by
-# the plugin's Dockerfile (COPY engine/ scripts/ tests/). Phase 1 makes NO
-# Robinhood calls — it maps verdict files through the local safety gates and
-# writes a paper ledger only.
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# Reviewed fixes for the bot itself (see deploy/cohost/BOT_REVIEW.md): this
-# session can only push to Monte-Carlo-Sim, so audited patches for the
-# Robinhood plugin ship here and are overlaid onto the checkout before the
-# image build. Re-running the installer always refreshes them.
-if [[ -d "$HERE/patches" ]]; then
-	log "Applying reviewed bot patches from deploy/cohost/patches/"
-	(cd "$HERE/patches" && find . -type f -name '*.py' -print0) \
-		| while IFS= read -r -d '' rel; do
-			install -D -m 644 "$HERE/patches/${rel#./}" \
-				"$PLUGIN_DIR/${rel#./}"
-			echo "    patched ${rel#./}"
-		done
-fi
-
-if [[ -d "$HERE/bridge" ]]; then
-	log "Installing MC→Robinhood paper bridge into the bot checkout"
-	install -m 644 "$HERE/bridge/mc_bridge.py" \
-		"$PLUGIN_DIR/engine/robinhood/mc_bridge.py"
-	install -m 644 "$HERE/bridge/run_mc_bridge.py" \
-		"$PLUGIN_DIR/scripts/run_mc_bridge.py"
-	install -m 644 "$HERE/bridge/test_mc_bridge.py" \
-		"$PLUGIN_DIR/tests/test_mc_bridge.py"
-	install -m 644 "$HERE/bridge/docker-compose.override.yml" \
-		"$PLUGIN_DIR/docker-compose.override.yml"
-else
-	echo "NOTE: $HERE/bridge not found — skipping the MC bridge (pull the" >&2
-	echo "      Monte-Carlo-Sim repo to get it)." >&2
+STALE_OVERRIDE="$PLUGIN_DIR/docker-compose.override.yml"
+if [[ -f "$STALE_OVERRIDE" ]]; then
+	log "Removing redundant docker-compose.override.yml (bridge is now in the bot's own compose)"
+	rm -f "$STALE_OVERRIDE"
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Build + start the container(s)
+# 5. Build + start the container(s) — bot API + agent + MC paper bridge
 # ---------------------------------------------------------------------------
 log "Building and starting the bot + bridge"
 cd "$PLUGIN_DIR"
-if [[ -f "$PLUGIN_DIR/docker-compose.override.yml" ]]; then
-	docker compose --profile robinhood --profile mc-bridge up -d --build
-else
-	docker compose --profile robinhood up -d --build
-fi
+docker compose --profile robinhood --profile mc-bridge up -d --build
 
 # ---------------------------------------------------------------------------
 # 6. Health check + next steps

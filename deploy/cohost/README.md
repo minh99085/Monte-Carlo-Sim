@@ -98,16 +98,18 @@ verification you run on the VPS (Step 1 health check + Step 3 status) is the
 real end-to-end test. If anything doesn't match what's described, paste the
 output back and it'll get fixed.
 
-## Reviewed bot fixes (`patches/`)
+## Reviewed bot fixes (now native in the bot repo)
 
 A full quant-team review of the Robinhood plugin found and fixed 10 issues —
 including a dead daily-loss halt, safety counters that reset on restart, and
 option orders whose dollar exposure was under-counted 100× by the per-order
-cap. The audited fixes live in `deploy/cohost/patches/` and the installer
-overlays them onto the bot checkout before every build (this session's
-GitHub access can't push to the Robinhood-Bot repo directly). Full findings
-and the improvement roadmap: [`BOT_REVIEW.md`](BOT_REVIEW.md). The plugin's
-test suite with patches applied: 56/56 passing.
+cap. **These fixes now live natively on `minh99085/Robinhood-Bot` `main`**, so
+`git pull` in the bot checkout brings them — there is no longer a file
+overlay. (Earlier, before this session had push access to the bot repo, the
+fixes shipped as a `deploy/cohost/patches/` overlay; that mechanism has been
+retired because overlaying tracked files also caused `git pull` collisions on
+the VPS.) Full findings and the improvement roadmap:
+[`BOT_REVIEW.md`](BOT_REVIEW.md). Plugin test suite: 56/56 passing.
 
 ## The MC → bot paper bridge (included)
 
@@ -140,13 +142,10 @@ per-order cap (`RH_MAX_ORDER_NOTIONAL_USD`, default $100) is far below one
 share of expensive symbols like SPY — those show up as skips with a message
 telling you what to raise the cap to. That's the cap working, not a bug.
 
-**Where the bridge code lives:** in THIS repo (`deploy/cohost/bridge/`), and
-the installer copies it into the bot's checkout at
-`/opt/Robinhood-Bot/.../engine/robinhood/mc_bridge.py` before building the
-image. (This session's GitHub access can only push to Monte-Carlo-Sim, not to
-the Robinhood-Bot repo, so MC is the source of truth; re-running the
-installer always refreshes the copy. If you later want it committed upstream
-in Robinhood-Bot, commit those copied files there yourself.)
+**Where the bridge code lives:** natively in the Robinhood-Bot repo
+(`engine/robinhood/mc_bridge.py`, `scripts/run_mc_bridge.py`, and the
+`mc-bridge` service in the plugin's own `docker-compose.yml`). `git pull` in
+the bot checkout brings it; the installer no longer overlays any files.
 
 ## Next milestone (not built yet)
 
