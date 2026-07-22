@@ -189,6 +189,61 @@ def walk_forward_trades(
 
 
 # ---------------------------------------------------------------------------
+# Short-term reversal signal (a genuinely different bet from trend-following)
+# ---------------------------------------------------------------------------
+# Pre-specified, NOT tuned (fixing the parameters up front avoids fishing a
+# threshold that flatters the backtest): enter LONG when a name's short
+# lookback return is oversold by more than Z_THRESH trailing sigmas, hold
+# HORIZON days, one position per name at a time (non-overlapping). Long-only
+# to match a cash account. This is the "buy the dip, many small wins"
+# profile — its risk lives in the tail (a dip that keeps falling), which the
+# confirm report surfaces as avg/worst loss.
+REVERSAL_LOOKBACK = 3        # days of the oversold move
+REVERSAL_Z_THRESH = 1.5      # trailing-sigma threshold for "oversold"
+REVERSAL_VOL_WINDOW = 60     # trailing window for the daily-vol estimate
+
+
+def reversal_trades(
+    ohlc: OHLC,
+    *,
+    horizon_days: int = 5,
+    lookback: int = REVERSAL_LOOKBACK,
+    z_thresh: float = REVERSAL_Z_THRESH,
+    vol_window: int = REVERSAL_VOL_WINDOW,
+    min_train_days: int = REVERSAL_VOL_WINDOW + 10,
+    require_agreement: bool = False,   # signature parity with walk_forward_trades
+) -> List[Trade]:
+    """Long-only short-term reversal, point-in-time, non-overlapping."""
+    h, k = int(horizon_days), int(lookback)
+    close, op, n = ohlc.close, ohlc.open, ohlc.close.size
+    logret = np.diff(np.log(close), prepend=np.log(close[0]))  # [0]=0
+    trades: List[Trade] = []
+    t = max(int(min_train_days), vol_window + k + 2)
+    while t + h + 1 < n:
+        rk = close[t] / close[t - k] - 1.0
+        window = logret[t - vol_window:t]
+        sd = float(np.std(window)) if window.size else 0.0
+        z = rk / (sd * math.sqrt(k)) if sd > 0 else 0.0
+        if z < -z_thresh:                       # oversold → long the bounce
+            rc = close[t + h] / close[t] - 1.0
+            re = op[t + 1 + h] / op[t + 1] - 1.0
+            trades.append(Trade(
+                entry_date=ohlc.dates[t], side="long", bucket="oversold",
+                r_signal_close=float(rc), r_executable=float(re),
+                year=int(ohlc.dates[t].year), both_lenses=True))
+            t += h                              # hold to exit before re-entering
+        else:
+            t += 1
+    return trades
+
+
+TRADE_GENERATORS: Dict[str, Callable[..., List[Trade]]] = {
+    "trend": walk_forward_trades,
+    "reversal": reversal_trades,
+}
+
+
+# ---------------------------------------------------------------------------
 # Item 1 + 2: edge, costs, tax
 # ---------------------------------------------------------------------------
 
@@ -669,20 +724,26 @@ def run_horizon_confirm(
     cost_side: float = 0.0003,
     short_tax: float = 0.35,
     long_tax: float = 0.15,
+    signal: str = "trend",
     fetch: Callable[[str, float], OHLC] = fetch_ohlc,
 ) -> Dict[str, Any]:
-    """Stability confirmation for ONE pre-chosen horizon.
+    """Stability confirmation for ONE pre-chosen horizon and signal.
 
     The sweep picked this horizon using the whole window — a multiple-testing
     risk. This check asks: does it beat the benchmark in BOTH halves of the
     period independently? A real edge should show up in each half; a lucky
     stretch shows up in one. Also reports the consistency profile the owner
     actually cares about: win rate together with the size of the losses.
+
+    ``signal`` selects the trade generator: ``"trend"`` (the EMA/RSI+momentum
+    strategy, annualized at the fixed 252/h cadence) or ``"reversal"`` (the
+    oversold-bounce strategy, whose entries are irregular so it is annualized
+    at the *actual* per-window trade frequency).
     """
     h = int(horizon_days)
     tax = tax_for_horizon(h, short_tax, long_tax)
-    per_ticker = {tk: walk_forward_trades(fetch(tk, years), horizon_days=h)
-                  for tk in tickers}
+    gen = TRADE_GENERATORS.get(signal, walk_forward_trades)
+    per_ticker = {tk: gen(fetch(tk, years), horizon_days=h) for tk in tickers}
     bench = fetch(benchmark, years)
     all_trades = sorted((t for ts in per_ticker.values() for t in ts),
                         key=lambda t: t.entry_date)
@@ -695,7 +756,14 @@ def run_horizon_confirm(
         per = {tk: [t for t in ts if date_lo <= t.entry_date < date_hi]
                for tk, ts in per_ticker.items()}
         wk = portfolio_weekly_returns(per, cost_side=cost_side, tax_rate=tax)
-        st = perf_stats(wk, TRADING_DAYS_PER_YEAR / h)
+        if signal == "trend":
+            ppy = TRADING_DAYS_PER_YEAR / h        # fixed cadence
+        else:
+            # irregular entries → annualize at the actual entry frequency
+            span_years = max((pd.Timestamp(date_hi) - pd.Timestamp(date_lo))
+                             .days / 365.25, 1e-9)
+            ppy = max(len(wk) / span_years, 1e-9)
+        st = perf_stats(wk, ppy)
         b_mask = (bench_ohlc.dates >= date_lo) & (bench_ohlc.dates < date_hi)
         b_close = bench_ohlc.close[np.asarray(b_mask)]
         b_r = b_close[1:] / b_close[:-1] - 1.0 if b_close.size > 2 else np.array([])
@@ -729,6 +797,7 @@ def run_horizon_confirm(
         "tickers": list(tickers),
         "benchmark": benchmark,
         "horizon_days": h,
+        "signal": signal,
         "cost_side": cost_side,
         "tax_rate": tax,
         "split_date": str(pd.Timestamp(mid_date).date()),
@@ -761,6 +830,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="stability check for ONE horizon (trading days): "
                          "must beat the benchmark in BOTH halves of history "
                          "independently, else the sweep pick was luck.")
+    ap.add_argument("--signal", default="trend", choices=list(TRADE_GENERATORS),
+                    help="which strategy to test: 'trend' (EMA/RSI+momentum) "
+                         "or 'reversal' (oversold-bounce). Default trend.")
     args = ap.parse_args(argv)
 
     try:
@@ -768,7 +840,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             res = run_horizon_confirm(
                 args.tickers, horizon_days=args.confirm,
                 benchmark=args.benchmark, years=args.years,
-                cost_side=args.cost_side, short_tax=args.tax_rate)
+                cost_side=args.cost_side, short_tax=args.tax_rate,
+                signal=args.signal)
             from validation_report import write_confirm_report
             path = write_confirm_report(res, Path(args.out))
             print(f"Wrote {path}")

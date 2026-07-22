@@ -204,7 +204,10 @@ def write_confirm_report(res: Dict[str, Any], out: Path) -> Path:
         out.write_text("\n".join(L) + "\n", encoding="utf-8")
         return out
     name = _HORIZON_NAME.get(res["horizon_days"], f"{res['horizon_days']}d")
-    A(f"# CONFIRM — is the {name} edge stable, or one lucky stretch?\n")
+    sig = res.get("signal", "trend")
+    sig_label = {"trend": "trend/momentum", "reversal": "oversold-reversal"}.get(
+        sig, sig)
+    A(f"# CONFIRM — is the {sig_label} {name} edge stable, or one lucky stretch?\n")
     A(f"*Tickers: {', '.join(res['tickers'])} · benchmark {res['benchmark']} · "
       f"cost {res['cost_side']*100:.2f}%/side · tax {res['tax_rate']:.0%} · "
       f"history split at {res['split_date']}.*\n")

@@ -331,6 +331,57 @@ def test_turnover_report_renders_survivor_path(tmp_path: Path):
     assert "Multiple testing" in text
 
 
+def mean_reverting_ohlc(n: int, seed: int, theta: float = 0.15,
+                        sigma_annual: float = 0.20) -> ve.OHLC:
+    """Ornstein-Uhlenbeck log-price: pulls back toward a level, so sharp
+    down-moves tend to bounce — a real short-term reversal edge."""
+    rng = np.random.default_rng(seed)
+    sd = sigma_annual / math.sqrt(252)
+    x = 0.0
+    xs = []
+    for _ in range(n):
+        x += -theta * x + rng.normal(0.0, sd)
+        xs.append(x)
+    close = 100.0 * np.exp(np.asarray(xs))
+    op = np.r_[close[0], close[:-1]]     # open ≈ prior close (no gap)
+    return ve.OHLC(dates=_dates(n), open=op, close=close)
+
+
+class TestReversalSignal:
+    def test_reversal_recovers_planted_mean_reversion(self):
+        ohlc = mean_reverting_ohlc(2000, seed=1)
+        trades = ve.reversal_trades(ohlc, horizon_days=5)
+        assert len(trades) > 20
+        r = np.array([t.r_executable for t in trades])
+        assert float(np.mean(r)) > 0        # oversold bounces are profitable
+        assert all(t.side == "long" for t in trades)
+
+    def test_reversal_finds_no_edge_in_random_walk(self):
+        ohlc = gbm_ohlc(2000, seed=2, mu_annual=0.0)
+        trades = ve.reversal_trades(ohlc, horizon_days=5)
+        r = np.array([t.r_executable for t in trades]) if trades else np.array([0.0])
+        assert abs(float(np.mean(r))) < 0.01   # ~no systematic bounce
+
+    def test_reversal_trades_are_non_overlapping(self):
+        ohlc = mean_reverting_ohlc(2000, seed=3)
+        trades = ve.reversal_trades(ohlc, horizon_days=5)
+        idxs = [list(ohlc.dates).index(pd.Timestamp(t.entry_date)) for t in trades]
+        assert np.all(np.diff(idxs) >= 5)
+
+    def test_confirm_reversal_signal_runs_and_labels(self, tmp_path):
+        def f(ticker, years):
+            return (gbm_ohlc(2000, seed=999, mu_annual=0.10)
+                    if ticker == "QQQ"
+                    else mean_reverting_ohlc(2000, seed=abs(hash(ticker)) % 9999))
+        res = ve.run_horizon_confirm(["AAA", "BBB"], horizon_days=5,
+                                     benchmark="QQQ", years=8.0,
+                                     signal="reversal", fetch=f)
+        assert res.get("signal") == "reversal"
+        assert "error" not in res, res
+        out = vr.write_confirm_report(res, tmp_path / "R.md")
+        assert "oversold-reversal" in out.read_text()
+
+
 class TestHorizonConfirm:
     def test_edgeless_vs_strong_benchmark_is_not_stable(self, tmp_path):
         # Mild-drift tickers trade a little but can't beat a strong benchmark
