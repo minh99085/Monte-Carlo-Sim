@@ -6,3 +6,4 @@ yfinance>=0.2.40
 pytest>=7.0
 scikit-learn>=1.4
 pyyaml>=6
+pydantic>=2.5

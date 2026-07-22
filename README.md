@@ -38,6 +38,11 @@ Streamlit GUI and is designed to run comfortably on a Windows 11 laptop
 | `test_monte_carlo_gbm.py` / `test_tactical.py` | Test suites. |
 | `tv_webhook_bridge.py` | Phase 3 — local TradingView webhook receiver. |
 | `tradingview_alert_template.pine` | Phase 3 — Pine Script JSON alert template. |
+| `chart_vision_models.py` | Chart image extraction schemas (Pydantic). |
+| `chart_vision_mapper.py` | Vision + MCP → tactical MC parameters. |
+| `chart_vision_pipeline.py` | Offline vision→MC decision runner. |
+| `chart_vision_scoring.py` | Chart2CSV-style evaluation scoring. |
+| `DESIGN_CHART_VISION.md` | Confidence policy (image = secondary channel). |
 | `PHASE1_README.md` / `PHASE2_README.md` / `PHASE3_README.md` | Phase docs. |
 | `requirements.txt` | Dependencies. |
 
