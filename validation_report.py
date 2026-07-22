@@ -247,6 +247,23 @@ def write_confirm_report(res: Dict[str, Any], out: Path) -> Path:
     half_block(f"Second half ({res['split_date']} →)", res["second_half"])
     half_block("Overall", res["overall"])
 
+    dd = res.get("drawdown_mc")
+    if dd and dd.get("n"):
+        A("## Drawdown stress (reshuffled trade order, Monte Carlo)\n")
+        A("The backtest is one lucky ordering of the trades. Reshuffling the "
+          "sequence thousands of times shows the drawdowns you should actually "
+          "size against:\n")
+        A("| | Drawdown |")
+        A("|---|---|")
+        A(f"| Backtest path (the single ordering) | {_pct(dd['backtest_dd'])} |")
+        A(f"| Median reshuffle | {_pct(dd['median_dd'])} |")
+        A(f"| 95th-percentile (bad but plausible) | {_pct(dd['p95_dd'])} |")
+        A(f"| Worst reshuffle seen | {_pct(dd['worst_dd'])} |")
+        A(f"\n**Size for the 95th-percentile drawdown ({_pct(dd['p95_dd'])}), "
+          f"not the backtest ({_pct(dd['backtest_dd'])}).** And this is a "
+          "floor: our positions are correlated (same tech names at once), so a "
+          "real regime drop could exceed even the worst reshuffle here.\n")
+
     A("## What this does and does not prove\n")
     A("- Passing means the edge was not carried by a single stretch of the "
       "2018–2026 window. It does NOT create bear-market evidence, and it does "

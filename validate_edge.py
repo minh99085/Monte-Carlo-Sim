@@ -290,6 +290,43 @@ def cost_tax_table(
 # ---------------------------------------------------------------------------
 
 
+def resample_drawdown(period_returns: np.ndarray, *, n_boot: int = 5000,
+                      seed: int = 13) -> Dict[str, Any]:
+    """Reshuffle the trade/period return SEQUENCE many times to get the
+    distribution of possible drawdowns (the dev.to 'Monte Carlo on trade
+    results' method). Same total return, different path each time — the
+    single backtest ordering is just one lucky draw. Reported drawdowns are
+    negative; more-negative = worse.
+
+    Reshuffling assumes the sampled units are exchangeable; here the units are
+    per-period PORTFOLIO returns (already bundling correlated same-period
+    names), so this captures sequence/streak risk. Regime clustering could
+    make reality worse still — treat the tail here as a floor, not a ceiling.
+    """
+    r = np.asarray(period_returns, dtype=float)
+    r = r[np.isfinite(r)]
+
+    def maxdd(x: np.ndarray) -> float:
+        eq = np.cumprod(1.0 + x)
+        peak = np.maximum.accumulate(eq)
+        return float((eq / peak - 1.0).min()) if x.size else 0.0
+
+    if r.size < 3:
+        bt = maxdd(r)
+        return {"backtest_dd": bt, "median_dd": bt, "p95_dd": bt,
+                "worst_dd": bt, "n": int(r.size)}
+    backtest = maxdd(r)
+    rng = np.random.default_rng(seed)
+    dds = np.array([maxdd(rng.permutation(r)) for _ in range(n_boot)])
+    return {
+        "backtest_dd": backtest,
+        "median_dd": float(np.median(dds)),
+        "p95_dd": float(np.quantile(dds, 0.05)),   # exceeded only ~5% of the time
+        "worst_dd": float(dds.min()),
+        "n": int(r.size),
+    }
+
+
 def perf_stats(period_returns: np.ndarray, periods_per_year: float) -> Dict[str, float]:
     """Sharpe / Sortino / maxDD / CAGR from a series of per-period simple
     returns (rf = 0)."""
@@ -793,6 +830,11 @@ def run_horizon_confirm(
     second = half_stats([t for t in all_trades if t.entry_date >= mid_date],
                         bench, mid_date, hi)
     overall = half_stats(all_trades, bench, lo, hi)
+    # Trade-sequence Monte Carlo on the full portfolio path: the honest
+    # drawdown you should size against, not the single lucky ordering.
+    overall_wk = portfolio_weekly_returns(per_ticker, cost_side=cost_side,
+                                          tax_rate=tax)
+    dd_mc = resample_drawdown(overall_wk)
     return {
         "tickers": list(tickers),
         "benchmark": benchmark,
@@ -804,6 +846,7 @@ def run_horizon_confirm(
         "first_half": first,
         "second_half": second,
         "overall": overall,
+        "drawdown_mc": dd_mc,
         "stable": bool(first["beats"] and second["beats"]),
     }
 

@@ -382,6 +382,42 @@ class TestReversalSignal:
         assert "oversold-reversal" in out.read_text()
 
 
+class TestResampleDrawdown:
+    def test_all_positive_has_no_drawdown(self):
+        r = np.full(50, 0.01)
+        dd = ve.resample_drawdown(r, n_boot=200)
+        assert dd["backtest_dd"] == pytest.approx(0.0)
+        assert dd["worst_dd"] == pytest.approx(0.0)
+
+    def test_worst_reshuffle_is_at_least_as_bad_as_backtest(self):
+        rng = np.random.default_rng(1)
+        r = rng.normal(0.005, 0.03, 120)   # mixed wins/losses
+        dd = ve.resample_drawdown(r, n_boot=3000)
+        # the backtest ordering is one of the permutations sampled, so the
+        # worst reshuffle can only be equal or deeper (more negative)
+        assert dd["worst_dd"] <= dd["backtest_dd"] + 1e-9
+        assert dd["worst_dd"] <= dd["median_dd"] <= 0.0
+        assert dd["p95_dd"] <= dd["median_dd"] + 1e-9
+
+    def test_tiny_series_degenerates_safely(self):
+        dd = ve.resample_drawdown(np.array([0.01, -0.02]))
+        assert dd["n"] == 2 and "worst_dd" in dd
+
+    def test_confirm_report_includes_drawdown_stress(self, tmp_path):
+        def f(ticker, years):
+            return (gbm_ohlc(2000, seed=999, mu_annual=0.05)
+                    if ticker == "QQQ"
+                    else mean_reverting_ohlc(2000, seed=abs(hash(ticker)) % 9999))
+        res = ve.run_horizon_confirm(["AAA", "BBB"], horizon_days=5,
+                                     benchmark="QQQ", years=8.0,
+                                     signal="reversal", fetch=f)
+        assert "drawdown_mc" in res
+        out = vr.write_confirm_report(res, tmp_path / "D.md")
+        text = out.read_text()
+        assert "Drawdown stress" in text
+        assert "95th-percentile" in text
+
+
 class TestHorizonConfirm:
     def test_edgeless_vs_strong_benchmark_is_not_stable(self, tmp_path):
         # Mild-drift tickers trade a little but can't beat a strong benchmark
