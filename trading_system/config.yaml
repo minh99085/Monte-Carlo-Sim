@@ -1,0 +1,46 @@
+# Meta-labeled trading system — all knobs in one place.
+# DRY_RUN is the master safety: while true, no order is ever placed anywhere.
+DRY_RUN: true
+
+universe:
+  tickers: [SPY, QQQ, XLK, NVDA, AAPL, MSFT]
+  benchmark: SPY
+  years: 8.0
+
+signals:
+  # Minimum historical signals per symbol before ANY modeling is allowed.
+  # Below this the pipeline stops and reports "insufficient history".
+  min_per_symbol: 100
+  # Live TradingView archive (bridge history) merged with reconstructed
+  # mechanical signals (EMA 9/21 cross — same rule the Pine script fires on).
+  tv_history_dir: tv_data/history
+
+barriers:
+  k_pt: 1.5          # profit barrier = entry * (1 + k_pt * sigma_daily * sqrt(h))
+  k_sl: 1.5          # stop barrier   = entry * (1 - k_sl * sigma_daily * sqrt(h))
+  max_hold: 10       # vertical barrier, trading days
+  vol_window: 60     # trailing window for sigma_daily
+
+costs:
+  per_side: 0.0005   # ≥ 5 bps slippage+spread per side (gauntlet gate 1)
+
+model:
+  threshold: 0.60          # trade iff calibrated P(profit) > threshold
+  threshold_sweep: [0.55, 0.575, 0.60, 0.625, 0.65]
+  sizer: B1                # A4 (all-or-nothing) or B1 (de Prado bet size)
+  n_folds: 6               # purged walk-forward folds
+  embargo_bars: 10         # >= max_hold
+  min_train: 60            # minimum labeled signals before the first fold
+
+risk:
+  risk_pct: 0.01           # fixed-% risk per trade (of equity)
+  max_position_pct: 0.10   # cap: no position above this share of equity
+  account_equity: 10000    # replaced by live buying power at execution time
+  mc_reshuffles: 5000      # drawdown-distribution reshuffles
+  daily_loss_limit: 200    # $ halt
+
+validation:
+  holdout_fraction: 0.20   # final untouched slice, evaluated exactly once
+  pbo_blocks: 8            # CSCV partitions
+  plateau_tolerance: 0.70  # Sharpe must stay >= 70% of chosen config
+  plateau_bump: 0.20       # +/- variation applied to threshold, k_pt/k_sl, max_hold

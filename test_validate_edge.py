@@ -26,6 +26,11 @@ import validation_report as vr
 def _dates(n: int) -> pd.DatetimeIndex:
     return pd.bdate_range("2016-01-04", periods=n)
 
+def stable_seed(s: str) -> int:
+    """Deterministic per-symbol seed (str hash is randomized per process)."""
+    return sum(ord(c) * (i + 1) for i, c in enumerate(s)) % 9973
+
+
 
 def gbm_ohlc(n: int, seed: int, mu_annual: float = 0.0,
              sigma_annual: float = 0.15) -> ve.OHLC:
@@ -231,7 +236,7 @@ def test_lens_correlation_high_on_trend():
 
 def _fetch_factory(builder):
     def _fetch(ticker: str, years: float) -> ve.OHLC:
-        seed = abs(hash(ticker)) % 100000
+        seed = stable_seed(ticker)
         return builder(seed)
     return _fetch
 
@@ -281,7 +286,7 @@ def test_cost_drag_falls_with_fewer_trades():
 def test_sweep_lower_cost_never_hurts_net_edge():
     def f(ticker, years):
         return (gbm_ohlc(1800, seed=999, mu_annual=0.10) if ticker == "QQQ"
-                else regime_ohlc(1800, seed=abs(hash(ticker)) % 9999,
+                else regime_ohlc(1800, seed=stable_seed(ticker),
                                  mu_bull_annual=0.40))
     cheap = ve.run_turnover_sweep(["AAA"], horizons=[5, 21], benchmark="QQQ",
                                   years=7.0, cost_side=0.0003, fetch=f)
@@ -296,7 +301,7 @@ def test_turnover_sweep_zero_edge_has_no_survivor(tmp_path: Path):
 
     def f(ticker, years):
         return (gbm_ohlc(2200, seed=999, mu_annual=0.10) if ticker == "QQQ"
-                else gbm_ohlc(2200, seed=abs(hash(ticker)) % 9999, mu_annual=0.0))
+                else gbm_ohlc(2200, seed=stable_seed(ticker), mu_annual=0.0))
 
     sweep = ve.run_turnover_sweep(["AAA", "BBB"], horizons=[5, 21, 63],
                                   benchmark="QQQ", years=8.0, fetch=f)
@@ -372,7 +377,7 @@ class TestReversalSignal:
         def f(ticker, years):
             return (gbm_ohlc(2000, seed=999, mu_annual=0.10)
                     if ticker == "QQQ"
-                    else mean_reverting_ohlc(2000, seed=abs(hash(ticker)) % 9999))
+                    else mean_reverting_ohlc(2000, seed=stable_seed(ticker)))
         res = ve.run_horizon_confirm(["AAA", "BBB"], horizon_days=5,
                                      benchmark="QQQ", years=8.0,
                                      signal="reversal", fetch=f)
@@ -407,7 +412,7 @@ class TestResampleDrawdown:
         def f(ticker, years):
             return (gbm_ohlc(2000, seed=999, mu_annual=0.05)
                     if ticker == "QQQ"
-                    else mean_reverting_ohlc(2000, seed=abs(hash(ticker)) % 9999))
+                    else mean_reverting_ohlc(2000, seed=stable_seed(ticker)))
         res = ve.run_horizon_confirm(["AAA", "BBB"], horizon_days=5,
                                      benchmark="QQQ", years=8.0,
                                      signal="reversal", fetch=f)
@@ -457,7 +462,7 @@ class TestHorizonConfirm:
         def f(ticker, years):
             return (gbm_ohlc(2200, seed=999, mu_annual=0.05)
                     if ticker == "QQQ"
-                    else regime_ohlc(2200, seed=abs(hash(ticker)) % 9999,
+                    else regime_ohlc(2200, seed=stable_seed(ticker),
                                      mu_bull_annual=0.40))
         res = ve.run_horizon_confirm(["AAA"], horizon_days=21,
                                      benchmark="QQQ", years=8.0, fetch=f)
@@ -492,7 +497,7 @@ def test_planted_edge_can_survive(tmp_path: Path):
     def fetch(ticker: str, years: float) -> ve.OHLC:
         if ticker == "BENCH":
             return gbm_ohlc(1800, seed=999, mu_annual=0.0)
-        return regime_ohlc(1800, seed=abs(hash(ticker)) % 9999,
+        return regime_ohlc(1800, seed=stable_seed(ticker),
                            mu_bull_annual=0.60)
     result = ve.run_full(["AAA", "BBB"], benchmark="BENCH",
                          years=7.0, fetch=fetch)
