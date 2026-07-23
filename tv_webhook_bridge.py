@@ -487,6 +487,22 @@ def make_handler(state: BridgeState):
                 self._send_json(code, data)
                 return
 
+            # Paper book + scout (secret-gated: portfolio state + heavy
+            # data pulls should not be world-readable on port 80).
+            if path in ("/dashboard/paper/book", "/dashboard/scout"):
+                query = parse_qs(parsed.query)
+                if not check_secret(self._headers_dict(), query, None,
+                                    state.secret):
+                    self._send_json(401, {"ok": False,
+                                          "error": "unauthorized"})
+                    return
+                target = ("/api/paper/book" if path.endswith("book")
+                          else "/api/scout/run")
+                code, data = _bot_request(
+                    state.dashboard_bot_api, target, timeout=180.0)
+                self._send_json(code, data)
+                return
+
             if path in ("/", "/health"):
                 latest = load_latest(state.data_dir)
                 self._send_json(200, {
@@ -592,14 +608,53 @@ def make_handler(state: BridgeState):
                 self._send_json(400, {"ok": False,
                                       "error": "provide charts: [...]"})
                 return
+            position = body.get("position")
+            if not isinstance(position, dict):
+                position = None
             try:
                 from chart_confluence import combine
-                verdict = combine(charts)
+                verdict = combine(charts, position=position)
             except Exception as exc:  # noqa: BLE001
                 self._send_json(500, {"ok": False,
                                       "error": f"confluence_failed: {exc}"})
                 return
             self._send_json(200, {"ok": True, "confluence": verdict})
+
+        def _handle_paper_trade(self, path: str) -> None:
+            """Proxy paper open/close to the bot (secret-gated, whitelisted)."""
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 100_000:
+                self._send_json(413, {"ok": False, "error": "payload_too_large"})
+                return
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8", errors="replace") or "null")
+            except json.JSONDecodeError:
+                body = None
+            if not isinstance(body, dict):
+                self._send_json(400, {"ok": False,
+                                      "error": "expected JSON object body"})
+                return
+            query = parse_qs(urlparse(self.path).query)
+            if not check_secret(self._headers_dict(), query, body,
+                                state.secret):
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            if path.endswith("open"):
+                target = "/api/paper/open"
+                fields = ("symbol", "stop_pct", "horizon_days", "thesis")
+            else:
+                target = "/api/paper/close"
+                fields = ("symbol", "reason")
+            forward = {k: body[k] for k in fields if k in body}
+            if not forward.get("symbol"):
+                self._send_json(400, {"ok": False, "error": "symbol required"})
+                return
+            code, data = _bot_request(state.dashboard_bot_api, target,
+                                      method="POST", payload=forward,
+                                      timeout=60.0)
+            logger.info("Paper %s %s → %s", target, forward.get("symbol"), code)
+            self._send_json(code, data)
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
@@ -609,6 +664,9 @@ def make_handler(state: BridgeState):
                 return
             if path == "/dashboard/chart/confluence":
                 self._handle_chart_confluence()
+                return
+            if path in ("/dashboard/paper/open", "/dashboard/paper/close"):
+                self._handle_paper_trade(path)
                 return
             if path != "/webhook":
                 self._send_json(404, {"error": "not_found", "use": "POST /webhook"})

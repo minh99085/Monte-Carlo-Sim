@@ -346,6 +346,65 @@ def test_bot_request_unreachable_unit():
     assert data["ok"] is False and "unreachable" in data["error"]
 
 
+def test_paper_and_scout_proxies(tmp_path: Path):
+    rec = {"last": None, "calls": []}
+
+    class FakeBot(_make_fake_bot_handler(rec)):
+        def do_GET(self):
+            rec["calls"].append(self.path)
+            if self.path == "/api/paper/book":
+                self._json(200, {"ok": True, "equity": 10000.0, "cash": 10000.0,
+                                 "realized_pnl": 0.0, "positions": [],
+                                 "n_open": 0, "review_due": []})
+            elif self.path == "/api/scout/run":
+                self._json(200, {"ok": True, "scanned": 70,
+                                 "suggest": [{"symbol": "XLE", "why": "+5% 21d"}],
+                                 "avoid": []})
+            else:
+                self._json(404, {"ok": False})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            rec["last"] = json.loads(self.rfile.read(n).decode())
+            rec["calls"].append(self.path)
+            self._json(200, {"ok": True, "position": {"symbol": "XLE", "qty": 4}})
+
+    bot = _serve(8786, FakeBot)
+    state = bridge.BridgeState(secret="s", data_dir=tmp_path,
+                               dashboard_bot_api="http://127.0.0.1:8786")
+    front = _serve(8787, bridge.make_handler(state))
+    time.sleep(0.15)
+    base = "http://127.0.0.1:8787"
+    try:
+        # secret-gated GETs
+        code, _ = _http_json("GET", f"{base}/dashboard/paper/book")
+        assert code == 401
+        code, book = _http_json("GET", f"{base}/dashboard/paper/book?secret=s")
+        assert code == 200 and book["equity"] == 10000.0
+        code, sc = _http_json("GET", f"{base}/dashboard/scout?secret=s")
+        assert code == 200 and sc["suggest"][0]["symbol"] == "XLE"
+
+        # paper open: secret stripped, fields whitelisted
+        body = json.dumps({"secret": "s", "symbol": "XLE", "stop_pct": 0.05,
+                           "horizon_days": 5, "thesis": "t", "junk": 1}).encode()
+        code, res = _http_json("POST", f"{base}/dashboard/paper/open",
+                               data=body, headers={"Content-Type": "application/json"})
+        assert code == 200 and res["ok"] is True
+        assert rec["last"] == {"symbol": "XLE", "stop_pct": 0.05,
+                               "horizon_days": 5, "thesis": "t"}
+
+        # close without secret → 401 and bot not called again
+        n_calls = len(rec["calls"])
+        body = json.dumps({"symbol": "XLE"}).encode()
+        code, _ = _http_json("POST", f"{base}/dashboard/paper/close",
+                             data=body, headers={"Content-Type": "application/json"})
+        assert code == 401 and len(rec["calls"]) == n_calls
+    finally:
+        for s in (front, bot):
+            s.shutdown()
+            s.server_close()
+
+
 def test_chart_confluence_route(tmp_path: Path):
     state = bridge.BridgeState(secret="s", data_dir=tmp_path)
     front = _serve(8785, bridge.make_handler(state))

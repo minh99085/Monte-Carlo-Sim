@@ -121,7 +121,20 @@ h2 .aux { color: var(--dim); margin-left: 10px; }
 .slot .slot-status .bad { color: var(--critical); }
 .controls { display: grid; gap: 12px; align-content: start; }
 .row2 { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+.row3 { display: grid; gap: 12px; grid-template-columns: 1fr 1fr 1fr; }
+@media (max-width: 720px) { .row3 { grid-template-columns: 1fr; } }
 .field { display: grid; gap: 6px; }
+.field select {
+  background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 6px;
+  color: var(--text); font: 13px var(--mono); padding: 9px 11px; width: 100%;
+}
+.badge {
+  display: inline-block; font-family: var(--mono); font-size: 10px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 3px; margin-left: 8px;
+}
+.badge.due { background: rgba(245,201,123,.12); color: var(--warn); }
+.badge.ok { background: rgba(110,231,183,.08); color: var(--good); }
 .field label {
   font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em;
   text-transform: uppercase; color: var(--muted);
@@ -235,10 +248,17 @@ a:hover { text-decoration: underline; }
     </div>
   </div>
   <div class="controls">
-    <div class="row2">
+    <div class="row3">
       <div class="field">
         <label for="ticker-hint">Ticker</label>
         <input type="text" id="ticker-hint" placeholder="e.g. NVDA" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="horizon">Holding plan</label>
+        <select id="horizon">
+          <option value="5" selected>Weekly (~5 trading days)</option>
+          <option value="21">Monthly (~21 trading days)</option>
+        </select>
       </div>
       <div class="field">
         <label for="secret">Dashboard secret</label>
@@ -254,6 +274,22 @@ a:hover { text-decoration: underline; }
 <div class="card">
   <div class="result" id="chart-result">
     <div class="placeholder">Upload at least the weekly and daily charts, then press <b>Analyze charts</b>. A full step-by-step explanation appears here. Paper only — no order is ever placed.</div>
+  </div>
+</div>
+
+<h2>Scout — what to chart this week <span class="aux">scans ~70 names with real Robinhood data, suggests 5–10</span></h2>
+<div class="card">
+  <button class="btn" id="scout-btn" style="max-width:280px" disabled>Scan the market</button>
+  <div class="result" id="scout-result">
+    <div class="placeholder">Enter the dashboard secret, then scan. Takes ~30–60s (real data for every name). Suggestions are candidates to chart — not buy signals.</div>
+  </div>
+</div>
+
+<h2>Paper portfolio <span class="aux">$10,000 paper bankroll · 2% risk per trade · trades logged, never placed</span></h2>
+<div class="card">
+  <button class="mini-btn" id="book-btn" disabled>↻ Refresh portfolio</button>
+  <div class="result" id="book-result">
+    <div class="placeholder">Enter the dashboard secret and refresh. Positions opened from BUY verdicts appear here with holding time and "review due" prompts.</div>
   </div>
 </div>
 
@@ -338,7 +374,10 @@ const ROLES = ["weekly", "daily", "ratio"];
 const slots = { weekly: null, daily: null, ratio: null };
 
 function updateAnalyzeBtn() {
-  $("analyze-btn").disabled = !(slots.weekly && slots.daily && $("secret").value.trim());
+  const hasSecret = !!$("secret").value.trim();
+  $("analyze-btn").disabled = !(slots.weekly && slots.daily && hasSecret);
+  $("scout-btn").disabled = !hasSecret;
+  $("book-btn").disabled = !hasSecret;
 }
 function handleFile(role, file) {
   if (!file || !file.type.startsWith("image/")) { $("st-"+role).innerHTML = '<span class="bad">not an image</span>'; return; }
@@ -411,17 +450,22 @@ function summarize(role, res) {
 }
 
 /* the comprehensive, plain-language explanation */
-function renderReport(summaries, results, conf) {
+function renderReport(summaries, results, conf, position) {
   const daily = results.daily || {};
   const dDec = daily.decision || {};
   const dVal = daily.validation || {};
   const dMcp = daily.mcp || {};
   const dEx = daily.extraction || {};
 
-  // --- stance banner ---
+  // --- action banner ---
   const mult = conf.size_multiplier;
-  const cls = conf.allowed ? "good" : (conf.stance === "INCOMPLETE" ? "info" : "warn");
-  const label = conf.stance.replace("_"," ");
+  const action = conf.action || conf.stance;
+  const cls = action === "BUY" ? "good"
+    : action === "SELL" ? "critical"
+    : action === "HOLD" ? "info"
+    : (conf.stance === "INCOMPLETE" ? "info" : "warn");
+  let label = action.replace("_", " ");
+  if (position) label += ` (holding ${position.qty} sh @ $${fmt(position.entry_price,2)})`;
   let h = `<div class="banner ${cls}"><b style="font-size:15px">${esc(label)}</b>`;
   if (conf.allowed) h += ` &nbsp;·&nbsp; suggested size ×${fmt(mult,2)}`;
   h += `<span class="sub">Paper only — this is an advisory read, no order is placed.</span></div>`;
@@ -483,29 +527,48 @@ function renderReport(summaries, results, conf) {
   h += `<div class="kv"><span class="k">Worst-case drawdown</span><span class="v critical">${risk.max_drawdown_p95!=null?pct(risk.max_drawdown_p95,1):"—"}</span></div>`;
   h += `</div>`;
 
-  // --- ④ the verdict + plain meaning ---
+  // --- ④ the verdict + plain meaning + paper action ---
   h += `<div class="step"><div class="head"><span class="num">4</span>The verdict <span class="who">what to do</span></div>`;
   const reasons = [].concat(conf.reasons || [], (conf.warnings || []).map(w => "⚠ "+w));
   if (reasons.length) h += `<div style="font-size:12.5px;color:var(--muted);line-height:1.65">${reasons.map(esc).join("<br>")}</div>`;
-  h += `<div class="plain">${plainMeaning(summaries, conf, risk)}</div>`;
+  h += `<div class="plain">${plainMeaning(summaries, conf, risk, position)}</div>`;
+  if (action === "BUY")
+    h += `<button class="btn" id="paper-action-btn" style="margin-top:12px" onclick="paperOpenFromLast()">Record paper BUY — 2% risk, ${fmt((lastAnalysis||{}).horizon_days||5,0)}-day plan</button>`;
+  else if (action === "SELL" && position)
+    h += `<button class="btn" id="paper-action-btn" style="margin-top:12px;background:var(--critical)" onclick="paperCloseFromLast()">Close paper position (${esc(position.symbol||"")})</button>`;
   h += `</div>`;
 
   $("chart-result").innerHTML = h;
 }
 
 /* one honest sentence a non-trader can act on */
-function plainMeaning(summaries, conf, risk) {
+function plainMeaning(summaries, conf, risk, position) {
   const t = (summaries[0] && summaries[0].ticker) || "this asset";
+  const action = conf.action || conf.stance;
+  if (action === "HOLD")
+    return `<b>Keep holding ${esc(t)}.</b> ${esc(conf.reasons[0]||"The thesis is intact.")} The book tracks holding time and will prompt the next review.`;
+  if (action === "SELL")
+    return `<b>Time to exit ${esc(t)} (paper).</b> ${esc(conf.reasons[0]||"")} Click the close button below to sell at the live price and lock the paper P&L.`;
   if (conf.stance === "INCOMPLETE")
     return `Upload at least the <b>weekly</b> and <b>daily</b> charts so the system can judge both the trend and the timing.`;
   if (conf.stance === "NO_TRADE")
     return `The system says <b>do not buy ${esc(t)} here.</b> ${esc(conf.reasons[0]||"")}. Sitting in cash is the call. No order placed.`;
   if (conf.stance === "MIXED")
     return `<b>Wait — don't buy ${esc(t)} yet.</b> The bigger trend may be up, but the pieces don't agree, so there's no clean entry right now. Watch it; re-run when the daily chart turns. No order placed.`;
-  // ALIGNED_LONG
+  // ALIGNED_LONG → BUY
   const pp = risk.prob_profit;
   const confNote = (pp!=null && pp < 0.5) ? " — though the simulation still puts profit odds under half, so keep size small" : "";
-  return `The charts agree <b>bullish on ${esc(t)}</b> and the risk read is acceptable${confNote}. If this were live, the system would take it at <b>×${fmt(conf.size_multiplier,2)}</b> of full size. It stays paper until the validation gauntlet passes — no order placed.`;
+  return `The charts agree <b>bullish on ${esc(t)}</b> and the risk read is acceptable${confNote}. The button below records a <b>paper</b> BUY at the live price, sized to 2% risk ×${fmt(conf.size_multiplier,2)}. Still paper — no real order can be placed.`;
+}
+
+let lastAnalysis = null;  // context for the action buttons
+
+async function fetchBook(secret) {
+  const r = await fetch("/dashboard/paper/book?secret=" + encodeURIComponent(secret),
+                        { cache: "no-store" });
+  const res = await r.json();
+  if (!r.ok || res.ok === false) throw new Error(res.error || "book fetch failed");
+  return res;
 }
 
 async function analyzeBattery() {
@@ -520,21 +583,158 @@ async function analyzeBattery() {
       try { results[role] = await analyzeOne(role, secret, ticker); summaries.push(summarize(role, results[role])); }
       catch (e) { $("st-"+role).innerHTML = '<span class="bad">failed</span>'; throw e; }
     }
+    // Position-aware: if we already hold this ticker on paper, the question
+    // becomes HOLD/SELL instead of BUY/WAIT.
+    let position = null;
+    try {
+      const book = await fetchBook(secret);
+      const p = (book.positions || []).find(p => p.symbol === ticker);
+      if (p) position = { symbol: p.symbol, qty: p.qty, entry_price: p.entry_price };
+    } catch (e) { /* book unavailable → flat analysis */ }
+
     const r = await fetch("/dashboard/chart/confluence", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ charts: summaries, secret }),
+      body: JSON.stringify({ charts: summaries, position, secret }),
     });
     const res = await r.json();
     if (!r.ok || res.ok === false) throw new Error(res.error || ("confluence failed ("+r.status+")"));
-    renderReport(summaries, results, res.confluence);
+    const dDec = (results.daily || {}).decision || {};
+    lastAnalysis = {
+      ticker: ticker || (summaries[0] && summaries[0].ticker) || "",
+      stop_pct: dDec.stop_loss_pct || 0.05,
+      horizon_days: parseFloat($("horizon").value) || 5,
+      action: res.confluence.action,
+      mult: res.confluence.size_multiplier,
+    };
+    renderReport(summaries, results, res.confluence, position);
   } catch (e) {
     $("chart-result").innerHTML = `<div class="banner critical">${esc(String(e.message||e))}</div>`;
+  } finally { updateAnalyzeBtn(); }
+}
+
+/* ---------- paper actions ---------- */
+async function paperOpenFromLast() {
+  if (!lastAnalysis || lastAnalysis.action !== "BUY") return;
+  const secret = $("secret").value.trim();
+  const btn = $("paper-action-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "Recording paper BUY…"; }
+  try {
+    const r = await fetch("/dashboard/paper/open", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        secret,
+        symbol: lastAnalysis.ticker,
+        stop_pct: lastAnalysis.stop_pct,
+        horizon_days: lastAnalysis.horizon_days,
+        thesis: `battery BUY ×${fmt(lastAnalysis.mult,2)}`,
+      }),
+    });
+    const res = await r.json();
+    if (!r.ok || res.ok === false) throw new Error(res.error || "open failed");
+    if (btn) btn.textContent = `Paper BUY recorded: ${res.position.qty} sh @ $${fmt(res.position.entry_price,2)}`;
+    await renderBook();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Record paper BUY (retry) — " + String(e.message||e).slice(0,60); }
+  }
+}
+
+async function paperCloseSymbol(symbol, reason) {
+  const secret = $("secret").value.trim();
+  const r = await fetch("/dashboard/paper/close", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ secret, symbol, reason: reason || "operator close" }),
+  });
+  const res = await r.json();
+  if (!r.ok || res.ok === false) throw new Error(res.error || "close failed");
+  return res;
+}
+
+async function paperCloseFromLast() {
+  if (!lastAnalysis) return;
+  const btn = $("paper-action-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "Closing paper position…"; }
+  try {
+    const res = await paperCloseSymbol(lastAnalysis.ticker, "battery verdict: SELL");
+    if (btn) btn.textContent = `Closed: P&L $${fmt(res.trade.pnl_usd,2)}`;
+    await renderBook();
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = "Close failed — " + String(e.message||e).slice(0,60); }
+  }
+}
+
+/* ---------- scout ---------- */
+async function runScout() {
+  const secret = $("secret").value.trim();
+  $("scout-btn").disabled = true;
+  $("scout-result").innerHTML = '<div class="placeholder">Scanning ~70 names with real Robinhood data… 30–60s.</div>';
+  try {
+    const r = await fetch("/dashboard/scout?secret=" + encodeURIComponent(secret),
+                          { cache: "no-store" });
+    const res = await r.json();
+    if (!r.ok || res.ok === false) throw new Error(res.error || "scout failed");
+    let h = `<div class="cfg-line" style="margin:10px 0 12px">Scanned ${int(res.scanned)} names · ${(res.suggest||[]).length} worth charting</div>`;
+    if ((res.suggest || []).length === 0) {
+      h += `<div class="placeholder">Nothing stands out right now — quiet tape is a valid answer. Re-scan tomorrow.</div>`;
+    } else {
+      for (const s of res.suggest) {
+        h += `<div class="kv"><span class="k"><b style="color:var(--text)">${esc(s.symbol)}</b> · ${esc(s.why)}</span>` +
+             `<span class="v"><button class="mini-btn" onclick="document.getElementById('ticker-hint').value='${esc(s.symbol)}';window.scrollTo({top:0,behavior:'smooth'})">chart this</button></span></div>`;
+      }
+    }
+    if ((res.avoid || []).length) {
+      h += `<div class="cfg-line" style="margin:14px 0 8px">FALLING &amp; ALIGNED — avoid opening; review if held:</div>`;
+      for (const s of res.avoid)
+        h += `<div class="kv"><span class="k" style="color:var(--dim)">${esc(s.symbol)} · ${esc(s.why)}</span><span class="v"></span></div>`;
+    }
+    h += `<div class="cfg-line" style="margin-top:12px">Candidates to CHART, not buys — the battery + confluence still decide.</div>`;
+    $("scout-result").innerHTML = h;
+  } catch (e) {
+    $("scout-result").innerHTML = `<div class="banner critical">${esc(String(e.message||e))}</div>`;
+  } finally { updateAnalyzeBtn(); }
+}
+
+/* ---------- paper book panel ---------- */
+async function renderBook() {
+  const secret = $("secret").value.trim();
+  if (!secret) return;
+  $("book-btn").disabled = true;
+  try {
+    const b = await fetchBook(secret);
+    let h = `<div style="display:flex;gap:28px;flex-wrap:wrap;margin:12px 0 14px">` +
+      `<div><div class="cfg-line">EQUITY</div><div style="font:500 22px var(--mono)">$${fmt(b.equity,2)}</div></div>` +
+      `<div><div class="cfg-line">CASH</div><div style="font:500 22px var(--mono)">$${fmt(b.cash,2)}</div></div>` +
+      `<div><div class="cfg-line">REALIZED P&amp;L</div><div style="font:500 22px var(--mono);color:${b.realized_pnl>=0?'var(--good)':'var(--critical)'}">$${fmt(b.realized_pnl,2)}</div></div>` +
+      `</div>`;
+    if (!b.positions.length) {
+      h += `<div class="placeholder">No open paper positions. A BUY verdict from the battery opens one.</div>`;
+    } else {
+      for (const p of b.positions) {
+        const badge = p.review_due
+          ? `<span class="badge due">review due — upload fresh charts</span>`
+          : `<span class="badge ok">review in ${fmt(p.review_in_days,1)}d</span>`;
+        const upnl = p.unrealized_pnl != null
+          ? ` · P&L <span style="color:${p.unrealized_pnl>=0?'var(--good)':'var(--critical)'}">$${fmt(p.unrealized_pnl,2)} (${pct(p.unrealized_pct,1)})</span>` : "";
+        const stop = p.stop_breached ? ` · <span style="color:var(--critical)">STOP BREACHED</span>` : "";
+        h += `<div class="kv" style="margin-bottom:6px"><span class="k">` +
+             `<b style="color:var(--text)">${esc(p.symbol)}</b> · ${p.qty} sh @ $${fmt(p.entry_price,2)}` +
+             (p.mark_price ? ` · now $${fmt(p.mark_price,2)}` : "") + upnl + stop +
+             ` · held ${fmt(p.age_trading_days,1)}d/${fmt(p.horizon_days,0)}d${badge}</span>` +
+             `<span class="v"><button class="mini-btn" onclick="paperCloseSymbol('${esc(p.symbol)}','manual close').then(renderBook)">close</button></span></div>`;
+      }
+    }
+    if ((b.review_due || []).length)
+      h += `<div class="warns" style="margin-top:10px">⚠ Review due: ${b.review_due.map(esc).join(", ")} — upload a fresh chart battery for each so the system can say HOLD or SELL.</div>`;
+    $("book-result").innerHTML = h;
+  } catch (e) {
+    $("book-result").innerHTML = `<div class="banner critical">${esc(String(e.message||e))}</div>`;
   } finally { updateAnalyzeBtn(); }
 }
 
 ROLES.forEach(wireSlot);
 $("secret").addEventListener("input", updateAnalyzeBtn);
 $("analyze-btn").addEventListener("click", analyzeBattery);
+$("scout-btn").addEventListener("click", runScout);
+$("book-btn").addEventListener("click", renderBook);
 $("refresh-btn").addEventListener("click", refresh);
 refresh();  // once on load; no auto-refresh — use the ↻ Refresh button
 </script>

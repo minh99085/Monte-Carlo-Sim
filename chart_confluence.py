@@ -41,14 +41,27 @@ def _to_float(value: Any) -> Optional[float]:
     return f if f == f else None  # drop NaN
 
 
-def combine(charts: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Combine per-chart summaries into one advisory stance.
+def combine(
+    charts: List[Dict[str, Any]],
+    position: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Combine per-chart summaries into one advisory stance + action verb.
 
     Each chart dict: role, bias, confidence, and optionally rsi + ticker.
-    Returns stance ALIGNED_LONG | MIXED | NO_TRADE | INCOMPLETE with a
+
+    Flat (no ``position``): stance ALIGNED_LONG | MIXED | NO_TRADE |
+    INCOMPLETE with action BUY | WAIT | AVOID | UPLOAD_MORE and a
     size_multiplier in (0, 1] when allowed (each caution flag halves it,
-    and they stack) and plain-language reasons.
+    and they stack).
+
+    Holding (``position`` = the open paper position for this symbol): the
+    question changes from "enter?" to "stay in?", so the same reads map to
+    HOLDING/EXIT with action HOLD | SELL — exits on a bearish weekly regime
+    (tide turned) or a bearish daily+ratio pair (deterioration). Long-only
+    account: there is never a short action.
     """
+    if position:
+        return _combine_holding(charts, position)
     by_role: Dict[str, Dict[str, Any]] = {}
     for c in charts or []:
         role = str(c.get("role", "")).strip().lower()
@@ -62,6 +75,7 @@ def combine(charts: List[Dict[str, Any]]) -> Dict[str, Any]:
     if missing:
         return {
             "stance": "INCOMPLETE",
+            "action": "UPLOAD_MORE",
             "allowed": False,
             "size_multiplier": 0.0,
             "reasons": [f"missing required chart(s): {', '.join(missing)}"],
@@ -76,6 +90,7 @@ def combine(charts: List[Dict[str, Any]]) -> Dict[str, Any]:
     if min_conf < MIN_CONFIDENCE:
         return {
             "stance": "NO_TRADE",
+            "action": "AVOID",
             "allowed": False,
             "size_multiplier": 0.0,
             "reasons": [
@@ -93,6 +108,7 @@ def combine(charts: List[Dict[str, Any]]) -> Dict[str, Any]:
     if t_w and t_d and t_w != t_d:
         return {
             "stance": "NO_TRADE",
+            "action": "AVOID",
             "allowed": False,
             "size_multiplier": 0.0,
             "reasons": [
@@ -110,6 +126,7 @@ def combine(charts: List[Dict[str, Any]]) -> Dict[str, Any]:
     if weekly_bias == "bearish":
         return {
             "stance": "NO_TRADE",
+            "action": "AVOID",
             "allowed": False,
             "size_multiplier": 0.0,
             "reasons": ["weekly regime is bearish — long-only account stays "
@@ -122,6 +139,7 @@ def combine(charts: List[Dict[str, Any]]) -> Dict[str, Any]:
     if daily_bias != "bullish":
         return {
             "stance": "MIXED",
+            "action": "WAIT",
             "allowed": False,
             "size_multiplier": 0.0,
             "reasons": [f"weekly regime is {weekly_bias} but daily timing "
@@ -156,9 +174,90 @@ def combine(charts: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     return {
         "stance": "ALIGNED_LONG",
+        "action": "BUY",
         "allowed": True,
         "size_multiplier": mult,
         "reasons": reasons,
         "warnings": warnings,
         "min_confidence": min_conf,
     }
+
+
+def _combine_holding(
+    charts: List[Dict[str, Any]],
+    position: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Already holding this symbol: HOLD or SELL, never a fresh BUY.
+
+    Conservative by construction: unreliable or incomplete reads keep the
+    position (HOLD with a warning) rather than acting on bad information;
+    exits require a clear signal — the weekly tide turning bearish, or the
+    daily AND ratio both bearish (deterioration while the tide is slack).
+    """
+    sym = str(position.get("symbol") or "").upper()
+    by_role: Dict[str, Dict[str, Any]] = {}
+    for c in charts or []:
+        role = str(c.get("role", "")).strip().lower()
+        if role in KNOWN_ROLES and role not in by_role:
+            by_role[role] = c
+
+    def hold(reasons: List[str], warnings: List[str],
+             min_conf: Optional[float]) -> Dict[str, Any]:
+        return {"stance": "HOLDING", "action": "HOLD", "allowed": False,
+                "size_multiplier": 0.0, "reasons": reasons,
+                "warnings": warnings, "min_confidence": min_conf}
+
+    missing = [r for r in REQUIRED_ROLES if r not in by_role]
+    if missing:
+        return hold(
+            [f"holding {sym}; missing chart(s) {', '.join(missing)} — "
+             "keeping the position until a full read says otherwise"],
+            ["upload weekly + daily charts to complete the review"], None)
+
+    confs = [_to_float(by_role[r].get("confidence")) or 0.0 for r in by_role]
+    min_conf = min(confs)
+    if min_conf < MIN_CONFIDENCE:
+        return hold(
+            [f"holding {sym}; chart-read confidence {min_conf:.2f} is under "
+             f"the {MIN_CONFIDENCE:.2f} floor — not exiting on unreliable "
+             "reads"],
+            ["re-upload clearer screenshots to complete the review"],
+            min_conf)
+
+    # Charts must be for the held symbol (ratio exempt).
+    t_w = str(by_role["weekly"].get("ticker") or "").strip().upper()
+    t_d = str(by_role["daily"].get("ticker") or "").strip().upper()
+    charted = {t for t in (t_w, t_d) if t}
+    if sym and charted and sym not in charted:
+        return hold(
+            [f"position is {sym} but charts read as "
+             f"{'/'.join(sorted(charted))} — review not applied"],
+            [f"upload {sym} charts to review this position"], min_conf)
+
+    weekly_bias = _norm_bias(by_role["weekly"].get("bias"))
+    daily_bias = _norm_bias(by_role["daily"].get("bias"))
+    ratio = by_role.get("ratio")
+    ratio_bias = _norm_bias(ratio.get("bias")) if ratio is not None else None
+
+    def sell(reason: str, warnings: List[str]) -> Dict[str, Any]:
+        return {"stance": "EXIT", "action": "SELL", "allowed": False,
+                "size_multiplier": 0.0, "reasons": [reason],
+                "warnings": warnings, "min_confidence": min_conf}
+
+    if weekly_bias == "bearish":
+        return sell(
+            f"weekly regime turned bearish — the tide that justified "
+            f"holding {sym} is gone; exit and hold cash", [])
+
+    if daily_bias == "bearish" and ratio_bias == "bearish":
+        return sell(
+            f"{sym} is deteriorating: daily timing bearish AND it is "
+            "lagging SPY — exit before the weekly turns", [])
+
+    reasons = [f"weekly regime is {weekly_bias} and daily is {daily_bias} — "
+               "thesis intact, keep holding"]
+    warnings: List[str] = []
+    if daily_bias == "bearish":
+        warnings.append("daily timing is bearish but the ratio holds up — "
+                        "watch closely; re-review in 2–3 trading days")
+    return hold(reasons, warnings, min_conf)
