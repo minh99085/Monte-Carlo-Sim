@@ -190,6 +190,58 @@ footer {
 a { color: var(--info); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
+/* ------- chart uploader ------- */
+.uploader { display: grid; gap: 16px; grid-template-columns: 340px 1fr; }
+@media (max-width: 900px) { .uploader { grid-template-columns: 1fr; } }
+.dropzone {
+  border: 1.5px dashed var(--hairline); border-radius: 10px;
+  background: var(--surface-2); padding: 22px 18px; text-align: center;
+  cursor: pointer; transition: border-color .15s, background .15s;
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  min-height: 150px; justify-content: center;
+}
+.dropzone:hover, .dropzone.drag { border-color: var(--info); background: rgba(107,169,245,.05); }
+.dropzone .hint { color: var(--muted); font-size: 12.5px; }
+.dropzone .hint b { color: var(--info); font-weight: 500; }
+.dropzone img { max-width: 100%; max-height: 180px; border-radius: 6px; }
+.controls { display: grid; gap: 12px; align-content: start; }
+.field { display: grid; gap: 6px; }
+.field label {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--muted);
+}
+.field input {
+  background: var(--surface-2); border: 1px solid var(--hairline);
+  border-radius: 6px; color: var(--text); font: 13px var(--mono);
+  padding: 9px 11px; width: 100%;
+}
+.field input:focus { outline: none; border-color: var(--info); }
+.row2 { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+.btn {
+  background: var(--info); color: #06101f; border: 0; border-radius: 7px;
+  font: 500 13px var(--sans); padding: 11px 16px; cursor: pointer;
+  transition: opacity .15s;
+}
+.btn:hover { opacity: .9; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.cfg-line {
+  font-family: var(--mono); font-size: 11px; color: var(--dim);
+  margin-top: 2px;
+}
+.cfg-line .on { color: var(--good); }
+.cfg-line .off { color: var(--warn); }
+.result { min-height: 150px; }
+.result .placeholder { color: var(--dim); font-size: 13px; padding: 20px 0; }
+.result .banner {
+  border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;
+  font-size: 13px; line-height: 1.4;
+}
+.result .banner.good { background: rgba(110,231,183,.08); color: var(--good); }
+.result .banner.info { background: rgba(107,169,245,.09); color: var(--info); }
+.result .banner.warn { background: rgba(245,201,123,.09); color: var(--warn); }
+.result .banner.critical { background: rgba(255,123,123,.09); color: var(--critical); }
+.result .warns { color: var(--warn); font-size: 12px; margin-top: 10px; }
+
 /* ------- accessibility ------- */
 @media (prefers-reduced-motion: reduce) {
   .title .dot { box-shadow: none; }
@@ -228,6 +280,38 @@ a:hover { text-decoration: underline; }
   <div class="card">
     <h3>Robinhood safety state</h3>
     <div id="bot-detail"></div>
+  </div>
+</div>
+
+<h2>Analyze a TradingView chart <span class="aux">— upload a screenshot; the vision model reads the indicators</span></h2>
+<div class="card">
+  <div class="uploader">
+    <div>
+      <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="Upload chart image">
+        <div class="hint" id="drop-hint">
+          <b>Choose a chart image</b> or drop it here<br>PNG / JPG · TradingView screenshot
+        </div>
+        <img id="preview" alt="" hidden>
+      </div>
+      <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="cfg-line" id="cfg-line">Checking vision provider…</div>
+    </div>
+    <div class="controls">
+      <div class="row2">
+        <div class="field">
+          <label for="ticker-hint">Ticker (optional)</label>
+          <input type="text" id="ticker-hint" placeholder="e.g. NVDA" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="secret">Dashboard secret</label>
+          <input type="password" id="secret" placeholder="required" autocomplete="off">
+        </div>
+      </div>
+      <button class="btn" id="analyze-btn" disabled>Analyze chart</button>
+      <div class="result" id="chart-result">
+        <div class="placeholder">Extracted indicators and the Monte-Carlo risk read will appear here. Paper only — no order is ever placed.</div>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -473,6 +557,173 @@ async function refresh() {
     $("clock").textContent = "reload failed";
   }
 }
+
+/* ------- chart upload ------- */
+let chartImage = null;  // { base64, mime }
+
+function chartResult(html) { $("chart-result").innerHTML = html; }
+
+function updateAnalyzeBtn() {
+  const ready = chartImage && $("secret").value.trim().length > 0;
+  $("analyze-btn").disabled = !ready;
+}
+
+async function loadChartConfig() {
+  try {
+    const r = await fetch("/dashboard/chart/config", { cache: "no-store" });
+    const c = await r.json();
+    if (!c || c.enabled === false) {
+      $("cfg-line").innerHTML = 'Vision <span class="off">disabled</span> — set CHART_VISION_PROVIDER on the bot.';
+      return;
+    }
+    const key = c.has_api_key
+      ? '<span class="on">key set</span>'
+      : '<span class="off">no API key</span>';
+    $("cfg-line").innerHTML =
+      `Provider <b>${esc(c.provider || "?")}</b> · ${esc(c.model || "")} · ${key} · MC ${int(c.mc_paths)} paths`;
+  } catch (e) {
+    $("cfg-line").innerHTML = '<span class="off">Bot API unreachable</span> — is the Robinhood container up?';
+  }
+}
+
+function setPreview(dataUrl) {
+  const img = $("preview");
+  img.src = dataUrl;
+  img.hidden = false;
+  $("drop-hint").style.display = "none";
+}
+
+function handleFile(file) {
+  if (!file || !file.type.startsWith("image/")) {
+    chartResult('<div class="banner critical">Please choose an image file (PNG or JPG).</div>');
+    return;
+  }
+  if (file.size > 11_000_000) {
+    chartResult('<div class="banner critical">Image is over ~11 MB. Export a smaller screenshot.</div>');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const dataUrl = reader.result;
+    const comma = dataUrl.indexOf(",");
+    chartImage = {
+      base64: dataUrl.slice(comma + 1),
+      mime: (dataUrl.slice(5, dataUrl.indexOf(";")) || file.type),
+    };
+    setPreview(dataUrl);
+    updateAnalyzeBtn();
+  };
+  reader.readAsDataURL(file);
+}
+
+function riskRow(k, v, cls) {
+  return `<div class="kv"><span class="k">${k}</span><span class="v ${cls || ""}">${v}</span></div>`;
+}
+
+function renderChartDecision(res) {
+  const ex = res.extraction || {};
+  const d = res.decision || null;
+  const val = res.validation || {};
+  const ind = ex.indicators || {};
+  const rsi = ind.rsi || {};
+
+  // Banner: colour by action + validation
+  let bannerCls = "info", action = "—";
+  if (d) {
+    action = (d.action || "flat").toUpperCase();
+    if (d.executable) bannerCls = "warn";        // paper still, but flagged tradeable
+    else if (action === "FLAT") bannerCls = "info";
+    else bannerCls = "good";
+  }
+  const vstatus = (d && d.validation_status) || val.status || "skipped";
+  let html = `<div class="banner ${bannerCls}">`;
+  html += `<b>${esc(ex.ticker || (d && d.ticker) || "chart")}</b> — recommendation: <b>${esc(action)}</b>`;
+  html += ` · validation: ${esc(vstatus)}`;
+  html += `<br><span style="font-size:12px;color:var(--muted)">Paper only — no order is placed. Executable: ${d ? d.executable : false}.</span>`;
+  html += `</div>`;
+
+  // What the image said
+  html += `<div style="margin-bottom:14px">`;
+  html += riskRow("Bias (from chart)", esc(ex.bias || "—"));
+  html += riskRow("RSI", rsi.value != null ? `${fmt(rsi.value,1)} ${esc(rsi.zone||"")}` : "—");
+  html += riskRow("Last price (image)", ex.image_last_price != null ? "$"+fmt(ex.image_last_price,2) : "—");
+  html += riskRow("Vision confidence", d ? pct(d.vision_confidence,0) : pct(ex.confidence && ex.confidence.overall,0),
+                  (d && d.vision_confidence < 0.45) ? "warn" : "");
+  html += `</div>`;
+
+  // Monte-Carlo risk read
+  if (d && d.risk) {
+    const r = d.risk;
+    html += `<div style="border-top:1px solid var(--hairline);padding-top:12px;margin-bottom:6px">`;
+    html += `<div class="cfg-line" style="margin-bottom:8px">MONTE-CARLO RISK · ${int(d.mc_paths)} paths · ${int(d.mc_horizon_days)}-day horizon</div>`;
+    html += riskRow("P(profit)", pct(r.prob_profit,0));
+    html += riskRow("Value at risk (95%)", r.var_95_pct != null ? pct(r.var_95_pct,1) : "—", "warn");
+    html += riskRow("Expected shortfall (95%)", r.es_95_pct != null ? pct(r.es_95_pct,1) : "—", "warn");
+    html += riskRow("Worst-case drawdown (p95)", r.max_drawdown_p95 != null ? pct(r.max_drawdown_p95,1) : "—", "critical");
+    if (d.position_size) {
+      html += riskRow("Suggested size", "$"+fmt(d.position_size.notional_usd,0)+" · "+fmt(d.position_size.shares,2)+" sh");
+      if (d.position_size.capped_by && d.position_size.capped_by.length)
+        html += riskRow("Capped by", esc(d.position_size.capped_by.join(", ")), "warn");
+    }
+    html += `</div>`;
+  }
+
+  if (d && d.rationale)
+    html += `<div style="font-size:12px;color:var(--muted);margin-top:10px">${esc(d.rationale)}</div>`;
+
+  const warns = res.warnings || [];
+  if (warns.length)
+    html += `<div class="warns">⚠ ${warns.map(esc).join("<br>⚠ ")}</div>`;
+
+  chartResult(html);
+}
+
+async function analyzeChart() {
+  if (!chartImage) return;
+  const btn = $("analyze-btn");
+  btn.disabled = true;
+  chartResult('<div class="placeholder">Reading the chart and running the simulation… this can take 10–30s.</div>');
+  try {
+    const r = await fetch("/dashboard/chart/analyze", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        image_base64: chartImage.base64,
+        mime_type: chartImage.mime,
+        ticker_hint: $("ticker-hint").value.trim() || null,
+        secret: $("secret").value.trim(),
+      }),
+    });
+    const res = await r.json();
+    if (!r.ok || res.ok === false) {
+      chartResult(`<div class="banner critical">${esc(res.error || ("Request failed ("+r.status+")"))}</div>`);
+    } else {
+      renderChartDecision(res);
+    }
+  } catch (e) {
+    chartResult(`<div class="banner critical">Upload failed: ${esc(String(e))}</div>`);
+  } finally {
+    updateAnalyzeBtn();
+  }
+}
+
+function wireUploader() {
+  const dz = $("dropzone"), fi = $("file-input");
+  dz.addEventListener("click", () => fi.click());
+  dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fi.click(); } });
+  fi.addEventListener("change", () => handleFile(fi.files[0]));
+  ["dragenter", "dragover"].forEach(ev =>
+    dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
+  ["dragleave", "drop"].forEach(ev =>
+    dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
+  dz.addEventListener("drop", (e) => {
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+  });
+  $("secret").addEventListener("input", updateAnalyzeBtn);
+  $("analyze-btn").addEventListener("click", analyzeChart);
+  loadChartConfig();
+}
+wireUploader();
 
 refresh();
 setInterval(refresh, 15000);

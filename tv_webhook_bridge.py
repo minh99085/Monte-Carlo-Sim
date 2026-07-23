@@ -35,6 +35,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+import urllib.error
+import urllib.request
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -45,6 +47,17 @@ DEFAULT_PORT = 5001
 DEFAULT_DATA_DIR = Path("tv_data")
 LATEST_FILENAME = "latest_signal.json"
 HISTORY_FILENAME = "signal_history.jsonl"
+
+# Chart-image uploads are base64 JSON, larger than a webhook alert. A
+# TradingView screenshot (base64-inflated ~33%) comfortably fits in 12 MB.
+MAX_CHART_UPLOAD_BYTES = 12_000_000
+# Fields the dashboard proxy is allowed to forward to the bot's chart API.
+# Everything else (including the dashboard secret) is dropped.
+_CHART_FORWARD_FIELDS = (
+    "image_base64", "image_url", "image_path", "mime_type",
+    "ticker_hint", "run_validation", "run_monte_carlo",
+    "mc_paths", "execution_mode",
+)
 
 # Consecutive identical signals (same ticker / trend / RSI bucket) within this
 # window are logged to history but do NOT rewrite latest_signal.json, so a
@@ -366,6 +379,50 @@ class BridgeState:
         self.dashboard_bot_api = dashboard_bot_api
 
 
+def _bot_request(
+    bot_api: str,
+    path: str,
+    *,
+    method: str = "GET",
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: float = 60.0,
+) -> Tuple[int, Dict[str, Any]]:
+    """Call the Robinhood bot's localhost HTTP API and return (status, json).
+
+    The bot API is bound to 127.0.0.1, so this server-side hop is the only
+    way a browser on the public dashboard can reach it — keeping the bot's
+    trust boundary intact. Any transport error is surfaced as a structured
+    dict rather than raised, so the dashboard degrades gracefully when the
+    bot container is down.
+    """
+    url = bot_api.rstrip("/") + path
+    data = None
+    headers = {"Accept": "application/json"}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            code = resp.getcode()
+    except urllib.error.HTTPError as exc:
+        # The bot answered with a non-2xx (e.g. 400/500) — pass its JSON body
+        # through so the operator sees the real reason.
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            return exc.code, json.loads(raw)
+        except (ValueError, TypeError):
+            return exc.code, {"ok": False, "error": raw or f"HTTP {exc.code}"}
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return 502, {"ok": False,
+                     "error": f"bot API unreachable at {url}: {exc}"}
+    try:
+        return code, json.loads(body)
+    except (ValueError, TypeError):
+        return code, {"ok": False, "error": "bot returned non-JSON response"}
+
+
 def make_handler(state: BridgeState):
     class WebhookHandler(BaseHTTPRequestHandler):
         # Quieter logs; we use the module logger
@@ -421,6 +478,15 @@ def make_handler(state: BridgeState):
                 self._send_json(200, snap)
                 return
 
+            # Chart-vision provider config (proxied from the bot). Read-only,
+            # no secrets: the bot returns has_api_key as a bool, never the key.
+            if path == "/dashboard/chart/config":
+                code, data = _bot_request(
+                    state.dashboard_bot_api, "/api/chart/config", timeout=10.0
+                )
+                self._send_json(code, data)
+                return
+
             if path in ("/", "/health"):
                 latest = load_latest(state.data_dir)
                 self._send_json(200, {
@@ -448,11 +514,60 @@ def make_handler(state: BridgeState):
 
             self._send_json(404, {"error": "not_found",
                 "paths": ["/", "/health", "/webhook", "/latest",
-                          "/dashboard", "/dashboard/api"]})
+                          "/dashboard", "/dashboard/api",
+                          "/dashboard/chart/config",
+                          "/dashboard/chart/analyze"]})
+
+        def _handle_chart_analyze(self) -> None:
+            """Proxy an operator's chart-image upload to the bot's vision API.
+
+            Secret-gated (the dashboard is public on port 80, and each call
+            spends paid vision-API credits) and size-capped. Only whitelisted
+            fields are forwarded; the secret is never passed to the bot.
+            """
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > MAX_CHART_UPLOAD_BYTES:
+                self._send_json(413, {"ok": False, "error": "image_too_large",
+                                      "max_bytes": MAX_CHART_UPLOAD_BYTES})
+                return
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8", errors="replace") or "null")
+            except json.JSONDecodeError:
+                body = None
+            if not isinstance(body, dict):
+                self._send_json(400, {"ok": False,
+                                      "error": "expected JSON object body"})
+                return
+
+            headers = self._headers_dict()
+            query = parse_qs(urlparse(self.path).query)
+            if not check_secret(headers, query, body, state.secret):
+                self._send_json(401, {"ok": False, "error": "unauthorized",
+                    "hint": "pass the dashboard secret"})
+                return
+
+            if not any(body.get(k) for k in
+                       ("image_base64", "image_url", "image_path")):
+                self._send_json(400, {"ok": False,
+                    "error": "provide image_base64, image_url, or image_path"})
+                return
+
+            forward = {k: body[k] for k in _CHART_FORWARD_FIELDS if k in body}
+            code, data = _bot_request(
+                state.dashboard_bot_api, "/api/chart/analyze",
+                method="POST", payload=forward, timeout=120.0,
+            )
+            logger.info("Chart analyze proxied → bot returned %s (ok=%s)",
+                        code, isinstance(data, dict) and data.get("ok"))
+            self._send_json(code, data)
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
+            if path == "/dashboard/chart/analyze":
+                self._handle_chart_analyze()
+                return
             if path != "/webhook":
                 self._send_json(404, {"error": "not_found", "use": "POST /webhook"})
                 return

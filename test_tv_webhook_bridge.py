@@ -203,6 +203,149 @@ def test_is_duplicate_signal_rules():
     assert not bridge.is_duplicate_signal(_rec(), None)
 
 
+# ---------------------------------------------------------------------------
+# Chart-vision upload proxy: dashboard (public) → bot /api/chart/analyze (local)
+# ---------------------------------------------------------------------------
+
+from http.server import BaseHTTPRequestHandler
+
+
+def _make_fake_bot_handler(rec: dict):
+    """Stand-in for the Robinhood bot's localhost chart API."""
+
+    class FakeBotHandler(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # silence
+            pass
+
+        def _json(self, code: int, obj: dict) -> None:
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/api/chart/config":
+                self._json(200, {"enabled": True, "provider": "xai",
+                                 "model": "grok-vision", "mc_paths": 100000,
+                                 "has_api_key": True})
+            else:
+                self._json(404, {"ok": False, "error": "not_found"})
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            rec["last"] = json.loads(self.rfile.read(n).decode())
+            rec["calls"].append(self.path)
+            self._json(200, {"ok": True,
+                             "extraction": {"ticker": "NVDA", "bias": "bullish",
+                                            "image_last_price": 120.5},
+                             "decision": {"ticker": "NVDA", "action": "long",
+                                          "executable": False,
+                                          "vision_confidence": 0.7,
+                                          "mc_paths": 100000, "mc_horizon_days": 5,
+                                          "risk": {"prob_profit": 0.55,
+                                                   "var_95_pct": -0.08}},
+                             "warnings": []})
+
+    return FakeBotHandler
+
+
+def _serve(port: int, handler):
+    httpd = bridge.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return httpd
+
+
+def test_chart_proxy_forwards_and_strips_secret(tmp_path: Path):
+    secret = "dash-secret"
+    rec = {"last": None, "calls": []}
+    bot = _serve(8781, _make_fake_bot_handler(rec))
+    state = bridge.BridgeState(secret=secret, data_dir=tmp_path,
+                               dashboard_bot_api="http://127.0.0.1:8781")
+    front = _serve(8782, bridge.make_handler(state))
+    time.sleep(0.15)
+    base = "http://127.0.0.1:8782"
+    try:
+        # config is proxied from the bot (has_api_key stays a bool)
+        code, cfg = _http_json("GET", f"{base}/dashboard/chart/config")
+        assert code == 200
+        assert cfg["provider"] == "xai" and cfg["has_api_key"] is True
+
+        # missing secret → 401, and the bot is never called
+        body = json.dumps({"image_base64": "QUJD", "mime_type": "image/png"}).encode()
+        code, _ = _http_json("POST", f"{base}/dashboard/chart/analyze",
+                             data=body, headers={"Content-Type": "application/json"})
+        assert code == 401
+        assert rec["calls"] == []
+
+        # correct secret → forwarded; secret + junk stripped before the bot
+        body = json.dumps({"image_base64": "QUJD", "mime_type": "image/png",
+                           "ticker_hint": "NVDA", "secret": secret,
+                           "junk": "x"}).encode()
+        code, res = _http_json("POST", f"{base}/dashboard/chart/analyze",
+                               data=body, headers={"Content-Type": "application/json"})
+        assert code == 200 and res["ok"] is True
+        assert res["decision"]["action"] == "long"
+        fwd = rec["last"]
+        assert fwd["image_base64"] == "QUJD"
+        assert fwd["ticker_hint"] == "NVDA"
+        assert "secret" not in fwd and "junk" not in fwd
+        assert rec["calls"] == ["/api/chart/analyze"]
+
+        # no image provided → 400 (bot still not called a second time)
+        body = json.dumps({"secret": secret}).encode()
+        code, _ = _http_json("POST", f"{base}/dashboard/chart/analyze",
+                             data=body, headers={"Content-Type": "application/json"})
+        assert code == 400
+        assert rec["calls"] == ["/api/chart/analyze"]
+    finally:
+        for s in (front, bot):
+            s.shutdown()
+            s.server_close()
+
+
+def test_chart_proxy_bot_unreachable(tmp_path: Path):
+    # Point the proxy at a dead port → clean 502, never a 500 crash.
+    state = bridge.BridgeState(secret="s", data_dir=tmp_path,
+                               dashboard_bot_api="http://127.0.0.1:9")
+    front = _serve(8783, bridge.make_handler(state))
+    time.sleep(0.15)
+    try:
+        body = json.dumps({"image_base64": "QUJD", "secret": "s"}).encode()
+        code, res = _http_json("POST", "http://127.0.0.1:8783/dashboard/chart/analyze",
+                               data=body, headers={"Content-Type": "application/json"})
+        assert code == 502
+        assert res["ok"] is False and "unreachable" in res["error"]
+    finally:
+        front.shutdown()
+        front.server_close()
+
+
+def test_chart_upload_size_cap(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(bridge, "MAX_CHART_UPLOAD_BYTES", 100)
+    state = bridge.BridgeState(secret="s", data_dir=tmp_path,
+                               dashboard_bot_api="http://127.0.0.1:9")
+    front = _serve(8784, bridge.make_handler(state))
+    time.sleep(0.15)
+    try:
+        big = json.dumps({"image_base64": "A" * 500, "secret": "s"}).encode()
+        code, res = _http_json("POST", "http://127.0.0.1:8784/dashboard/chart/analyze",
+                               data=big, headers={"Content-Type": "application/json"})
+        assert code == 413
+    finally:
+        front.shutdown()
+        front.server_close()
+
+
+def test_bot_request_unreachable_unit():
+    code, data = bridge._bot_request("http://127.0.0.1:9", "/api/chart/config",
+                                     timeout=1.0)
+    assert code == 502
+    assert data["ok"] is False and "unreachable" in data["error"]
+
+
 def test_server_hmac_and_dedupe(tmp_path: Path):
     secret, key = "s3cret", "hmac-key-123"
     host, port = "127.0.0.1", 8766
