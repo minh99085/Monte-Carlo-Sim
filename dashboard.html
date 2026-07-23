@@ -190,20 +190,30 @@ footer {
 a { color: var(--info); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
-/* ------- chart uploader ------- */
-.uploader { display: grid; gap: 16px; grid-template-columns: 340px 1fr; }
-@media (max-width: 900px) { .uploader { grid-template-columns: 1fr; } }
+/* ------- chart battery uploader ------- */
+.slots { display: grid; gap: 14px; grid-template-columns: repeat(3, 1fr); margin-bottom: 16px; }
+@media (max-width: 900px) { .slots { grid-template-columns: 1fr; } }
+.slot { display: grid; gap: 8px; align-content: start; }
+.slot .slot-label {
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--muted);
+}
+.slot .slot-label b { color: var(--text); }
+.slot .slot-q { font-size: 11.5px; color: var(--dim); }
 .dropzone {
   border: 1.5px dashed var(--hairline); border-radius: 10px;
-  background: var(--surface-2); padding: 22px 18px; text-align: center;
+  background: var(--surface-2); padding: 14px 12px; text-align: center;
   cursor: pointer; transition: border-color .15s, background .15s;
-  display: flex; flex-direction: column; align-items: center; gap: 10px;
-  min-height: 150px; justify-content: center;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  min-height: 110px; justify-content: center;
 }
 .dropzone:hover, .dropzone.drag { border-color: var(--info); background: rgba(107,169,245,.05); }
-.dropzone .hint { color: var(--muted); font-size: 12.5px; }
+.dropzone .hint { color: var(--muted); font-size: 12px; }
 .dropzone .hint b { color: var(--info); font-weight: 500; }
-.dropzone img { max-width: 100%; max-height: 180px; border-radius: 6px; }
+.dropzone img { max-width: 100%; max-height: 110px; border-radius: 6px; }
+.slot .slot-status { font-family: var(--mono); font-size: 11px; color: var(--dim); min-height: 15px; }
+.slot .slot-status .ok { color: var(--good); }
+.slot .slot-status .bad { color: var(--critical); }
 .controls { display: grid; gap: 12px; align-content: start; }
 .field { display: grid; gap: 6px; }
 .field label {
@@ -283,34 +293,55 @@ a:hover { text-decoration: underline; }
   </div>
 </div>
 
-<h2>Analyze a TradingView chart <span class="aux">— upload a screenshot; the vision model reads the indicators</span></h2>
+<h2>Chart battery — one asset, three views <span class="aux">— weekly regime · daily timing · strength vs market</span></h2>
 <div class="card">
-  <div class="uploader">
-    <div>
-      <div class="dropzone" id="dropzone" role="button" tabindex="0" aria-label="Upload chart image">
-        <div class="hint" id="drop-hint">
-          <b>Choose a chart image</b> or drop it here<br>PNG / JPG · TradingView screenshot
-        </div>
-        <img id="preview" alt="" hidden>
+  <div class="slots">
+    <div class="slot" data-role="weekly">
+      <div class="slot-label"><b>1 · Weekly regime</b> — 1W chart, ~3 years</div>
+      <div class="slot-q">Is the tide rising? EMA 9/21 + RSI on weekly bars.</div>
+      <div class="dropzone" id="dz-weekly" role="button" tabindex="0" aria-label="Upload weekly chart">
+        <div class="hint" id="hint-weekly"><b>Choose / drop</b> the 1W screenshot</div>
+        <img id="prev-weekly" alt="" hidden>
       </div>
-      <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden>
-      <div class="cfg-line" id="cfg-line">Checking vision provider…</div>
+      <input type="file" id="file-weekly" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="slot-status" id="st-weekly"></div>
     </div>
-    <div class="controls">
-      <div class="row2">
-        <div class="field">
-          <label for="ticker-hint">Ticker (optional)</label>
-          <input type="text" id="ticker-hint" placeholder="e.g. NVDA" autocomplete="off">
-        </div>
-        <div class="field">
-          <label for="secret">Dashboard secret</label>
-          <input type="password" id="secret" placeholder="required" autocomplete="off">
-        </div>
+    <div class="slot" data-role="daily">
+      <div class="slot-label"><b>2 · Daily timing</b> — 1D chart, ~9 months</div>
+      <div class="slot-q">Sane entry now? EMA 9/21 + MACD + volume on daily bars.</div>
+      <div class="dropzone" id="dz-daily" role="button" tabindex="0" aria-label="Upload daily chart">
+        <div class="hint" id="hint-daily"><b>Choose / drop</b> the 1D screenshot</div>
+        <img id="prev-daily" alt="" hidden>
       </div>
-      <button class="btn" id="analyze-btn" disabled>Analyze chart</button>
-      <div class="result" id="chart-result">
-        <div class="placeholder">Extracted indicators and the Monte-Carlo risk read will appear here. Paper only — no order is ever placed.</div>
+      <input type="file" id="file-daily" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="slot-status" id="st-daily"></div>
+    </div>
+    <div class="slot" data-role="ratio">
+      <div class="slot-label"><b>3 · Vs market</b> — ASSET/SPY 1D <span style="color:var(--dim)">(optional)</span></div>
+      <div class="slot-q">Beating the index? Chart the symbol ratio, e.g. <code>NVDA/SPY</code>, with MA50.</div>
+      <div class="dropzone" id="dz-ratio" role="button" tabindex="0" aria-label="Upload ratio chart">
+        <div class="hint" id="hint-ratio"><b>Choose / drop</b> the ratio screenshot</div>
+        <img id="prev-ratio" alt="" hidden>
       </div>
+      <input type="file" id="file-ratio" accept="image/png,image/jpeg,image/webp" hidden>
+      <div class="slot-status" id="st-ratio"></div>
+    </div>
+  </div>
+  <div class="controls">
+    <div class="row2">
+      <div class="field">
+        <label for="ticker-hint">Ticker</label>
+        <input type="text" id="ticker-hint" placeholder="e.g. NVDA" autocomplete="off">
+      </div>
+      <div class="field">
+        <label for="secret">Dashboard secret</label>
+        <input type="password" id="secret" placeholder="required" autocomplete="off">
+      </div>
+    </div>
+    <button class="btn" id="analyze-btn" disabled>Analyze charts</button>
+    <div class="cfg-line" id="cfg-line">Checking vision provider…</div>
+    <div class="result" id="chart-result">
+      <div class="placeholder">Upload at least the weekly and daily charts. Each is read by the vision model, then combined into one stance. Paper only — no order is ever placed.</div>
     </div>
   </div>
 </div>
@@ -558,13 +589,14 @@ async function refresh() {
   }
 }
 
-/* ------- chart upload ------- */
-let chartImage = null;  // { base64, mime }
+/* ------- chart battery upload ------- */
+const ROLES = ["weekly", "daily", "ratio"];
+const slots = { weekly: null, daily: null, ratio: null };  // { base64, mime }
 
 function chartResult(html) { $("chart-result").innerHTML = html; }
 
 function updateAnalyzeBtn() {
-  const ready = chartImage && $("secret").value.trim().length > 0;
+  const ready = slots.weekly && slots.daily && $("secret").value.trim().length > 0;
   $("analyze-btn").disabled = !ready;
 }
 
@@ -586,14 +618,7 @@ async function loadChartConfig() {
   }
 }
 
-function setPreview(dataUrl) {
-  const img = $("preview");
-  img.src = dataUrl;
-  img.hidden = false;
-  $("drop-hint").style.display = "none";
-}
-
-function handleFile(file) {
+function handleFile(role, file) {
   if (!file || !file.type.startsWith("image/")) {
     chartResult('<div class="banner critical">Please choose an image file (PNG or JPG).</div>');
     return;
@@ -606,11 +631,15 @@ function handleFile(file) {
   reader.onload = () => {
     const dataUrl = reader.result;
     const comma = dataUrl.indexOf(",");
-    chartImage = {
+    slots[role] = {
       base64: dataUrl.slice(comma + 1),
       mime: (dataUrl.slice(5, dataUrl.indexOf(";")) || file.type),
     };
-    setPreview(dataUrl);
+    const img = $("prev-" + role);
+    img.src = dataUrl;
+    img.hidden = false;
+    $("hint-" + role).style.display = "none";
+    $("st-" + role).textContent = "loaded";
     updateAnalyzeBtn();
   };
   reader.readAsDataURL(file);
@@ -620,107 +649,134 @@ function riskRow(k, v, cls) {
   return `<div class="kv"><span class="k">${k}</span><span class="v ${cls || ""}">${v}</span></div>`;
 }
 
-function renderChartDecision(res) {
+function chartSummary(role, res) {
+  // Compress one analyze response into what the confluence rules need.
   const ex = res.extraction || {};
   const d = res.decision || null;
-  const val = res.validation || {};
-  const ind = ex.indicators || {};
-  const rsi = ind.rsi || {};
+  const rsi = ((ex.indicators || {}).rsi || {});
+  const conf = d ? d.vision_confidence
+                 : ((ex.confidence || {}).overall != null ? ex.confidence.overall : 0);
+  return {
+    role: role,
+    ticker: ex.ticker || null,
+    bias: ex.bias || "neutral",
+    rsi: rsi.value != null ? rsi.value : null,
+    confidence: conf,
+  };
+}
 
-  // Banner: colour by action + validation
-  let bannerCls = "info", action = "—";
-  if (d) {
-    action = (d.action || "flat").toUpperCase();
-    if (d.executable) bannerCls = "warn";        // paper still, but flagged tradeable
-    else if (action === "FLAT") bannerCls = "info";
-    else bannerCls = "good";
+function renderBattery(summaries, results, conf) {
+  const mult = conf.size_multiplier;
+  const cls = conf.allowed ? "good" : (conf.stance === "INCOMPLETE" ? "info" : "warn");
+  let html = `<div class="banner ${cls}"><b>${esc(conf.stance.replace("_", " "))}</b>`;
+  if (conf.allowed) html += ` · size ×${fmt(mult, 2)}`;
+  html += `<br><span style="font-size:12px;color:var(--muted)">Paper only — advisory stance, no order is placed.</span></div>`;
+
+  html += `<div style="margin-bottom:12px">`;
+  for (const s of summaries) {
+    html += riskRow(
+      s.role + " read",
+      `${esc(s.ticker || "?")} · ${esc(s.bias)}` +
+        (s.rsi != null ? ` · RSI ${fmt(s.rsi, 0)}` : "") +
+        ` · conf ${pct(s.confidence, 0)}`,
+      s.bias === "bullish" ? "good" : (s.bias === "bearish" ? "critical" : ""));
   }
-  const vstatus = (d && d.validation_status) || val.status || "skipped";
-  let html = `<div class="banner ${bannerCls}">`;
-  html += `<b>${esc(ex.ticker || (d && d.ticker) || "chart")}</b> — recommendation: <b>${esc(action)}</b>`;
-  html += ` · validation: ${esc(vstatus)}`;
-  html += `<br><span style="font-size:12px;color:var(--muted)">Paper only — no order is placed. Executable: ${d ? d.executable : false}.</span>`;
   html += `</div>`;
 
-  // What the image said
-  html += `<div style="margin-bottom:14px">`;
-  html += riskRow("Bias (from chart)", esc(ex.bias || "—"));
-  html += riskRow("RSI", rsi.value != null ? `${fmt(rsi.value,1)} ${esc(rsi.zone||"")}` : "—");
-  html += riskRow("Last price (image)", ex.image_last_price != null ? "$"+fmt(ex.image_last_price,2) : "—");
-  html += riskRow("Vision confidence", d ? pct(d.vision_confidence,0) : pct(ex.confidence && ex.confidence.overall,0),
-                  (d && d.vision_confidence < 0.45) ? "warn" : "");
-  html += `</div>`;
+  const lines = [].concat(conf.reasons || [], (conf.warnings || []).map(w => "⚠ " + w));
+  if (lines.length)
+    html += `<div style="font-size:12.5px;color:var(--muted);line-height:1.6">${lines.map(esc).join("<br>")}</div>`;
 
-  // Monte-Carlo risk read
-  if (d && d.risk) {
-    const r = d.risk;
-    html += `<div style="border-top:1px solid var(--hairline);padding-top:12px;margin-bottom:6px">`;
-    html += `<div class="cfg-line" style="margin-bottom:8px">MONTE-CARLO RISK · ${int(d.mc_paths)} paths · ${int(d.mc_horizon_days)}-day horizon</div>`;
-    html += riskRow("P(profit)", pct(r.prob_profit,0));
-    html += riskRow("Value at risk (95%)", r.var_95_pct != null ? pct(r.var_95_pct,1) : "—", "warn");
-    html += riskRow("Expected shortfall (95%)", r.es_95_pct != null ? pct(r.es_95_pct,1) : "—", "warn");
-    html += riskRow("Worst-case drawdown (p95)", r.max_drawdown_p95 != null ? pct(r.max_drawdown_p95,1) : "—", "critical");
-    if (d.position_size) {
-      html += riskRow("Suggested size", "$"+fmt(d.position_size.notional_usd,0)+" · "+fmt(d.position_size.shares,2)+" sh");
-      if (d.position_size.capped_by && d.position_size.capped_by.length)
-        html += riskRow("Capped by", esc(d.position_size.capped_by.join(", ")), "warn");
+  // Monte-Carlo risk from the daily (timing) chart — the trade horizon.
+  const daily = results.daily && results.daily.decision;
+  if (daily && daily.risk) {
+    const r = daily.risk;
+    html += `<div style="border-top:1px solid var(--hairline);padding-top:12px;margin-top:12px">`;
+    html += `<div class="cfg-line" style="margin-bottom:8px">MONTE-CARLO RISK (daily chart) · ${int(daily.mc_paths)} paths · ${int(daily.mc_horizon_days)}-day horizon</div>`;
+    html += riskRow("P(profit)", pct(r.prob_profit, 0));
+    html += riskRow("Value at risk (95%)", r.var_95_pct != null ? pct(r.var_95_pct, 1) : "—", "warn");
+    html += riskRow("Worst-case drawdown (p95)", r.max_drawdown_p95 != null ? pct(r.max_drawdown_p95, 1) : "—", "critical");
+    if (daily.position_size && conf.allowed) {
+      const n = daily.position_size.notional_usd * mult;
+      html += riskRow("Suggested size (after confluence)", "$" + fmt(n, 0));
     }
     html += `</div>`;
   }
-
-  if (d && d.rationale)
-    html += `<div style="font-size:12px;color:var(--muted);margin-top:10px">${esc(d.rationale)}</div>`;
-
-  const warns = res.warnings || [];
-  if (warns.length)
-    html += `<div class="warns">⚠ ${warns.map(esc).join("<br>⚠ ")}</div>`;
-
   chartResult(html);
 }
 
-async function analyzeChart() {
-  if (!chartImage) return;
+async function analyzeOne(role, secret, ticker) {
+  const img = slots[role];
+  $("st-" + role).innerHTML = "analyzing…";
+  const r = await fetch("/dashboard/chart/analyze", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      image_base64: img.base64,
+      mime_type: img.mime,
+      ticker_hint: role === "ratio" ? (ticker ? ticker + "/SPY" : null) : (ticker || null),
+      secret: secret,
+    }),
+  });
+  const res = await r.json();
+  if (!r.ok || res.ok === false)
+    throw new Error(role + ": " + (res.error || ("failed (" + r.status + ")")));
+  $("st-" + role).innerHTML = '<span class="ok">read ✓</span>';
+  return res;
+}
+
+async function analyzeBattery() {
+  const secret = $("secret").value.trim();
+  const ticker = $("ticker-hint").value.trim().toUpperCase();
   const btn = $("analyze-btn");
   btn.disabled = true;
-  chartResult('<div class="placeholder">Reading the chart and running the simulation… this can take 10–30s.</div>');
+  chartResult('<div class="placeholder">Reading each chart with the vision model, then combining… 20–60s.</div>');
   try {
-    const r = await fetch("/dashboard/chart/analyze", {
+    const results = {}, summaries = [];
+    for (const role of ROLES) {
+      if (!slots[role]) continue;
+      try {
+        results[role] = await analyzeOne(role, secret, ticker);
+        summaries.push(chartSummary(role, results[role]));
+      } catch (e) {
+        $("st-" + role).innerHTML = '<span class="bad">failed</span>';
+        throw e;
+      }
+    }
+    const r = await fetch("/dashboard/chart/confluence", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        image_base64: chartImage.base64,
-        mime_type: chartImage.mime,
-        ticker_hint: $("ticker-hint").value.trim() || null,
-        secret: $("secret").value.trim(),
-      }),
+      body: JSON.stringify({ charts: summaries, secret: secret }),
     });
     const res = await r.json();
-    if (!r.ok || res.ok === false) {
-      chartResult(`<div class="banner critical">${esc(res.error || ("Request failed ("+r.status+")"))}</div>`);
-    } else {
-      renderChartDecision(res);
-    }
+    if (!r.ok || res.ok === false)
+      throw new Error(res.error || ("confluence failed (" + r.status + ")"));
+    renderBattery(summaries, results, res.confluence);
   } catch (e) {
-    chartResult(`<div class="banner critical">Upload failed: ${esc(String(e))}</div>`);
+    chartResult(`<div class="banner critical">${esc(String(e.message || e))}</div>`);
   } finally {
     updateAnalyzeBtn();
   }
 }
 
-function wireUploader() {
-  const dz = $("dropzone"), fi = $("file-input");
+function wireSlot(role) {
+  const dz = $("dz-" + role), fi = $("file-" + role);
   dz.addEventListener("click", () => fi.click());
   dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fi.click(); } });
-  fi.addEventListener("change", () => handleFile(fi.files[0]));
+  fi.addEventListener("change", () => handleFile(role, fi.files[0]));
   ["dragenter", "dragover"].forEach(ev =>
     dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
   ["dragleave", "drop"].forEach(ev =>
     dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
   dz.addEventListener("drop", (e) => {
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(role, e.dataTransfer.files[0]);
   });
+}
+
+function wireUploader() {
+  ROLES.forEach(wireSlot);
   $("secret").addEventListener("input", updateAnalyzeBtn);
-  $("analyze-btn").addEventListener("click", analyzeChart);
+  $("analyze-btn").addEventListener("click", analyzeBattery);
   loadChartConfig();
 }
 wireUploader();

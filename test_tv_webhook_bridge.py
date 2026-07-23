@@ -346,6 +346,42 @@ def test_bot_request_unreachable_unit():
     assert data["ok"] is False and "unreachable" in data["error"]
 
 
+def test_chart_confluence_route(tmp_path: Path):
+    state = bridge.BridgeState(secret="s", data_dir=tmp_path)
+    front = _serve(8785, bridge.make_handler(state))
+    time.sleep(0.15)
+    base = "http://127.0.0.1:8785/dashboard/chart/confluence"
+    try:
+        # No secret → 401
+        body = json.dumps({"charts": [{"role": "weekly"}]}).encode()
+        code, _ = _http_json("POST", base, data=body,
+                             headers={"Content-Type": "application/json"})
+        assert code == 401
+
+        # Aligned battery → ALIGNED_LONG through the HTTP layer
+        charts = [
+            {"role": "weekly", "bias": "bullish", "confidence": 0.8,
+             "ticker": "NVDA"},
+            {"role": "daily", "bias": "bullish", "confidence": 0.7,
+             "rsi": 55.0, "ticker": "NVDA"},
+        ]
+        body = json.dumps({"charts": charts, "secret": "s"}).encode()
+        code, res = _http_json("POST", base, data=body,
+                               headers={"Content-Type": "application/json"})
+        assert code == 200 and res["ok"] is True
+        assert res["confluence"]["stance"] == "ALIGNED_LONG"
+        assert res["confluence"]["size_multiplier"] == 1.0
+
+        # Missing charts list → 400
+        body = json.dumps({"secret": "s"}).encode()
+        code, _ = _http_json("POST", base, data=body,
+                             headers={"Content-Type": "application/json"})
+        assert code == 400
+    finally:
+        front.shutdown()
+        front.server_close()
+
+
 def test_server_hmac_and_dedupe(tmp_path: Path):
     secret, key = "s3cret", "hmac-key-123"
     host, port = "127.0.0.1", 8766

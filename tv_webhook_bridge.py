@@ -562,11 +562,53 @@ def make_handler(state: BridgeState):
                         code, isinstance(data, dict) and data.get("ok"))
             self._send_json(code, data)
 
+        def _handle_chart_confluence(self) -> None:
+            """Combine per-chart vision reads into one advisory stance.
+
+            Pure local computation (no bot call, no vision spend) but still
+            secret-gated so the public dashboard exposes nothing interactive
+            without the operator's secret.
+            """
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > 1_000_000:
+                self._send_json(413, {"ok": False, "error": "payload_too_large"})
+                return
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                body = json.loads(raw.decode("utf-8", errors="replace") or "null")
+            except json.JSONDecodeError:
+                body = None
+            if not isinstance(body, dict):
+                self._send_json(400, {"ok": False,
+                                      "error": "expected JSON object body"})
+                return
+            headers = self._headers_dict()
+            query = parse_qs(urlparse(self.path).query)
+            if not check_secret(headers, query, body, state.secret):
+                self._send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            charts = body.get("charts")
+            if not isinstance(charts, list) or not charts:
+                self._send_json(400, {"ok": False,
+                                      "error": "provide charts: [...]"})
+                return
+            try:
+                from chart_confluence import combine
+                verdict = combine(charts)
+            except Exception as exc:  # noqa: BLE001
+                self._send_json(500, {"ok": False,
+                                      "error": f"confluence_failed: {exc}"})
+                return
+            self._send_json(200, {"ok": True, "confluence": verdict})
+
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
             if path == "/dashboard/chart/analyze":
                 self._handle_chart_analyze()
+                return
+            if path == "/dashboard/chart/confluence":
+                self._handle_chart_confluence()
                 return
             if path != "/webhook":
                 self._send_json(404, {"error": "not_found", "use": "POST /webhook"})
