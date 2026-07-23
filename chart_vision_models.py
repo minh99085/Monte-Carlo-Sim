@@ -220,6 +220,10 @@ class MCPMarketSnapshot(BaseModel):
     portfolio_equity: Optional[float] = None
     buying_power: Optional[float] = None
     existing_position_qty: Optional[float] = None
+    # Indicators computed from REAL price history (mirrors the bot-side
+    # model; carried through so the MC decision and dashboard can show
+    # calculated truth next to the vision read).
+    computed_indicators: Optional[Dict[str, Any]] = None
     raw_quotes: Optional[Dict[str, Any]] = None
     raw_historicals: Optional[Dict[str, Any]] = None
     errors: List[str] = Field(default_factory=list)

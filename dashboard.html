@@ -345,11 +345,33 @@ function handleFile(role, file) {
   if (file.size > 11_000_000) { $("st-"+role).innerHTML = '<span class="bad">over 11 MB</span>'; return; }
   const reader = new FileReader();
   reader.onload = () => {
-    const url = reader.result, comma = url.indexOf(",");
-    slots[role] = { base64: url.slice(comma+1), mime: url.slice(5, url.indexOf(";")) || file.type };
-    const img = $("prev-"+role); img.src = url; img.hidden = false;
-    $("hint-"+role).style.display = "none"; $("st-"+role).textContent = "loaded";
-    updateAnalyzeBtn();
+    const url = reader.result;
+    // Vision models slice images into ~448px tiles; a small screenshot makes
+    // axis labels a few blurry tiles. Upscale narrow images 2x client-side
+    // so the numbers are sharp when Grok reads them.
+    const probe = new Image();
+    probe.onload = () => {
+      let finalUrl = url, note = "loaded";
+      if (probe.width > 0 && probe.width < 1400) {
+        try {
+          const c = document.createElement("canvas");
+          c.width = probe.width * 2; c.height = probe.height * 2;
+          const ctx = c.getContext("2d");
+          ctx.imageSmoothingEnabled = true;
+          ctx.imageSmoothingQuality = "high";
+          ctx.drawImage(probe, 0, 0, c.width, c.height);
+          finalUrl = c.toDataURL("image/png");
+          note = "loaded · sharpened 2×";
+        } catch (e) { /* keep original */ }
+      }
+      const comma = finalUrl.indexOf(",");
+      slots[role] = { base64: finalUrl.slice(comma+1),
+                      mime: finalUrl.slice(5, finalUrl.indexOf(";")) || file.type };
+      const img = $("prev-"+role); img.src = url; img.hidden = false;
+      $("hint-"+role).style.display = "none"; $("st-"+role).textContent = note;
+      updateAnalyzeBtn();
+    };
+    probe.src = url;
   };
   reader.readAsDataURL(file);
 }
@@ -426,6 +448,20 @@ function renderReport(summaries, results, conf) {
       matchCls = relErr <= 0.02 ? "good" : "warn";
     }
     h += `<div class="kv"><span class="k">Live price (from Robinhood)</span><span class="v ${matchCls}">$${fmt(liveP,2)}${matchTxt}</span></div>`;
+    const ci = dMcp.computed_indicators || {};
+    if (ci.rsi14 != null) {
+      const grokRsi = ((dEx.indicators || {}).rsi || {}).value;
+      let rsiTxt = `${fmt(ci.rsi14,0)}`, rsiCls = "";
+      if (grokRsi != null) {
+        const diff = Math.abs(grokRsi - ci.rsi14);
+        rsiTxt += diff <= 10 ? ` — Grok read ${fmt(grokRsi,0)}, agrees`
+                             : ` — Grok read ${fmt(grokRsi,0)}, off by ${fmt(diff,0)} pts`;
+        rsiCls = diff <= 10 ? "good" : "warn";
+      }
+      h += `<div class="kv"><span class="k">RSI (computed from real prices)</span><span class="v ${rsiCls}">${rsiTxt}</span></div>`;
+    }
+    if (ci.ema_cross)
+      h += `<div class="kv"><span class="k">EMA 9/21 (computed)</span><span class="v ${ci.ema_cross==='bullish'?'good':'critical'}">${esc(ci.ema_cross)}</span></div>`;
     if (dMcp.realized_vol_annual != null)
       h += `<div class="kv"><span class="k">Real volatility (per year)</span><span class="v">${pct(dMcp.realized_vol_annual,0)}</span></div>`;
     if (dMcp.buying_power != null)
