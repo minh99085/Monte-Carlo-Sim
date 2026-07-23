@@ -34,10 +34,22 @@ echo "    (open the printed URL in your LAPTOP browser; the callback returns"
 echo "     through your 'ssh -L 53682:127.0.0.1:53682' tunnel)"
 echo
 
+# The long-running agent container already binds host port 53682 (its
+# compose port mapping), so the one-off login container below cannot claim
+# it until the agent is stopped. Stop it, run the login, then bring the
+# whole stack back up.
+echo "==> Freeing the OAuth callback port (stopping the agent container)"
+docker compose --profile robinhood stop hermes-robinhood-agent 2>/dev/null || true
+
 # --rm: throwaway container; -p publishes the callback port for the tunnel.
 docker compose --profile robinhood run --rm -p 53682:53682 \
 	hermes-robinhood-agent python scripts/robinhood_oauth_login.py
 
 echo
-echo "==> If the token was saved, restart the bot so the agent picks it up:"
-echo "    cd $PLUGIN_DIR && docker compose --profile robinhood up -d"
+echo "==> Login flow finished. Bringing the full stack back up so the agent"
+echo "    picks up the saved token from the shared /data volume:"
+docker compose --profile robinhood --profile mc-bridge up -d
+echo
+echo "==> Verify the connection:"
+echo "    curl -s http://127.0.0.1:8810/api/health"
+echo "    (want: \"mcp_connected\":true and \"tool_count\" above 0)"
