@@ -54,6 +54,11 @@ header {
   font-family: var(--mono); font-size: 12px; color: var(--muted);
 }
 .meta code { background: var(--surface); padding: 3px 8px; border-radius: 4px; color: var(--text); }
+.mini-btn {
+  background: var(--surface); border: 1px solid var(--hairline); color: var(--text);
+  font: 11px var(--mono); padding: 4px 10px; border-radius: 5px; cursor: pointer;
+}
+.mini-btn:hover { border-color: var(--info); color: var(--info); }
 
 /* engine status strip */
 .strip { display: grid; gap: 14px; grid-template-columns: repeat(4, 1fr); margin-bottom: 30px; }
@@ -187,7 +192,7 @@ a:hover { text-decoration: underline; }
     </div>
   </div>
   <div class="meta">
-    <span>Auto-refresh <code>15s</code></span>
+    <button id="refresh-btn" class="mini-btn" title="Refresh engine status">↻ Refresh</button>
     <span id="clock">—</span>
   </div>
 </header>
@@ -494,6 +499,6 @@ async function analyzeBattery() {
 ROLES.forEach(wireSlot);
 $("secret").addEventListener("input", updateAnalyzeBtn);
 $("analyze-btn").addEventListener("click", analyzeBattery);
-refresh();
-setInterval(refresh, 15000);
+$("refresh-btn").addEventListener("click", refresh);
+refresh();  // once on load; no auto-refresh — use the ↻ Refresh button
 </script>
