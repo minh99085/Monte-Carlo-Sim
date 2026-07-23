@@ -3,7 +3,14 @@
 DRY_RUN: true
 
 universe:
-  tickers: [SPY, QQQ, XLK, NVDA, AAPL, MSFT]
+  # Broad, principled, NOT cherry-picked: the nine long-history SPDR sector
+  # ETFs (span the whole market, one clean bet per sector) plus small-caps
+  # (IWM) and emerging markets (EEM) for size + geography breadth. This is
+  # the honest fix for v1's failure — v1 traded the benchmark's own tech
+  # mega-cap components (SPY/QQQ/NVDA/AAPL/MSFT), which cannot out-run the
+  # index they sit inside. These names genuinely move differently from SPY.
+  # Chosen by a rule (all sectors + size + geography), not by backtest.
+  tickers: [XLE, XLF, XLV, XLI, XLP, XLU, XLB, XLY, XLK, IWM, EEM]
   benchmark: SPY
   # 12y so the reconstructed EMA-cross stream clears the 100-signal minimum
   # per symbol (8y yields ~80-95 after feature warm-up — under the bar).
