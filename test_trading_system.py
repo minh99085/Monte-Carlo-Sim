@@ -391,3 +391,28 @@ class TestDecision:
         path = write_verdict(v, tmp_path / "verdicts")
         data = json.loads(path.read_text())
         assert data["ticker"] == "EDGEA"
+
+    def test_gauntlet_pass_stamp_tracks_report_ready(self, tmp_path):
+        """Every verdict carries gauntlet_pass; True ONLY for ready:true."""
+        from trading_system.decision import decide, gauntlet_ready
+
+        cfg = _cfg(tmp_path)
+        fetch = _fetch_for(lambda s: edge_world_bars(2200, seed=1, symbol=s))
+        signal = {"ticker": "EDGEA", "trend": "bearish", "price": 100.0}
+
+        # No report on disk → False (the safe default).
+        missing = tmp_path / "nope" / "gauntlet_report.json"
+        v = decide(signal, cfg=cfg, fetch=fetch, gauntlet_report=missing)
+        assert v["gauntlet_pass"] is False
+
+        # ready:false and corrupt reports → False.
+        rpt = tmp_path / "gauntlet_report.json"
+        rpt.write_text(json.dumps({"ready": False}))
+        assert gauntlet_ready(rpt) is False
+        rpt.write_text("{not json")
+        assert gauntlet_ready(rpt) is False
+
+        # ready:true → the marker is stamped True.
+        rpt.write_text(json.dumps({"ready": True}))
+        v = decide(signal, cfg=cfg, fetch=fetch, gauntlet_report=rpt)
+        assert v["gauntlet_pass"] is True

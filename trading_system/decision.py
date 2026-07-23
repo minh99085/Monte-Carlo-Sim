@@ -29,6 +29,23 @@ from trading_system.model import fit_final_model
 from trading_system.primary import signal_history
 from trading_system.sizing import shares_for
 
+DEFAULT_GAUNTLET_REPORT = Path("outputs") / "gauntlet_report.json"
+
+
+def gauntlet_ready(report_path: Path | str = DEFAULT_GAUNTLET_REPORT) -> bool:
+    """True only while the current gauntlet report shows ALL gates passing.
+
+    This is the source of the ``gauntlet_pass`` marker stamped on every
+    verdict. The bot's bridge refuses to treat any unmarked verdict as
+    execution-eligible, so a missing/failed/unreadable report safely means
+    False — paper-only.
+    """
+    try:
+        report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(report, dict) and report.get("ready") is True
+
 
 def decide(
     signal: Dict[str, Any],
@@ -36,6 +53,7 @@ def decide(
     cfg: Optional[dict] = None,
     fetch: FetchFn = fetch_bars,
     now: Optional[datetime] = None,
+    gauntlet_report: Path | str = DEFAULT_GAUNTLET_REPORT,
 ) -> Dict[str, Any]:
     """Return a verdict dict for one normalized TV signal."""
     cfg = cfg or load_config()
@@ -51,6 +69,11 @@ def decide(
         "verdict": "NO_TRADE",
         "reason": "",
         "horizon_days": int(cfg["barriers"]["max_hold"]),
+        # Provenance marker: true ONLY while the full validation gauntlet
+        # (all six gates incl. the one-shot holdout) currently passes. The
+        # bot's bridge treats anything without this as paper-only, never
+        # executable.
+        "gauntlet_pass": gauntlet_ready(gauntlet_report),
     }
     if direction == "short":
         verdict["reason"] = "short signal — cash account cannot short; recorded only"
