@@ -1,9 +1,10 @@
-<!DOCTYPE html>
-<html lang="en" data-theme="dark">
-<head>
+<!-- Chart-vision trading console. Served at /dashboard by tv_webhook_bridge.
+     Centered on the live pipeline: Grok reads charts → Robinhood supplies
+     live facts → Monte-Carlo simulates risk → confluence gives one stance.
+     Paper-only; no order is ever placed from here. -->
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Trading Console — Monte Carlo + Robinhood</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chart Vision Console</title>
 <style>
 :root {
   --bg: #0B0E13;
@@ -24,24 +25,18 @@
 html, body { margin: 0; background: var(--bg); color: var(--text); }
 body {
   font: 14px/1.5 var(--sans);
-  font-feature-settings: "cv09", "ss01";
-  padding: 32px 40px 80px;
-  min-height: 100vh;
+  padding: 32px 40px 80px; min-height: 100vh;
 }
 @media (max-width: 720px) { body { padding: 24px 18px 64px; } }
 
-/* ------- header ------- */
 header {
   display: flex; align-items: baseline; justify-content: space-between;
   gap: 24px; flex-wrap: wrap;
-  padding-bottom: 20px; margin-bottom: 28px;
+  padding-bottom: 20px; margin-bottom: 24px;
   border-bottom: 1px solid var(--hairline);
 }
 .title { display: flex; align-items: baseline; gap: 14px; }
-.title h1 {
-  font: 500 22px/1 var(--sans); margin: 0;
-  letter-spacing: -0.01em;
-}
+.title h1 { font: 500 22px/1 var(--sans); margin: 0; letter-spacing: -0.01em; }
 .title .dot {
   width: 10px; height: 10px; border-radius: 50%;
   background: var(--good); box-shadow: 0 0 12px currentColor;
@@ -58,139 +53,44 @@ header {
   display: flex; align-items: center; gap: 18px;
   font-family: var(--mono); font-size: 12px; color: var(--muted);
 }
-.meta code {
-  background: var(--surface); padding: 3px 8px; border-radius: 4px;
-  color: var(--text);
-}
+.meta code { background: var(--surface); padding: 3px 8px; border-radius: 4px; color: var(--text); }
 
-/* ------- strip of 4 tiles ------- */
-.strip {
-  display: grid; gap: 14px;
-  grid-template-columns: repeat(4, 1fr);
-  margin-bottom: 28px;
-}
+/* engine status strip */
+.strip { display: grid; gap: 14px; grid-template-columns: repeat(4, 1fr); margin-bottom: 30px; }
 @media (max-width: 900px) { .strip { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 520px) { .strip { grid-template-columns: 1fr; } }
 .tile {
   background: var(--surface); border: 1px solid var(--hairline);
-  border-radius: 10px; padding: 16px 18px;
-  position: relative; overflow: hidden;
-  transition: border-color .15s;
+  border-radius: 10px; padding: 16px 18px; position: relative; overflow: hidden;
 }
-.tile::before {
-  content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
-  background: var(--muted);
-}
+.tile::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--muted); }
 .tile[data-state="good"]::before { background: var(--good); }
 .tile[data-state="info"]::before { background: var(--info); }
 .tile[data-state="warn"]::before { background: var(--warn); }
 .tile[data-state="critical"]::before { background: var(--critical); }
 .tile .label {
-  font-family: var(--mono); font-size: 10.5px;
-  letter-spacing: 0.14em; text-transform: uppercase;
-  color: var(--muted); margin-bottom: 8px;
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--muted); margin-bottom: 8px;
 }
-.tile .name {
-  font-size: 16px; font-weight: 500;
-  margin: 0 0 4px; letter-spacing: -0.005em;
-}
-.tile .detail {
-  font-size: 12.5px; color: var(--muted); line-height: 1.45;
-}
+.tile .name { font-size: 16px; font-weight: 500; margin: 0 0 4px; }
+.tile .detail { font-size: 12.5px; color: var(--muted); line-height: 1.45; }
 .tile .pill {
-  display: inline-block; margin-top: 12px;
-  font-family: var(--mono); font-size: 10.5px;
-  letter-spacing: 0.1em; text-transform: uppercase;
-  padding: 3px 8px; border-radius: 3px;
+  display: inline-block; margin-top: 12px; font-family: var(--mono); font-size: 10.5px;
+  letter-spacing: 0.1em; text-transform: uppercase; padding: 3px 8px; border-radius: 3px;
 }
 .tile[data-state="good"] .pill { background: rgba(110,231,183,.08); color: var(--good); }
 .tile[data-state="info"] .pill { background: rgba(107,169,245,.09); color: var(--info); }
 .tile[data-state="warn"] .pill { background: rgba(245,201,123,.09); color: var(--warn); }
 .tile[data-state="critical"] .pill { background: rgba(255,123,123,.09); color: var(--critical); }
 
-/* ------- section headings ------- */
 h2 {
-  font: 500 12.5px/1 var(--mono); letter-spacing: 0.14em;
-  text-transform: uppercase; color: var(--muted);
-  margin: 32px 0 14px;
+  font: 500 12.5px/1 var(--mono); letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--muted); margin: 32px 0 14px;
 }
 h2 .aux { color: var(--dim); margin-left: 10px; }
+.card { background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px; padding: 20px 22px; }
 
-/* ------- grid card ------- */
-.grid {
-  display: grid; gap: 18px;
-  grid-template-columns: 1fr 1fr;
-}
-@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
-.card {
-  background: var(--surface); border: 1px solid var(--hairline);
-  border-radius: 10px; padding: 20px 22px;
-}
-.card h3 {
-  font: 500 15px/1 var(--sans); margin: 0 0 14px;
-}
-
-/* ------- key/value ------- */
-.kv { display: grid; gap: 8px; grid-template-columns: 1fr auto; align-items: baseline; }
-.kv .k { color: var(--muted); font-size: 13px; }
-.kv .v { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
-.kv .v.good { color: var(--good); }
-.kv .v.info { color: var(--info); }
-.kv .v.warn { color: var(--warn); }
-.kv .v.critical { color: var(--critical); }
-
-/* ------- large numeric hero (track record) ------- */
-.record { display: flex; gap: 32px; flex-wrap: wrap; align-items: flex-end; }
-.record .fig {
-  font-family: var(--mono); font-variant-numeric: tabular-nums;
-  font-size: 34px; letter-spacing: -0.01em; line-height: 1;
-  color: var(--text);
-}
-.record .fig .unit { font-size: 15px; color: var(--muted); margin-left: 4px; }
-.record .cap {
-  font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.14em;
-  text-transform: uppercase; color: var(--muted); margin-top: 8px;
-}
-
-/* ------- tables ------- */
-table {
-  width: 100%; border-collapse: collapse;
-  font-family: var(--mono); font-size: 12.5px;
-  font-variant-numeric: tabular-nums;
-}
-th, td {
-  text-align: left; padding: 8px 10px;
-  border-bottom: 1px solid var(--hairline);
-}
-th {
-  font: 500 10.5px/1 var(--mono); letter-spacing: 0.12em;
-  text-transform: uppercase; color: var(--muted);
-  border-bottom-color: var(--hairline);
-}
-td.ticker { color: var(--text); font-weight: 500; }
-td.trade { color: var(--good); }
-td.no_trade { color: var(--muted); }
-td.dim { color: var(--dim); }
-tr:last-child td { border-bottom: 0; }
-.scroll { overflow-x: auto; margin: 0 -6px; }
-
-/* ------- empty state ------- */
-.empty {
-  text-align: center; padding: 28px 0;
-  color: var(--dim); font-size: 13px;
-}
-
-/* ------- footer ------- */
-footer {
-  margin-top: 40px; padding-top: 20px;
-  border-top: 1px solid var(--hairline);
-  font-family: var(--mono); font-size: 11px;
-  color: var(--dim); display: flex; justify-content: space-between;
-  flex-wrap: wrap; gap: 12px;
-}
-a { color: var(--info); text-decoration: none; }
-a:hover { text-decoration: underline; }
-
-/* ------- chart battery uploader ------- */
+/* chart battery */
 .slots { display: grid; gap: 14px; grid-template-columns: repeat(3, 1fr); margin-bottom: 16px; }
 @media (max-width: 900px) { .slots { grid-template-columns: 1fr; } }
 .slot { display: grid; gap: 8px; align-content: start; }
@@ -201,9 +101,9 @@ a:hover { text-decoration: underline; }
 .slot .slot-label b { color: var(--text); }
 .slot .slot-q { font-size: 11.5px; color: var(--dim); }
 .dropzone {
-  border: 1.5px dashed var(--hairline); border-radius: 10px;
-  background: var(--surface-2); padding: 14px 12px; text-align: center;
-  cursor: pointer; transition: border-color .15s, background .15s;
+  border: 1.5px dashed var(--hairline); border-radius: 10px; background: var(--surface-2);
+  padding: 14px 12px; text-align: center; cursor: pointer;
+  transition: border-color .15s, background .15s;
   display: flex; flex-direction: column; align-items: center; gap: 8px;
   min-height: 110px; justify-content: center;
 }
@@ -215,57 +115,75 @@ a:hover { text-decoration: underline; }
 .slot .slot-status .ok { color: var(--good); }
 .slot .slot-status .bad { color: var(--critical); }
 .controls { display: grid; gap: 12px; align-content: start; }
+.row2 { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
 .field { display: grid; gap: 6px; }
 .field label {
   font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em;
   text-transform: uppercase; color: var(--muted);
 }
 .field input {
-  background: var(--surface-2); border: 1px solid var(--hairline);
-  border-radius: 6px; color: var(--text); font: 13px var(--mono);
-  padding: 9px 11px; width: 100%;
+  background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 6px;
+  color: var(--text); font: 13px var(--mono); padding: 9px 11px; width: 100%;
 }
 .field input:focus { outline: none; border-color: var(--info); }
-.row2 { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
 .btn {
   background: var(--info); color: #06101f; border: 0; border-radius: 7px;
-  font: 500 13px var(--sans); padding: 11px 16px; cursor: pointer;
-  transition: opacity .15s;
+  font: 500 13px var(--sans); padding: 12px 16px; cursor: pointer; transition: opacity .15s;
 }
 .btn:hover { opacity: .9; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
-.cfg-line {
-  font-family: var(--mono); font-size: 11px; color: var(--dim);
-  margin-top: 2px;
-}
+.cfg-line { font-family: var(--mono); font-size: 11px; color: var(--dim); }
 .cfg-line .on { color: var(--good); }
 .cfg-line .off { color: var(--warn); }
-.result { min-height: 150px; }
-.result .placeholder { color: var(--dim); font-size: 13px; padding: 20px 0; }
-.result .banner {
-  border-radius: 8px; padding: 12px 14px; margin-bottom: 14px;
-  font-size: 13px; line-height: 1.4;
-}
-.result .banner.good { background: rgba(110,231,183,.08); color: var(--good); }
-.result .banner.info { background: rgba(107,169,245,.09); color: var(--info); }
-.result .banner.warn { background: rgba(245,201,123,.09); color: var(--warn); }
-.result .banner.critical { background: rgba(255,123,123,.09); color: var(--critical); }
-.result .warns { color: var(--warn); font-size: 12px; margin-top: 10px; }
 
-/* ------- accessibility ------- */
-@media (prefers-reduced-motion: reduce) {
-  .title .dot { box-shadow: none; }
+/* the explanation report */
+.result { margin-top: 4px; }
+.result .placeholder { color: var(--dim); font-size: 13px; padding: 8px 0; }
+.banner { border-radius: 8px; padding: 14px 16px; margin-bottom: 18px; font-size: 14px; line-height: 1.5; }
+.banner.good { background: rgba(110,231,183,.08); color: var(--good); }
+.banner.info { background: rgba(107,169,245,.09); color: var(--info); }
+.banner.warn { background: rgba(245,201,123,.09); color: var(--warn); }
+.banner.critical { background: rgba(255,123,123,.09); color: var(--critical); }
+.banner .sub { display:block; margin-top:6px; font-size:12px; color: var(--muted); }
+.step { border-left: 2px solid var(--hairline); padding: 2px 0 2px 16px; margin: 0 0 18px; }
+.step .head {
+  font: 500 13px var(--sans); color: var(--text); margin-bottom: 8px;
+  display: flex; align-items: center; gap: 8px;
 }
+.step .num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px; border-radius: 50%; flex: none;
+  background: var(--surface-2); color: var(--info);
+  font: 600 11px var(--mono); border: 1px solid var(--hairline);
+}
+.step .who { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); }
+.kv { display: grid; gap: 7px; grid-template-columns: 1fr auto; align-items: baseline; }
+.kv .k { color: var(--muted); font-size: 13px; }
+.kv .v { font-family: var(--mono); font-size: 13px; font-variant-numeric: tabular-nums; }
+.kv .v.good { color: var(--good); } .kv .v.info { color: var(--info); }
+.kv .v.warn { color: var(--warn); } .kv .v.critical { color: var(--critical); }
+.plain {
+  background: var(--surface-2); border-radius: 8px; padding: 14px 16px; margin-top: 6px;
+  font-size: 13.5px; line-height: 1.55; color: var(--text);
+}
+.plain b { color: var(--info); }
+
+footer {
+  margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--hairline);
+  font-family: var(--mono); font-size: 11px; color: var(--dim);
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px;
+}
+a { color: var(--info); text-decoration: none; }
+a:hover { text-decoration: underline; }
+@media (prefers-reduced-motion: reduce) { .title .dot { box-shadow: none; } }
 </style>
-</head>
-<body>
 
 <header>
   <div class="title" id="title" data-state="info">
     <span class="dot" aria-hidden="true"></span>
     <div>
-      <div class="kicker">Trading console</div>
-      <h1>Monte Carlo &nbsp;<span style="color: var(--dim); font-weight: 300;">+</span>&nbsp; Robinhood</h1>
+      <div class="kicker">Chart vision console</div>
+      <h1>Grok &nbsp;<span style="color:var(--dim);font-weight:300;">+</span>&nbsp; Robinhood &nbsp;<span style="color:var(--dim);font-weight:300;">+</span>&nbsp; Monte&nbsp;Carlo</h1>
     </div>
   </div>
   <div class="meta">
@@ -274,31 +192,15 @@ a:hover { text-decoration: underline; }
   </div>
 </header>
 
-<section class="strip" id="strip"></section>
+<!-- the four engines that do the work -->
+<section class="strip" id="engines"></section>
 
-<h2>Track record <span class="aux">— paper training verdicts settled against real prices</span></h2>
-<div class="card" id="record-card">
-  <div class="record" id="record"></div>
-  <div style="margin-top: 22px; display: grid; gap: 8px; grid-template-columns: 1fr auto;" id="record-detail"></div>
-</div>
-
-<div class="grid" style="margin-top: 22px;">
-  <div class="card">
-    <h3>Latest TradingView alert</h3>
-    <div id="signal-detail"></div>
-  </div>
-  <div class="card">
-    <h3>Robinhood safety state</h3>
-    <div id="bot-detail"></div>
-  </div>
-</div>
-
-<h2>Chart battery — one asset, three views <span class="aux">— weekly regime · daily timing · strength vs market</span></h2>
+<h2>Analyze one asset — three charts <span class="aux">weekly regime · daily timing · strength vs SPY</span></h2>
 <div class="card">
   <div class="slots">
     <div class="slot" data-role="weekly">
-      <div class="slot-label"><b>1 · Weekly regime</b> — 1W chart, ~3 years</div>
-      <div class="slot-q">Is the tide rising? EMA 9/21 + RSI on weekly bars.</div>
+      <div class="slot-label"><b>1 · Weekly regime</b> — 1W, ~3y</div>
+      <div class="slot-q">Is the tide rising? EMA 9/21 + RSI.</div>
       <div class="dropzone" id="dz-weekly" role="button" tabindex="0" aria-label="Upload weekly chart">
         <div class="hint" id="hint-weekly"><b>Choose / drop</b> the 1W screenshot</div>
         <img id="prev-weekly" alt="" hidden>
@@ -307,8 +209,8 @@ a:hover { text-decoration: underline; }
       <div class="slot-status" id="st-weekly"></div>
     </div>
     <div class="slot" data-role="daily">
-      <div class="slot-label"><b>2 · Daily timing</b> — 1D chart, ~9 months</div>
-      <div class="slot-q">Sane entry now? EMA 9/21 + MACD + volume on daily bars.</div>
+      <div class="slot-label"><b>2 · Daily timing</b> — 1D, ~9mo</div>
+      <div class="slot-q">Sane entry now? EMA 9/21 + MACD + volume.</div>
       <div class="dropzone" id="dz-daily" role="button" tabindex="0" aria-label="Upload daily chart">
         <div class="hint" id="hint-daily"><b>Choose / drop</b> the 1D screenshot</div>
         <img id="prev-daily" alt="" hidden>
@@ -318,7 +220,7 @@ a:hover { text-decoration: underline; }
     </div>
     <div class="slot" data-role="ratio">
       <div class="slot-label"><b>3 · Vs market</b> — ASSET/SPY 1D <span style="color:var(--dim)">(optional)</span></div>
-      <div class="slot-q">Beating the index? Chart the symbol ratio, e.g. <code>NVDA/SPY</code>, with MA50.</div>
+      <div class="slot-q">Beating the index? e.g. <code>NVDA/SPY</code> + MA50.</div>
       <div class="dropzone" id="dz-ratio" role="button" tabindex="0" aria-label="Upload ratio chart">
         <div class="hint" id="hint-ratio"><b>Choose / drop</b> the ratio screenshot</div>
         <img id="prev-ratio" alt="" hidden>
@@ -339,450 +241,259 @@ a:hover { text-decoration: underline; }
       </div>
     </div>
     <button class="btn" id="analyze-btn" disabled>Analyze charts</button>
-    <div class="cfg-line" id="cfg-line">Checking vision provider…</div>
-    <div class="result" id="chart-result">
-      <div class="placeholder">Upload at least the weekly and daily charts. Each is read by the vision model, then combined into one stance. Paper only — no order is ever placed.</div>
-    </div>
+    <div class="cfg-line" id="cfg-line">Checking engines…</div>
   </div>
 </div>
 
-<h2>Latest decisions <span class="aux">— what the brain said, newest first</span></h2>
+<h2>What the engines found <span class="aux">plain-language read after Grok, Robinhood &amp; Monte-Carlo finish</span></h2>
 <div class="card">
-  <div class="scroll">
-    <table id="verdicts">
-      <thead><tr>
-        <th>Time (UTC)</th><th>Ticker</th><th>Verdict</th>
-        <th>Side</th><th>Shares</th><th>Source</th><th>Reason</th>
-      </tr></thead>
-      <tbody><tr><td class="dim" colspan="7">Loading…</td></tr></tbody>
-    </table>
-  </div>
-</div>
-
-<h2>Bot bridge ledger <span class="aux">— what the paper bridge decided about each verdict</span></h2>
-<div class="card">
-  <div class="scroll">
-    <table id="ledger">
-      <thead><tr>
-        <th>Verdict file</th><th>Ticker</th><th>Verdict</th><th>Outcome</th>
-      </tr></thead>
-      <tbody><tr><td class="dim" colspan="4">Loading…</td></tr></tbody>
-    </table>
+  <div class="result" id="chart-result">
+    <div class="placeholder">Upload at least the weekly and daily charts, then press <b>Analyze charts</b>. A full step-by-step explanation appears here. Paper only — no order is ever placed.</div>
   </div>
 </div>
 
 <footer>
-  <span>Data reload every 15s · No orders are placed while paper mode is on</span>
-  <span>
-    <a href="/dashboard/api">JSON</a> ·
-    <a href="/health">Bridge health</a>
-  </span>
+  <span>Paper mode · no orders are placed from this console</span>
+  <span><a href="/dashboard/api">status JSON</a> · <a href="/health">bridge health</a></span>
 </footer>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const stateOf = (v) => (v && v.state) || "info";
-const STATES = ["good", "info", "warn", "critical"];
+function pct(x, d=1) { return (x===null||x===undefined||!isFinite(x)) ? "—" : (x*100).toFixed(d)+"%"; }
+function fmt(x, d=2) { return (x===null||x===undefined||!isFinite(x)) ? "—" : Number(x).toFixed(d); }
+function int(x) { return (x===null||x===undefined||!isFinite(x)) ? "—" : Math.round(x).toLocaleString(); }
+function esc(s) { const d=document.createElement("div"); d.textContent=(s===null||s===undefined)?"":String(s); return d.innerHTML; }
+function shortTime(iso) { if(!iso) return "—"; const d=new Date(iso); return isNaN(d)?"—":d.toUTCString().slice(17,25)+" UTC"; }
 
-function pct(x, digits=1) {
-  if (x === null || x === undefined || !isFinite(x)) return "—";
-  return (x * 100).toFixed(digits) + "%";
-}
-function fmt(x, digits=2) {
-  if (x === null || x === undefined || !isFinite(x)) return "—";
-  return Number(x).toFixed(digits);
-}
-function int(x) {
-  if (x === null || x === undefined) return "—";
-  return Number(x).toLocaleString();
-}
-function shortTime(iso) {
-  if (!iso) return "—";
-  return iso.replace("T", " ").replace("+00:00", "").replace("Z", "");
-}
-function pillLabel(state) {
-  return { good: "Healthy", info: "Idle", warn: "Attention", critical: "Critical" }[state] || state;
-}
-function esc(s) {
-  if (s === null || s === undefined) return "";
-  return String(s).replace(/[&<>"']/g, c => (
-    { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]
-  ));
+/* ---------- engine status strip ---------- */
+let lastConfig = null;
+
+function tile(label, name, detail, state, pill) {
+  return `<div class="tile" data-state="${state}">
+    <div class="label">${esc(label)}</div>
+    <div class="name">${name}</div>
+    <div class="detail">${detail}</div>
+    <span class="pill">${esc(pill)}</span>
+  </div>`;
 }
 
-function renderStrip(data) {
-  const tiles = [
-    {
-      name: "Brain",
-      label: "Monte Carlo sim",
-      state: data.brain.state,
-      detail: data.brain.detail,
-    },
-    {
-      name: "Signal",
-      label: "TradingView alert",
-      state: data.signal.state,
-      detail: data.signal.detail,
-    },
-    {
-      name: "Bridge",
-      label: "MC → Bot handoff",
-      state: data.bridge.state,
-      detail: data.bridge.detail,
-    },
-    {
-      name: "Bot",
-      label: "Robinhood executor",
-      state: data.bot.state,
-      detail: data.bot.detail,
-    },
-  ];
-  $("strip").innerHTML = tiles.map(t => `
-    <div class="tile" data-state="${t.state}">
-      <div class="label">${t.label}</div>
-      <div class="name">${t.name}</div>
-      <div class="detail">${esc(t.detail)}</div>
-      <div class="pill">${pillLabel(t.state)}</div>
-    </div>
-  `).join("");
-  $("title").dataset.state = data.overall_state;
-}
+function renderEngines(snap, cfg) {
+  const bot = (snap && snap.bot) || {};
+  // 1 — Grok (eyes)
+  let grok;
+  if (!cfg || cfg.enabled === false) grok = tile("Engine 1 · eyes", "Grok Vision", "Vision disabled on the bot", "warn", "off");
+  else if (!cfg.has_api_key) grok = tile("Engine 1 · eyes", "Grok Vision", "No API key set", "warn", "no key");
+  else grok = tile("Engine 1 · eyes", "Grok Vision", `Reads your charts · <b style="color:var(--text)">${esc(cfg.model||cfg.provider)}</b>`, "good", "ready");
 
-function renderRecord(data) {
-  const s = data.brain.stats || {};
-  const settled = s.n_settled_trades || 0;
-  const traded = s.n_trade_verdicts || 0;
-  const logged = s.n_logged || 0;
-  const hit = s.hit_rate;
-  const realized = s.mean_realized_pnl_pct;
-  const calibRatio = s.calibration_ratio;
+  // 2 — Robinhood live data (truth) — the headline of this rebuild
+  let rh;
+  if (!bot.reachable) rh = tile("Engine 2 · truth", "Robinhood", "Bot API not reachable", "warn", "offline");
+  else if (bot.mcp_connected) rh = tile("Engine 2 · truth", "Robinhood <span style='font-size:11px;color:var(--good)'>● LIVE</span>", `Pulling live quotes &amp; history · <b style="color:var(--text)">${int(bot.tool_count)}</b> tools`, "good", "connected");
+  else rh = tile("Engine 2 · truth", "Robinhood", "Connected bot, but market data link is down (OAuth)", "info", "no data");
 
-  $("record").innerHTML = `
-    <div>
-      <div class="fig">${int(logged)}<span class="unit">verdicts</span></div>
-      <div class="cap">Total decisions logged</div>
-    </div>
-    <div>
-      <div class="fig">${int(traded)}<span class="unit">trades</span></div>
-      <div class="cap">TRADE verdicts (not NO_TRADE)</div>
-    </div>
-    <div>
-      <div class="fig">${int(settled)}<span class="unit">settled</span></div>
-      <div class="cap">Matured against real prices</div>
-    </div>
-    <div>
-      <div class="fig">${hit === null || hit === undefined ? "—" : pct(hit, 0)}</div>
-      <div class="cap">Hit rate (settled)</div>
-    </div>
-    <div>
-      <div class="fig">${realized === null || realized === undefined ? "—" : pct(realized, 2)}</div>
-      <div class="cap">Mean realized P&L per trade</div>
-    </div>
-  `;
+  // 3 — Monte-Carlo (risk)
+  let mc;
+  const mounted = cfg && cfg.monte_carlo_sim_path === "/mc-sim";
+  if (cfg && mounted) mc = tile("Engine 3 · risk", "Monte-Carlo", `Simulates the future · <b style="color:var(--text)">${int(cfg.mc_paths)}</b> paths`, "good", "engine mounted");
+  else mc = tile("Engine 3 · risk", "Monte-Carlo", "Full engine not mounted — using fallback sim", "warn", "fallback");
 
-  const ks = data.brain.kill_switch || {};
-  const ksClass = ks.tripped ? "critical" : (settled >= 20 ? "good" : "info");
-  const ksText = ks.tripped ? "TRIPPED" : (settled >= 20 ? "Clear" : `Inactive (needs 20 settled, have ${settled})`);
+  // 4 — Safety
+  let safe;
+  if (bot.live_trading_enabled) safe = tile("Safety", "Live trading", "REAL orders can be placed", "critical", "LIVE ON");
+  else safe = tile("Safety", "Paper mode", "No order can be placed — paper only", "good", "safe");
 
-  const calibDays = data.brain.calibration_age_days;
-  const calibClass = calibDays === null ? "warn" : (calibDays > 30 ? "warn" : "good");
-  const calibText = calibDays === null ? "no tables" : `${calibDays.toFixed(1)} days ago`;
+  $("engines").innerHTML = grok + rh + mc + safe;
 
-  const calRatio = calibRatio === null || calibRatio === undefined ? "—" : calibRatio.toFixed(2);
-
-  $("record-detail").innerHTML = `
-    <div class="kv" style="grid-column: 1 / -1;">
-      <span class="k">Kill switch</span>
-      <span class="v ${ksClass}">${ksText}</span>
-    </div>
-    <div class="kv" style="grid-column: 1 / -1;">
-      <span class="k">Calibration tables</span>
-      <span class="v ${calibClass}">${data.brain.calibration_files} tables · last built ${calibText}</span>
-    </div>
-    <div class="kv" style="grid-column: 1 / -1;">
-      <span class="k">Calibration ratio (realized ÷ predicted)</span>
-      <span class="v">${calRatio}<span style="color: var(--dim); margin-left: 6px; letter-spacing: 0.05em;">1.0 = perfectly calibrated</span></span>
-    </div>
-  `;
-}
-
-function renderSignal(data) {
-  const s = data.signal;
-  const rows = [
-    ["Ticker", s.ticker || "—", ""],
-    ["Trend", s.trend || "—", ""],
-    ["RSI", s.rsi === null || s.rsi === undefined ? "—" : fmt(s.rsi, 1), ""],
-    ["Price", s.price ? "$" + fmt(s.price) : "—", ""],
-    ["Received", shortTime(s.received_at_utc) || "never", ""],
-    ["Age", s.age_hours === null || s.age_hours === undefined ? "—" : s.age_hours.toFixed(1) + " h",
-      s.age_hours !== null && s.age_hours > 30 ? "warn" : ""],
-  ];
-  $("signal-detail").innerHTML = rows.map(([k, v, cls]) => `
-    <div class="kv"><span class="k">${k}</span><span class="v ${cls}">${esc(v)}</span></div>
-  `).join("");
-}
-
-function renderBot(data) {
-  const b = data.bot;
-  const live = b.live_trading_enabled;
-  const rows = [
-    ["Bot API", b.reachable ? "Reachable" : "Not reachable", b.reachable ? "good" : "warn"],
-    ["Live trading", live ? "ON" : "OFF (paper)", live ? "critical" : "good"],
-    ["Robinhood MCP", b.mcp_connected ? "Connected" : "Not connected (OAuth pending)", b.mcp_connected ? "good" : "info"],
-    ["Tools available", int(b.tool_count), ""],
-  ];
-  $("bot-detail").innerHTML = rows.map(([k, v, cls]) => `
-    <div class="kv"><span class="k">${k}</span><span class="v ${cls}">${esc(v)}</span></div>
-  `).join("");
-}
-
-function renderVerdicts(data) {
-  const rows = data.verdicts || [];
-  const tbody = $("verdicts").querySelector("tbody");
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td class="dim" colspan="7">No verdicts yet — run <code>paper_train.py</code> or wait for the timer.</td></tr>`;
-    return;
-  }
-  tbody.innerHTML = rows.map(v => `
-    <tr>
-      <td class="dim">${shortTime(v.timestamp_utc)}</td>
-      <td class="ticker">${esc(v.ticker || "—")}</td>
-      <td class="${v.verdict === "TRADE" ? "trade" : "no_trade"}">${esc(v.verdict || "—")}</td>
-      <td>${esc(v.side || "—")}</td>
-      <td>${v.shares ? int(v.shares) : "—"}</td>
-      <td class="dim">${esc(v.source || "")}</td>
-      <td class="dim" title="${esc(v.reason || "")}">${esc((v.reason || "").slice(0, 84))}${v.reason && v.reason.length > 84 ? "…" : ""}</td>
-    </tr>
-  `).join("");
-}
-
-function renderLedger(data) {
-  const rows = (data.bridge.recent || []).slice().reverse();
-  const tbody = $("ledger").querySelector("tbody");
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td class="dim" colspan="4">No bridge decisions yet — verdict files haven't been processed.</td></tr>`;
-    return;
-  }
-  tbody.innerHTML = rows.map(r => `
-    <tr>
-      <td class="dim">${esc((r.verdict_id || "").replace(".json", ""))}</td>
-      <td class="ticker">${esc(r.ticker || "—")}</td>
-      <td class="${r.mc_verdict === "TRADE" ? "trade" : "no_trade"}">${esc(r.mc_verdict || "—")}</td>
-      <td>${esc(r.outcome || "")}</td>
-    </tr>
-  `).join("");
+  const worst = bot.live_trading_enabled ? "critical"
+    : (bot.reachable && bot.mcp_connected && cfg && cfg.has_api_key && mounted) ? "good" : "warn";
+  $("title").dataset.state = worst;
 }
 
 async function refresh() {
   try {
-    const r = await fetch("/dashboard/api", { cache: "no-store" });
-    const data = await r.json();
-    renderStrip(data);
-    renderRecord(data);
-    renderSignal(data);
-    renderBot(data);
-    renderVerdicts(data);
-    renderLedger(data);
-    $("clock").textContent = shortTime(data.generated_at_utc);
-  } catch (e) {
-    $("clock").textContent = "reload failed";
-  }
+    const [snapR, cfgR] = await Promise.allSettled([
+      fetch("/dashboard/api", { cache: "no-store" }).then(r => r.json()),
+      fetch("/dashboard/chart/config", { cache: "no-store" }).then(r => r.json()),
+    ]);
+    const snap = snapR.status === "fulfilled" ? snapR.value : null;
+    lastConfig = cfgR.status === "fulfilled" ? cfgR.value : lastConfig;
+    renderEngines(snap, lastConfig);
+    $("clock").textContent = shortTime(snap && snap.generated_at_utc);
+    // config line under the button
+    if (lastConfig && lastConfig.enabled !== false && lastConfig.has_api_key) {
+      $("cfg-line").innerHTML = `Provider <b>${esc(lastConfig.provider)}</b> · ${esc(lastConfig.model||"")} · <span class="on">ready</span> · MC ${int(lastConfig.mc_paths)} paths`;
+    } else {
+      $("cfg-line").innerHTML = '<span class="off">Vision not fully configured</span> — check the bot .env';
+    }
+  } catch (e) { $("clock").textContent = "reload failed"; }
 }
 
-/* ------- chart battery upload ------- */
+/* ---------- chart battery upload ---------- */
 const ROLES = ["weekly", "daily", "ratio"];
-const slots = { weekly: null, daily: null, ratio: null };  // { base64, mime }
-
-function chartResult(html) { $("chart-result").innerHTML = html; }
+const slots = { weekly: null, daily: null, ratio: null };
 
 function updateAnalyzeBtn() {
-  const ready = slots.weekly && slots.daily && $("secret").value.trim().length > 0;
-  $("analyze-btn").disabled = !ready;
+  $("analyze-btn").disabled = !(slots.weekly && slots.daily && $("secret").value.trim());
 }
-
-async function loadChartConfig() {
-  try {
-    const r = await fetch("/dashboard/chart/config", { cache: "no-store" });
-    const c = await r.json();
-    if (!c || c.enabled === false) {
-      $("cfg-line").innerHTML = 'Vision <span class="off">disabled</span> — set CHART_VISION_PROVIDER on the bot.';
-      return;
-    }
-    const key = c.has_api_key
-      ? '<span class="on">key set</span>'
-      : '<span class="off">no API key</span>';
-    $("cfg-line").innerHTML =
-      `Provider <b>${esc(c.provider || "?")}</b> · ${esc(c.model || "")} · ${key} · MC ${int(c.mc_paths)} paths`;
-  } catch (e) {
-    $("cfg-line").innerHTML = '<span class="off">Bot API unreachable</span> — is the Robinhood container up?';
-  }
-}
-
 function handleFile(role, file) {
-  if (!file || !file.type.startsWith("image/")) {
-    chartResult('<div class="banner critical">Please choose an image file (PNG or JPG).</div>');
-    return;
-  }
-  if (file.size > 11_000_000) {
-    chartResult('<div class="banner critical">Image is over ~11 MB. Export a smaller screenshot.</div>');
-    return;
-  }
+  if (!file || !file.type.startsWith("image/")) { $("st-"+role).innerHTML = '<span class="bad">not an image</span>'; return; }
+  if (file.size > 11_000_000) { $("st-"+role).innerHTML = '<span class="bad">over 11 MB</span>'; return; }
   const reader = new FileReader();
   reader.onload = () => {
-    const dataUrl = reader.result;
-    const comma = dataUrl.indexOf(",");
-    slots[role] = {
-      base64: dataUrl.slice(comma + 1),
-      mime: (dataUrl.slice(5, dataUrl.indexOf(";")) || file.type),
-    };
-    const img = $("prev-" + role);
-    img.src = dataUrl;
-    img.hidden = false;
-    $("hint-" + role).style.display = "none";
-    $("st-" + role).textContent = "loaded";
+    const url = reader.result, comma = url.indexOf(",");
+    slots[role] = { base64: url.slice(comma+1), mime: url.slice(5, url.indexOf(";")) || file.type };
+    const img = $("prev-"+role); img.src = url; img.hidden = false;
+    $("hint-"+role).style.display = "none"; $("st-"+role).textContent = "loaded";
     updateAnalyzeBtn();
   };
   reader.readAsDataURL(file);
 }
-
-function riskRow(k, v, cls) {
-  return `<div class="kv"><span class="k">${k}</span><span class="v ${cls || ""}">${v}</span></div>`;
-}
-
-function chartSummary(role, res) {
-  // Compress one analyze response into what the confluence rules need.
-  const ex = res.extraction || {};
-  const d = res.decision || null;
-  const rsi = ((ex.indicators || {}).rsi || {});
-  const conf = d ? d.vision_confidence
-                 : ((ex.confidence || {}).overall != null ? ex.confidence.overall : 0);
-  return {
-    role: role,
-    ticker: ex.ticker || null,
-    bias: ex.bias || "neutral",
-    rsi: rsi.value != null ? rsi.value : null,
-    confidence: conf,
-  };
-}
-
-function renderBattery(summaries, results, conf) {
-  const mult = conf.size_multiplier;
-  const cls = conf.allowed ? "good" : (conf.stance === "INCOMPLETE" ? "info" : "warn");
-  let html = `<div class="banner ${cls}"><b>${esc(conf.stance.replace("_", " "))}</b>`;
-  if (conf.allowed) html += ` · size ×${fmt(mult, 2)}`;
-  html += `<br><span style="font-size:12px;color:var(--muted)">Paper only — advisory stance, no order is placed.</span></div>`;
-
-  html += `<div style="margin-bottom:12px">`;
-  for (const s of summaries) {
-    html += riskRow(
-      s.role + " read",
-      `${esc(s.ticker || "?")} · ${esc(s.bias)}` +
-        (s.rsi != null ? ` · RSI ${fmt(s.rsi, 0)}` : "") +
-        ` · conf ${pct(s.confidence, 0)}`,
-      s.bias === "bullish" ? "good" : (s.bias === "bearish" ? "critical" : ""));
-  }
-  html += `</div>`;
-
-  const lines = [].concat(conf.reasons || [], (conf.warnings || []).map(w => "⚠ " + w));
-  if (lines.length)
-    html += `<div style="font-size:12.5px;color:var(--muted);line-height:1.6">${lines.map(esc).join("<br>")}</div>`;
-
-  // Monte-Carlo risk from the daily (timing) chart — the trade horizon.
-  const daily = results.daily && results.daily.decision;
-  if (daily && daily.risk) {
-    const r = daily.risk;
-    html += `<div style="border-top:1px solid var(--hairline);padding-top:12px;margin-top:12px">`;
-    html += `<div class="cfg-line" style="margin-bottom:8px">MONTE-CARLO RISK (daily chart) · ${int(daily.mc_paths)} paths · ${int(daily.mc_horizon_days)}-day horizon</div>`;
-    html += riskRow("P(profit)", pct(r.prob_profit, 0));
-    html += riskRow("Value at risk (95%)", r.var_95_pct != null ? pct(r.var_95_pct, 1) : "—", "warn");
-    html += riskRow("Worst-case drawdown (p95)", r.max_drawdown_p95 != null ? pct(r.max_drawdown_p95, 1) : "—", "critical");
-    if (daily.position_size && conf.allowed) {
-      const n = daily.position_size.notional_usd * mult;
-      html += riskRow("Suggested size (after confluence)", "$" + fmt(n, 0));
-    }
-    html += `</div>`;
-  }
-  chartResult(html);
+function wireSlot(role) {
+  const dz = $("dz-"+role), fi = $("file-"+role);
+  dz.addEventListener("click", () => fi.click());
+  dz.addEventListener("keydown", e => { if (e.key==="Enter"||e.key===" ") { e.preventDefault(); fi.click(); } });
+  fi.addEventListener("change", () => handleFile(role, fi.files[0]));
+  ["dragenter","dragover"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.add("drag"); }));
+  ["dragleave","drop"].forEach(ev => dz.addEventListener(ev, e => { e.preventDefault(); dz.classList.remove("drag"); }));
+  dz.addEventListener("drop", e => { if (e.dataTransfer.files[0]) handleFile(role, e.dataTransfer.files[0]); });
 }
 
 async function analyzeOne(role, secret, ticker) {
   const img = slots[role];
-  $("st-" + role).innerHTML = "analyzing…";
+  $("st-"+role).innerHTML = "analyzing…";
   const r = await fetch("/dashboard/chart/analyze", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+    method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      image_base64: img.base64,
-      mime_type: img.mime,
-      ticker_hint: role === "ratio" ? (ticker ? ticker + "/SPY" : null) : (ticker || null),
+      image_base64: img.base64, mime_type: img.mime,
+      ticker_hint: role === "ratio" ? (ticker ? ticker+"/SPY" : null) : (ticker || null),
       secret: secret,
     }),
   });
   const res = await r.json();
-  if (!r.ok || res.ok === false)
-    throw new Error(role + ": " + (res.error || ("failed (" + r.status + ")")));
-  $("st-" + role).innerHTML = '<span class="ok">read ✓</span>';
+  if (!r.ok || res.ok === false) throw new Error(role + ": " + (res.error || ("failed ("+r.status+")")));
+  $("st-"+role).innerHTML = '<span class="ok">read ✓</span>';
   return res;
+}
+
+function summarize(role, res) {
+  const ex = res.extraction || {}, d = res.decision || null;
+  const rsi = (ex.indicators || {}).rsi || {};
+  const conf = d ? d.vision_confidence : ((ex.confidence || {}).overall);
+  return { role, ticker: ex.ticker || null, bias: ex.bias || "neutral",
+           rsi: rsi.value != null ? rsi.value : null, confidence: conf };
+}
+
+/* the comprehensive, plain-language explanation */
+function renderReport(summaries, results, conf) {
+  const daily = results.daily || {};
+  const dDec = daily.decision || {};
+  const dVal = daily.validation || {};
+  const dMcp = daily.mcp || {};
+  const dEx = daily.extraction || {};
+
+  // --- stance banner ---
+  const mult = conf.size_multiplier;
+  const cls = conf.allowed ? "good" : (conf.stance === "INCOMPLETE" ? "info" : "warn");
+  const label = conf.stance.replace("_"," ");
+  let h = `<div class="banner ${cls}"><b style="font-size:15px">${esc(label)}</b>`;
+  if (conf.allowed) h += ` &nbsp;·&nbsp; suggested size ×${fmt(mult,2)}`;
+  h += `<span class="sub">Paper only — this is an advisory read, no order is placed.</span></div>`;
+
+  // --- ① Grok read the charts ---
+  h += `<div class="step"><div class="head"><span class="num">1</span>Grok read your charts <span class="who">the eyes</span></div>`;
+  for (const s of summaries) {
+    const c = s.bias === "bullish" ? "good" : (s.bias === "bearish" ? "critical" : "");
+    const roleName = {weekly:"Weekly (regime)", daily:"Daily (timing)", ratio:"Vs market (ratio)"}[s.role] || s.role;
+    h += `<div class="kv"><span class="k">${roleName}</span><span class="v ${c}">${esc(s.ticker||"?")} · ${esc(s.bias)}${s.rsi!=null?` · RSI ${fmt(s.rsi,0)}`:""} · ${pct(s.confidence,0)} sure</span></div>`;
+  }
+  h += `</div>`;
+
+  // --- ② Robinhood checked the facts (LIVE) ---
+  h += `<div class="step"><div class="head"><span class="num">2</span>Robinhood checked the facts <span class="who">the truth · live</span></div>`;
+  const liveP = dMcp.last_price;
+  const imgP = dEx.image_last_price;
+  if (liveP != null) {
+    let matchTxt = "", matchCls = "good";
+    if (imgP != null && liveP) {
+      const relErr = Math.abs(imgP - liveP) / liveP;
+      matchTxt = relErr <= 0.02 ? ` — your chart showed $${fmt(imgP,2)}, matches (±${pct(relErr,1)})`
+                                : ` — your chart showed $${fmt(imgP,2)}, off by ${pct(relErr,1)}`;
+      matchCls = relErr <= 0.02 ? "good" : "warn";
+    }
+    h += `<div class="kv"><span class="k">Live price (from Robinhood)</span><span class="v ${matchCls}">$${fmt(liveP,2)}${matchTxt}</span></div>`;
+    if (dMcp.realized_vol_annual != null)
+      h += `<div class="kv"><span class="k">Real volatility (per year)</span><span class="v">${pct(dMcp.realized_vol_annual,0)}</span></div>`;
+    if (dMcp.buying_power != null)
+      h += `<div class="kv"><span class="k">Your buying power</span><span class="v">$${fmt(dMcp.buying_power,0)}</span></div>`;
+    const vstat = dVal.status || dDec.validation_status || "—";
+    h += `<div class="kv"><span class="k">Cross-check</span><span class="v ${String(vstat).includes('valid')?'good':'warn'}">${esc(vstat)}</span></div>`;
+  } else {
+    h += `<div class="plain">Robinhood live data wasn't available for this read, so the numbers below come from the <b>chart image only</b> and are unverified. Connect Robinhood (OAuth) to fact-check prices against live quotes.</div>`;
+  }
+  h += `</div>`;
+
+  // --- ③ Monte-Carlo simulated the future ---
+  h += `<div class="step"><div class="head"><span class="num">3</span>Monte-Carlo simulated the future <span class="who">the risk</span></div>`;
+  const risk = dDec.risk || {};
+  const start = dDec.starting_price;
+  h += `<div class="kv"><span class="k">Simulated</span><span class="v">${int(dDec.mc_paths)} futures · ${int(dDec.mc_horizon_days)}-day horizon${start!=null?` · from $${fmt(start,2)}`:""}</span></div>`;
+  h += `<div class="kv"><span class="k">Chance of profit</span><span class="v ${risk.prob_profit>=0.5?'good':'warn'}">${pct(risk.prob_profit,0)}</span></div>`;
+  h += `<div class="kv"><span class="k">Value at risk (95%)</span><span class="v warn">${risk.var_95_pct!=null?pct(risk.var_95_pct,1):"—"}</span></div>`;
+  h += `<div class="kv"><span class="k">Worst-case drawdown</span><span class="v critical">${risk.max_drawdown_p95!=null?pct(risk.max_drawdown_p95,1):"—"}</span></div>`;
+  h += `</div>`;
+
+  // --- ④ the verdict + plain meaning ---
+  h += `<div class="step"><div class="head"><span class="num">4</span>The verdict <span class="who">what to do</span></div>`;
+  const reasons = [].concat(conf.reasons || [], (conf.warnings || []).map(w => "⚠ "+w));
+  if (reasons.length) h += `<div style="font-size:12.5px;color:var(--muted);line-height:1.65">${reasons.map(esc).join("<br>")}</div>`;
+  h += `<div class="plain">${plainMeaning(summaries, conf, risk)}</div>`;
+  h += `</div>`;
+
+  $("chart-result").innerHTML = h;
+}
+
+/* one honest sentence a non-trader can act on */
+function plainMeaning(summaries, conf, risk) {
+  const t = (summaries[0] && summaries[0].ticker) || "this asset";
+  if (conf.stance === "INCOMPLETE")
+    return `Upload at least the <b>weekly</b> and <b>daily</b> charts so the system can judge both the trend and the timing.`;
+  if (conf.stance === "NO_TRADE")
+    return `The system says <b>do not buy ${esc(t)} here.</b> ${esc(conf.reasons[0]||"")}. Sitting in cash is the call. No order placed.`;
+  if (conf.stance === "MIXED")
+    return `<b>Wait — don't buy ${esc(t)} yet.</b> The bigger trend may be up, but the pieces don't agree, so there's no clean entry right now. Watch it; re-run when the daily chart turns. No order placed.`;
+  // ALIGNED_LONG
+  const pp = risk.prob_profit;
+  const confNote = (pp!=null && pp < 0.5) ? " — though the simulation still puts profit odds under half, so keep size small" : "";
+  return `The charts agree <b>bullish on ${esc(t)}</b> and the risk read is acceptable${confNote}. If this were live, the system would take it at <b>×${fmt(conf.size_multiplier,2)}</b> of full size. It stays paper until the validation gauntlet passes — no order placed.`;
 }
 
 async function analyzeBattery() {
   const secret = $("secret").value.trim();
   const ticker = $("ticker-hint").value.trim().toUpperCase();
-  const btn = $("analyze-btn");
-  btn.disabled = true;
-  chartResult('<div class="placeholder">Reading each chart with the vision model, then combining… 20–60s.</div>');
+  $("analyze-btn").disabled = true;
+  $("chart-result").innerHTML = '<div class="placeholder">Grok is reading each chart, Robinhood is fetching live data, and Monte-Carlo is simulating… 20–60s.</div>';
   try {
     const results = {}, summaries = [];
     for (const role of ROLES) {
       if (!slots[role]) continue;
-      try {
-        results[role] = await analyzeOne(role, secret, ticker);
-        summaries.push(chartSummary(role, results[role]));
-      } catch (e) {
-        $("st-" + role).innerHTML = '<span class="bad">failed</span>';
-        throw e;
-      }
+      try { results[role] = await analyzeOne(role, secret, ticker); summaries.push(summarize(role, results[role])); }
+      catch (e) { $("st-"+role).innerHTML = '<span class="bad">failed</span>'; throw e; }
     }
     const r = await fetch("/dashboard/chart/confluence", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ charts: summaries, secret: secret }),
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ charts: summaries, secret }),
     });
     const res = await r.json();
-    if (!r.ok || res.ok === false)
-      throw new Error(res.error || ("confluence failed (" + r.status + ")"));
-    renderBattery(summaries, results, res.confluence);
+    if (!r.ok || res.ok === false) throw new Error(res.error || ("confluence failed ("+r.status+")"));
+    renderReport(summaries, results, res.confluence);
   } catch (e) {
-    chartResult(`<div class="banner critical">${esc(String(e.message || e))}</div>`);
-  } finally {
-    updateAnalyzeBtn();
-  }
+    $("chart-result").innerHTML = `<div class="banner critical">${esc(String(e.message||e))}</div>`;
+  } finally { updateAnalyzeBtn(); }
 }
 
-function wireSlot(role) {
-  const dz = $("dz-" + role), fi = $("file-" + role);
-  dz.addEventListener("click", () => fi.click());
-  dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); fi.click(); } });
-  fi.addEventListener("change", () => handleFile(role, fi.files[0]));
-  ["dragenter", "dragover"].forEach(ev =>
-    dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("drag"); }));
-  ["dragleave", "drop"].forEach(ev =>
-    dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("drag"); }));
-  dz.addEventListener("drop", (e) => {
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFile(role, e.dataTransfer.files[0]);
-  });
-}
-
-function wireUploader() {
-  ROLES.forEach(wireSlot);
-  $("secret").addEventListener("input", updateAnalyzeBtn);
-  $("analyze-btn").addEventListener("click", analyzeBattery);
-  loadChartConfig();
-}
-wireUploader();
-
+ROLES.forEach(wireSlot);
+$("secret").addEventListener("input", updateAnalyzeBtn);
+$("analyze-btn").addEventListener("click", analyzeBattery);
 refresh();
 setInterval(refresh, 15000);
 </script>
-</body>
-</html>
