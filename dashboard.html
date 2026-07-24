@@ -551,8 +551,17 @@ function plainMeaning(summaries, conf, risk, position) {
     return `<b>Time to exit ${esc(t)} (paper).</b> ${esc(conf.reasons[0]||"")} Click the close button below to sell at the live price and lock the paper P&L.`;
   if (conf.stance === "INCOMPLETE")
     return `Upload at least the <b>weekly</b> and <b>daily</b> charts so the system can judge both the trend and the timing.`;
-  if (conf.stance === "NO_TRADE")
-    return `The system says <b>do not buy ${esc(t)} here.</b> ${esc(conf.reasons[0]||"")}. Sitting in cash is the call. No order placed.`;
+  if (conf.stance === "NO_TRADE") {
+    // 1x inverse hint: a bearish read on an index with a mapped inverse ETF
+    // is chartable downside, not just cash.
+    const INVERSE_MAP = {SPY:"SH", QQQ:"PSQ", DIA:"DOG", IWM:"RWM",
+                         EEM:"EUM", MDY:"MYY", TLT:"TBF", IBIT:"BITI"};
+    const inv = INVERSE_MAP[t];
+    const hint = (inv && (conf.reasons[0]||"").includes("bearish"))
+      ? ` If you want to act on the downturn: chart <b>${esc(inv)}</b> (the 1× inverse ETF — it rises when ${esc(t)} falls, bought long, loss capped).`
+      : "";
+    return `The system says <b>do not buy ${esc(t)} here.</b> ${esc(conf.reasons[0]||"")}. Sitting in cash is the call.${hint} No order placed.`;
+  }
   if (conf.stance === "MIXED")
     return `<b>Wait — don't buy ${esc(t)} yet.</b> The bigger trend may be up, but the pieces don't agree, so there's no clean entry right now. Watch it; re-run when the daily chart turns. No order placed.`;
   // ALIGNED_LONG → BUY
@@ -681,12 +690,19 @@ async function runScout() {
              `<span class="v"><button class="mini-btn" onclick="document.getElementById('ticker-hint').value='${esc(s.symbol)}';window.scrollTo({top:0,behavior:'smooth'})">chart this</button></span></div>`;
       }
     }
+    if ((res.downside_ideas || []).length) {
+      h += `<div class="cfg-line" style="margin:14px 0 8px">DOWNSIDE IDEAS — profit from the fall via 1× inverse ETFs (bought long, capped loss, no margin):</div>`;
+      for (const d of res.downside_ideas) {
+        h += `<div class="kv"><span class="k"><b style="color:var(--warn)">${esc(d.inverse)}</b> · ${esc(d.why)}</span>` +
+             `<span class="v"><button class="mini-btn" onclick="document.getElementById('ticker-hint').value='${esc(d.inverse)}';window.scrollTo({top:0,behavior:'smooth'})">chart this</button></span></div>`;
+      }
+    }
     if ((res.avoid || []).length) {
       h += `<div class="cfg-line" style="margin:14px 0 8px">FALLING &amp; ALIGNED — avoid opening; review if held:</div>`;
       for (const s of res.avoid)
         h += `<div class="kv"><span class="k" style="color:var(--dim)">${esc(s.symbol)} · ${esc(s.why)}</span><span class="v"></span></div>`;
     }
-    h += `<div class="cfg-line" style="margin-top:12px">Candidates to CHART, not buys — the battery + confluence still decide.</div>`;
+    h += `<div class="cfg-line" style="margin-top:12px">Candidates to CHART, not buys — the battery + confluence still decide. Leveraged inverse ETFs are blacklisted (decay).</div>`;
     $("scout-result").innerHTML = h;
   } catch (e) {
     $("scout-result").innerHTML = `<div class="banner critical">${esc(String(e.message||e))}</div>`;
