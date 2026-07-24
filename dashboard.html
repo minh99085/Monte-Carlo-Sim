@@ -277,11 +277,11 @@ a:hover { text-decoration: underline; }
   </div>
 </div>
 
-<h2>Scout — what to chart this week <span class="aux">scans ~70 names with real Robinhood data, suggests 5–10</span></h2>
+<h2>Scout — what to chart this week <span class="aux">sweeps ~585 liquid names, ranks by a 6-factor model, suggests the best set-ups</span></h2>
 <div class="card">
   <button class="btn" id="scout-btn" style="max-width:280px" disabled>Scan the market</button>
   <div class="result" id="scout-result">
-    <div class="placeholder">Enter the dashboard secret, then scan. Takes ~30–60s (real data for every name). Suggestions are candidates to chart — not buy signals.</div>
+    <div class="placeholder">Enter the dashboard secret, then scan. Takes ~60–90s the first time (real data for ~585 names), then cached 5 min. Ranked by momentum, risk-adjusted momentum, trend persistence, volume surge, and new-high proximity — candidates to chart, not buy signals.</div>
   </div>
 </div>
 
@@ -681,13 +681,19 @@ async function runScout() {
                           { cache: "no-store" });
     const res = await r.json();
     if (!r.ok || res.ok === false) throw new Error(res.error || "scout failed");
-    let h = `<div class="cfg-line" style="margin:10px 0 12px">Scanned ${int(res.scanned)} names · ${(res.suggest||[]).length} worth charting</div>`;
+    const cov = `${int(res.scanned)}/${int(res.universe_size||res.scanned)} names`;
+    let h = `<div class="cfg-line" style="margin:10px 0 12px">Scanned ${cov} · ${(res.suggest||[]).length} best set-ups · ranked by a 6-factor composite (momentum · risk-adjusted · trend · volume · new-highs)${res.cached?' · cached':''}</div>`;
     if ((res.suggest || []).length === 0) {
-      h += `<div class="placeholder">Nothing stands out right now — quiet tape is a valid answer. Re-scan tomorrow.</div>`;
+      h += `<div class="placeholder">Nothing sets up well right now — quiet tape is a valid answer. Re-scan tomorrow.</div>`;
     } else {
       for (const s of res.suggest) {
-        h += `<div class="kv"><span class="k"><b style="color:var(--text)">${esc(s.symbol)}</b> · ${esc(s.why)}</span>` +
-             `<span class="v"><button class="mini-btn" onclick="document.getElementById('ticker-hint').value='${esc(s.symbol)}';window.scrollTo({top:0,behavior:'smooth'})">chart this</button></span></div>`;
+        const facts = `<span style="color:var(--dim);font-size:11px">score ${fmt(s.composite,2)} · ${esc(s.setup||"")}</span>`;
+        const bars = `<span style="font-family:var(--mono);font-size:11px;color:var(--muted)">` +
+          `3mo ${pct(s.mom_63,0)} · risk-adj ${fmt(s.risk_adj_mom,2)} · trend ${pct(s.trend_persist,0)} · vol ×${fmt(s.vol_surge,1)} · ${pct(s.high_prox,0)} of hi</span>`;
+        h += `<div style="border-bottom:1px solid var(--hairline);padding:8px 0">` +
+             `<div class="kv"><span class="k"><b style="color:var(--text);font-size:14px">${esc(s.symbol)}</b> &nbsp;${facts}</span>` +
+             `<span class="v"><button class="mini-btn" onclick="document.getElementById('ticker-hint').value='${esc(s.symbol)}';window.scrollTo({top:0,behavior:'smooth'})">chart this</button></span></div>` +
+             `<div style="margin-top:3px">${bars}</div></div>`;
       }
     }
     if ((res.downside_ideas || []).length) {
