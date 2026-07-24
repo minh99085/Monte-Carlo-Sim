@@ -119,16 +119,19 @@ def settle_entry(
 ) -> Optional[Dict[str, Any]]:
     """Settle one log entry against a realized close series.
 
-    The realized path is the first close on/after the signal date (the entry
-    close) plus the next ``horizon_days`` closes. Returns the settlement dict
-    or None when the window is not complete yet (fewer than ``horizon_days``
-    trading days have elapsed).
+    Fill contract (unified with v2's next-bar labeling): entry is the first
+    close STRICTLY AFTER the signal date — a decision made on day t can only
+    be filled in the next session, never at the same bar it was decided on
+    (that was lookahead: research could "enter" at a price execution never
+    had). The path is that entry close plus the next ``horizon_days``
+    closes. Returns the settlement dict or None when the window is not
+    complete yet.
     """
     entry_date = _entry_date(entry)
     if entry_date is None:
         return None
     horizon = int(entry.get("horizon_days") or 5)
-    idx = next((i for i, d in enumerate(dates) if d >= entry_date), None)
+    idx = next((i for i, d in enumerate(dates) if d > entry_date), None)
     if idx is None:
         return None
     path = np.asarray(closes[idx: idx + horizon + 1], dtype=float)
@@ -173,6 +176,7 @@ def settle_entry(
     return {
         "settled_at_utc": datetime.now(timezone.utc)
         .replace(microsecond=0).isoformat(),
+        "entry_rule": "next_session_close",
         "entry_date": dates[idx],
         "exit_date": dates[idx + horizon],
         "entry_close": entry_close,

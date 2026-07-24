@@ -523,6 +523,11 @@ def run_pipeline(settings: PipelineSettings) -> Dict[str, Any]:
 
     record: Dict[str, Any] = {
         "timestamp_utc": now.isoformat(),
+        # Quarantined legacy engine: the bot's bridge only plans verdicts
+        # from the canonical meta_label_v2 engine; this stamp makes the
+        # drift pipeline's output explicit so it can never be confused
+        # for (or executed as) a v2 decision.
+        "engine": "legacy_drift_v1",
         "ticker": ticker,
         "verdict": verdict,
         "reason": reason,

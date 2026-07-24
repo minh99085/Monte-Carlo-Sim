@@ -335,6 +335,37 @@ class TestGauntletEndToEnd:
         assert report["ready"] is False
         assert "NOT READY" in report["verdict"]
 
+    def test_gate4_is_none_without_plateau_full_and_blocks_ready(self, tmp_path):
+        """A green gauntlet must mean every claimed check ran: without
+        --plateau-full, gate 4 reports pass=None and ready can never be
+        True, no matter what the other gates say."""
+        cfg = _cfg(tmp_path)
+        fetch = _fetch_for(lambda s: edge_world_bars(
+            2200, seed=stable_seed(s), symbol=s))
+        report = run_gauntlet(cfg, fetch=fetch, workdir=tmp_path)
+        g4 = report["gates"]["4_plateau"]
+        assert g4["pass"] is None
+        assert g4["full_run"] is False
+        assert {r["param"] for r in g4["rows"]} == {"threshold"}
+        assert report["ready"] is False
+
+    def test_plateau_full_relabels_all_barrier_params(self, tmp_path):
+        cfg = _cfg(tmp_path)
+        fetch = _fetch_for(lambda s: edge_world_bars(
+            2200, seed=stable_seed(s), symbol=s))
+        report = run_gauntlet(cfg, fetch=fetch, workdir=tmp_path,
+                              evaluate_plateau_full=True)
+        g4 = report["gates"]["4_plateau"]
+        assert g4["full_run"] is True
+        assert isinstance(g4["pass"], bool)     # actually evaluated now
+        params = {r["param"] for r in g4["rows"]}
+        assert params == {"threshold", "k_pt", "k_sl", "max_hold"}
+        # each barrier param bumped both ways
+        for p in ("k_pt", "k_sl", "max_hold"):
+            mults = {r["mult"] for r in g4["rows"] if r["param"] == p}
+            assert len(mults) == 2
+        assert "config_hash" in report
+
     def test_holdout_can_only_run_once(self, tmp_path):
         cfg = _cfg(tmp_path)
         fetch = _fetch_for(lambda s: edge_world_bars(
@@ -416,3 +447,32 @@ class TestDecision:
         rpt.write_text(json.dumps({"ready": True}))
         v = decide(signal, cfg=cfg, fetch=fetch, gauntlet_report=rpt)
         assert v["gauntlet_pass"] is True
+
+    def test_certificate_ties_verdict_to_report_bytes(self, tmp_path):
+        """The certificate must hash the exact report file so the executor
+        can verify it on its side of the mount."""
+        import hashlib
+
+        from trading_system.decision import decide
+
+        cfg = _cfg(tmp_path)
+        fetch = _fetch_for(lambda s: edge_world_bars(2200, seed=1, symbol=s))
+        rpt = tmp_path / "gauntlet_report.json"
+        rpt.write_text(json.dumps({"ready": True, "tickers": ["EDGEA"],
+                                   "config_hash": "abc123"}))
+        v = decide({"ticker": "EDGEA", "trend": "bearish", "price": 100.0},
+                   cfg=cfg, fetch=fetch, gauntlet_report=rpt)
+        cert = v["certificate"]
+        assert cert["engine"] == "meta_label_v2"
+        assert cert["report_hash"] == hashlib.sha256(
+            rpt.read_bytes()).hexdigest()
+        assert cert["config_hash"] == "abc123"
+        assert cert["universe"] == ["EDGEA"]
+        assert v["entry_rule"] == "next_session_open"
+
+        # no report → no certificate, and still a valid paper verdict
+        v2 = decide({"ticker": "EDGEA", "trend": "bearish", "price": 100.0},
+                    cfg=cfg, fetch=fetch,
+                    gauntlet_report=tmp_path / "missing.json")
+        assert v2["certificate"] is None
+        assert v2["gauntlet_pass"] is False

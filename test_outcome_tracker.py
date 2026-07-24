@@ -59,10 +59,13 @@ class TestSettle:
         entry = ot.read_log(log)[0]
         assert entry["settled"] is True
         st = entry["settlement"]
-        assert st["entry_close"] == 100.0
-        assert st["exit_close"] == 105.0  # 5 trading days later
-        assert st["realized_ret"] == pytest.approx(0.05)
-        assert st["realized_pnl_pct"] == pytest.approx(0.05)
+        # Fill contract: entry is the first close STRICTLY AFTER the signal
+        # date (next session) — never the same bar the decision was made on.
+        assert st["entry_rule"] == "next_session_close"
+        assert st["entry_date"] == "2026-01-06"
+        assert st["entry_close"] == 101.0
+        assert st["exit_close"] == 106.0  # 5 trading days after entry
+        assert st["realized_ret"] == pytest.approx(106.0 / 101.0 - 1.0)
         assert st["hit"] is True
 
     def test_stop_replay_on_realized_path(self, tmp_path: Path):
@@ -73,10 +76,12 @@ class TestSettle:
         ot.settle(log, price_fetcher=_fetcher_from(BDAYS, closes))
         st = ot.read_log(log)[0]["settlement"]
         assert st["exit_reason"] == "stop_loss"
-        assert st["realized_pnl_pct"] == pytest.approx(-0.025)
+        # entry = next session close (99.5); day after breaches the 2% stop
+        assert st["realized_pnl_pct"] == pytest.approx(97.5 / 99.5 - 1.0,
+                                                       abs=1e-4)
         assert st["hit"] is False
-        # buy-and-hold return recorded separately
-        assert st["realized_ret"] == pytest.approx(0.04)
+        # buy-and-hold return recorded separately (99.5 → 105)
+        assert st["realized_ret"] == pytest.approx(105.0 / 99.5 - 1.0)
 
     def test_incomplete_window_stays_pending(self, tmp_path: Path):
         log = tmp_path / "log.jsonl"

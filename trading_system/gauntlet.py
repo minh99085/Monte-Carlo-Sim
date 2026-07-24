@@ -20,6 +20,7 @@ requirement). It has no vote on direction or trades.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import math
@@ -248,12 +249,21 @@ def bump_trials(path: Path, n_new: int, note: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _config_hash(cfg: dict) -> str:
+    """Deterministic hash of the full config — part of the verdict
+    certificate, so an executed decision can be tied to the exact
+    configuration that was validated."""
+    canonical = json.dumps(cfg, sort_keys=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def run_gauntlet(
     cfg: Optional[dict] = None,
     *,
     fetch: FetchFn = fetch_bars,
     workdir: Path | str = ".",
     evaluate_holdout: bool = False,
+    evaluate_plateau_full: bool = False,
 ) -> Dict[str, Any]:
     """Run every gate on the non-holdout window (and, once ever, the holdout).
 
@@ -269,10 +279,13 @@ def run_gauntlet(
 
     tickers = list(cfg["universe"]["tickers"])
     years = float(cfg["universe"]["years"])
-    report: Dict[str, Any] = {"tickers": tickers, "gates": {}, "ready": False}
+    report: Dict[str, Any] = {"tickers": tickers, "gates": {},
+                              "ready": False,
+                              "config_hash": _config_hash(cfg)}
 
     # ---- pipeline per symbol -------------------------------------------
     runs: List[SymbolRun] = []
+    bars_by_symbol: Dict[str, Bars] = {}
     insufficient: List[str] = []
     for tk in tickers:
         try:
@@ -286,6 +299,7 @@ def run_gauntlet(
             insufficient.append(
                 f"{tk}: < {cfg['signals']['min_per_symbol']} usable signals")
             continue
+        bars_by_symbol[tk] = bars
         runs.append(run)
     if not runs:
         report["stopped"] = ("insufficient history to validate — collect more "
@@ -373,24 +387,62 @@ def run_gauntlet(
     }
 
     # ---- gate 4: plateau ------------------------------------------------
+    # Honest semantics: the cheap threshold bumps alone are NOT a plateau
+    # test. Without --plateau-full (which re-labels and re-fits under
+    # bumped profit/stop/holding barriers) this gate reports pass=None and
+    # the gauntlet can never be ready — a green gauntlet must mean every
+    # claimed check actually ran.
     bump = float(cfg["validation"]["plateau_bump"])
     tol = float(cfg["validation"]["plateau_tolerance"])
     base_sr = sharpe(filt)
     plateau_rows = []
-    plateau_pass = bool(np.isfinite(base_sr))
+    plateau_ok = bool(np.isfinite(base_sr))
+
+    def _judge(sr_v: float) -> bool:
+        return not (np.isfinite(base_sr) and base_sr > 0 and
+                    (not np.isfinite(sr_v) or sr_v < tol * base_sr))
+
     for th_mult in (1 - bump, 1 + bump):
         sr_v = sharpe(weekly_portfolio_returns(
             dev_runs, sizer=sizer, threshold=threshold * th_mult))
         plateau_rows.append({"param": "threshold", "mult": th_mult, "sr": sr_v})
-        if np.isfinite(base_sr) and base_sr > 0 and (
-                not np.isfinite(sr_v) or sr_v < tol * base_sr):
-            plateau_pass = False
+        if not _judge(sr_v):
+            plateau_ok = False
+
+    if evaluate_plateau_full:
+        # Robustness re-runs, not new strategy trials: the config is not
+        # being selected by these, so they do not inflate n_trials.
+        b0 = cfg["barriers"]
+        variants = []
+        for mult in (1 - bump, 1 + bump):
+            variants.append(("k_pt", mult, {**b0, "k_pt": float(b0["k_pt"]) * mult}))
+            variants.append(("k_sl", mult, {**b0, "k_sl": float(b0["k_sl"]) * mult}))
+            variants.append(("max_hold", mult,
+                             {**b0, "max_hold": max(2, round(int(b0["max_hold"]) * mult))}))
+        for pname, mult, barriers2 in variants:
+            cfg2 = {**cfg, "barriers": barriers2}
+            runs2 = []
+            for tk, bars2 in bars_by_symbol.items():
+                r2 = run_symbol(bars2, cfg2,
+                                tv_history_dir=cfg["signals"].get("tv_history_dir"))
+                if r2 is not None:
+                    runs2.append(window(r2, holdout=False))
+            sr_v = sharpe(weekly_portfolio_returns(
+                runs2, sizer=sizer, threshold=threshold)) if runs2 else float("nan")
+            plateau_rows.append({"param": pname, "mult": mult, "sr": sr_v})
+            if not _judge(sr_v):
+                plateau_ok = False
+
     report["gates"]["4_plateau"] = {
-        "pass": plateau_pass,
+        "pass": bool(plateau_ok) if evaluate_plateau_full else None,
+        "full_run": bool(evaluate_plateau_full),
         "base_sr": base_sr,
         "rows": plateau_rows,
-        "note": "k_pt/k_sl/max_hold bumps require re-labeling; run via "
-                "--plateau-full on the VPS (compute-heavy).",
+        "note": ("full plateau evaluated (threshold + re-labeled k_pt/k_sl/"
+                 "max_hold bumps)" if evaluate_plateau_full else
+                 "threshold rows only — NOT a full plateau test; run "
+                 "--plateau-full to evaluate this gate (until then it "
+                 "cannot pass and the gauntlet cannot be ready)"),
     }
 
     # ---- gate 5: filter must beat raw primary ---------------------------
@@ -442,10 +494,10 @@ def run_gauntlet(
                     "after freezing everything)",
         }
 
-    hard_gates = [g for k, g in report["gates"].items()
-                  if g.get("pass") is not None]
-    report["ready"] = bool(all(g["pass"] for g in hard_gates)
-                           and report["gates"]["6_holdout"]["pass"] is True)
+    required = ("1_costs", "2_sharpe", "3_pbo", "4_plateau", "5_beats_raw")
+    report["ready"] = bool(
+        all(report["gates"][k].get("pass") is True for k in required)
+        and report["gates"]["6_holdout"]["pass"] is True)
     report["verdict"] = (
         "ALL GATES PASS — eligible for DRY_RUN live paper, then tiny live"
         if report["ready"] else
@@ -463,9 +515,15 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Run the validation gauntlet.")
     ap.add_argument("--holdout", action="store_true",
                     help="evaluate the final untouched holdout (ONCE)")
+    ap.add_argument("--plateau-full", action="store_true",
+                    help="re-label and re-fit under bumped k_pt/k_sl/"
+                         "max_hold (compute-heavy; gate 4 cannot pass "
+                         "without it)")
     ap.add_argument("--workdir", default=".")
     args = ap.parse_args(argv)
-    report = run_gauntlet(evaluate_holdout=args.holdout, workdir=args.workdir)
+    report = run_gauntlet(evaluate_holdout=args.holdout,
+                          evaluate_plateau_full=args.plateau_full,
+                          workdir=args.workdir)
     keys = ("stopped", "details", "insufficient_symbols", "auc_by_symbol",
             "gates", "risk_overlay", "ready", "verdict")
     print(json.dumps({k: report[k] for k in keys if k in report},

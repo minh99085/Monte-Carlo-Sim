@@ -47,6 +47,35 @@ def gauntlet_ready(report_path: Path | str = DEFAULT_GAUNTLET_REPORT) -> bool:
     return isinstance(report, dict) and report.get("ready") is True
 
 
+def build_certificate(
+    report_path: Path | str = DEFAULT_GAUNTLET_REPORT,
+) -> Optional[Dict[str, Any]]:
+    """Verifiable research identity for a verdict.
+
+    Ties the decision to the exact gauntlet report (byte hash) and config
+    (hash embedded in the report) it was made under. The bot's executor
+    re-hashes the report on ITS side of the mount and refuses any verdict
+    whose certificate does not match — a bare ready:true can no longer
+    make anything execution-eligible.
+    """
+    import hashlib
+
+    try:
+        raw = Path(report_path).read_bytes()
+        report = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(report, dict):
+        return None
+    return {
+        "engine": "meta_label_v2",
+        "report_hash": hashlib.sha256(raw).hexdigest(),
+        "config_hash": report.get("config_hash"),
+        "universe": report.get("tickers"),
+        "report_ready": report.get("ready") is True,
+    }
+
+
 def decide(
     signal: Dict[str, Any],
     *,
@@ -69,11 +98,18 @@ def decide(
         "verdict": "NO_TRADE",
         "reason": "",
         "horizon_days": int(cfg["barriers"]["max_hold"]),
+        # Fill contract: v2 labels every trade from the NEXT session's open;
+        # a live fill must follow the same rule (s0 below is the reference
+        # price at decision time, never the assumed fill).
+        "entry_rule": "next_session_open",
         # Provenance marker: true ONLY while the full validation gauntlet
         # (all six gates incl. the one-shot holdout) currently passes. The
         # bot's bridge treats anything without this as paper-only, never
         # executable.
         "gauntlet_pass": gauntlet_ready(gauntlet_report),
+        # Verifiable identity: report hash + config hash + universe. The
+        # executor re-hashes the report on its side and refuses mismatches.
+        "certificate": build_certificate(gauntlet_report),
     }
     if direction == "short":
         verdict["reason"] = "short signal — cash account cannot short; recorded only"
