@@ -99,6 +99,58 @@ def test_levels_to_stop_tp_long():
     assert notes
 
 
+def test_atr_default_stop_when_no_chart_levels():
+    e = _extraction(levels=[])
+    # ATR = 3.8 on a $190 name → 2% ATR → 2×ATR adaptive stop = 4%.
+    stop_pct, _tp, stop_px, _tpx, notes = levels_to_stop_tp(
+        e, 190.0, "long", confidence=0.8, atr_abs=3.8)
+    assert stop_pct == pytest.approx(0.04, abs=1e-6)
+    assert any("ATR" in n for n in notes)
+
+
+def test_atr_floors_a_too_tight_chart_stop():
+    # Support sits only ~0.2% under entry; 1×ATR is 2% → stop must widen to ATR.
+    e = _extraction(levels=[PriceLevel(price=189.6, kind=LevelKind.SUPPORT,
+                                       strength=0.9)])
+    stop_pct, _tp, _px, _tpx, notes = levels_to_stop_tp(
+        e, 190.0, "long", confidence=0.8, atr_abs=3.8)
+    assert stop_pct == pytest.approx(0.02, abs=1e-6)
+    assert any("1×ATR" in n or "widened" in n for n in notes)
+
+
+def _mcp_with(adx=None, atr=None, price=190.0):
+    ci = {}
+    if adx is not None:
+        ci["adx14"] = adx
+    if atr is not None:
+        ci["atr14"] = atr
+    return MCPMarketSnapshot(
+        ticker="AAPL", last_price=price, realized_vol_annual=0.3,
+        computed_indicators=ci or None)
+
+
+def test_adx_below_threshold_forces_mean_neutral_drift():
+    e = _extraction()  # bullish → soft drift would be positive
+    val = ValidationResult(status=ValidationStatus.PASSED, overall_confidence=0.75,
+                           adjusted_confidence=0.75, ticker_confirmed=True)
+    tactical, _rule, meta = map_to_tactical(
+        e, mcp=_mcp_with(adx=12.0), validation=val, paths=500, seed=1,
+        use_calibration_drift=False)
+    assert tactical.annual_drift == 0.0
+    assert meta["adx_gated"] is True
+
+
+def test_adx_above_threshold_retains_drift():
+    e = _extraction()
+    val = ValidationResult(status=ValidationStatus.PASSED, overall_confidence=0.75,
+                           adjusted_confidence=0.75, ticker_confirmed=True)
+    tactical, _rule, meta = map_to_tactical(
+        e, mcp=_mcp_with(adx=30.0), validation=val, paths=500, seed=1,
+        use_calibration_drift=False)
+    assert tactical.annual_drift > 0.0
+    assert meta["adx_gated"] is False
+
+
 def test_map_prefers_mcp_price():
     e = _extraction(image_last_price=999.0)
     mcp = MCPMarketSnapshot(ticker="AAPL", last_price=190.5, realized_vol_annual=0.3)

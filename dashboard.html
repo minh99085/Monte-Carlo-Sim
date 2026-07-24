@@ -506,6 +506,14 @@ function renderReport(summaries, results, conf, position) {
     }
     if (ci.ema_cross)
       h += `<div class="kv"><span class="k">EMA 9/21 (computed)</span><span class="v ${ci.ema_cross==='bullish'?'good':'critical'}">${esc(ci.ema_cross)}</span></div>`;
+    if (ci.adx14 != null) {
+      const trend = ci.adx14 >= 20;
+      const adxTxt = `${fmt(ci.adx14,0)} — ${trend ? 'trend real, MC drift ON'
+                                                    : 'no trend, MC stays neutral'}`;
+      h += `<div class="kv"><span class="k">ADX trend strength (14)</span><span class="v ${trend?'good':'warn'}">${adxTxt}</span></div>`;
+    }
+    if (ci.atr14_pct != null)
+      h += `<div class="kv"><span class="k">ATR volatility (14)</span><span class="v">${pct(ci.atr14_pct,1)} — stop ≈ 2×ATR = ${pct(ci.atr14_pct*2,1)}</span></div>`;
     if (dMcp.realized_vol_annual != null)
       h += `<div class="kv"><span class="k">Real volatility (per year)</span><span class="v">${pct(dMcp.realized_vol_annual,0)}</span></div>`;
     if (dMcp.buying_power != null)

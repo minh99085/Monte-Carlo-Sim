@@ -39,6 +39,14 @@ MAX_TP_PCT = 0.15
 DEFAULT_STOP_PCT = 0.02
 DEFAULT_TP_PCT = 0.03
 
+# ADX(14) below this = no real trend → MC drift forced mean-neutral.
+# 20-25 is the classic Wilder "trend is tradeable" threshold; 20 is the gate.
+ADX_TREND_MIN = 20.0
+
+# ATR(14)-based adaptive stop: stop distance = ATR_STOP_MULT × ATR. A 2×ATR
+# stop sits outside normal daily noise so trades aren't shaken out early.
+ATR_STOP_MULT = 2.0
+
 # Soft drift magnitudes when no calibration table is available.
 # Image path is secondary; keep conservative.
 BIAS_DRIFT_ANNUAL = {
@@ -59,9 +67,16 @@ def levels_to_stop_tp(
     side: str,
     *,
     confidence: float = 0.5,
+    atr_abs: Optional[float] = None,
 ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], List[str]]:
     """
     Suggest stop/TP percentages (and absolute prices) from chart levels.
+
+    ``atr_abs`` is ATR(14) in price units (from real bars). When present it
+    drives an adaptive stop: with no usable chart level the stop is
+    ``ATR_STOP_MULT × ATR`` (volatility-scaled, replacing the fixed default),
+    and any chart-derived stop is floored at 1×ATR so it never sits inside
+    normal daily noise.
 
     Returns
     -------
@@ -105,15 +120,29 @@ def levels_to_stop_tp(
     stop_pct: Optional[float] = None
     tp_pct: Optional[float] = None
 
+    atr_pct = (atr_abs / entry_price) if (atr_abs and atr_abs > 0) else None
     if stop_price is not None:
         stop_pct = abs(entry_price - stop_price) / entry_price
         # Widen stop slightly when confidence is low (avoid tight image noise)
         conf_scale = 1.0 + (1.0 - _clamp(confidence, 0.0, 1.0)) * 0.5
-        stop_pct = _clamp(stop_pct * conf_scale, MIN_STOP_PCT, MAX_STOP_PCT)
-        notes.append(f"stop_pct={stop_pct:.4f} (confidence-scaled)")
+        stop_pct = stop_pct * conf_scale
+        # Never let a chart-derived stop sit inside one ATR of normal noise.
+        if atr_pct is not None and stop_pct < atr_pct:
+            notes.append(
+                f"chart stop {stop_pct:.4f} < 1×ATR {atr_pct:.4f} → widened to ATR"
+            )
+            stop_pct = atr_pct
+        stop_pct = _clamp(stop_pct, MIN_STOP_PCT, MAX_STOP_PCT)
+        notes.append(f"stop_pct={stop_pct:.4f} (confidence-scaled, ATR-floored)")
+    elif atr_pct is not None:
+        stop_pct = _clamp(ATR_STOP_MULT * atr_pct, MIN_STOP_PCT, MAX_STOP_PCT)
+        notes.append(
+            f"No usable stop level; adaptive stop = {ATR_STOP_MULT:g}×ATR "
+            f"({atr_pct:.4f}) → stop_pct={stop_pct:.4f}"
+        )
     else:
         stop_pct = DEFAULT_STOP_PCT
-        notes.append(f"No usable stop level; default stop_pct={stop_pct}")
+        notes.append(f"No usable stop level or ATR; default stop_pct={stop_pct}")
 
     if tp_price is not None:
         tp_pct = abs(tp_price - entry_price) / entry_price
@@ -252,9 +281,16 @@ def map_to_tactical(
     stop_pct = DEFAULT_STOP_PCT
     tp_pct = DEFAULT_TP_PCT
     stop_price = tp_price = None
+    atr_abs = None
+    if mcp and mcp.computed_indicators:
+        atr_abs = mcp.computed_indicators.get("atr14")
+        try:
+            atr_abs = float(atr_abs) if atr_abs is not None else None
+        except (TypeError, ValueError):
+            atr_abs = None
     if side and start_price:
         stop_pct, tp_pct, stop_price, tp_price, lv_notes = levels_to_stop_tp(
-            extraction, start_price, side, confidence=adj_conf
+            extraction, start_price, side, confidence=adj_conf, atr_abs=atr_abs
         )
         notes.extend(lv_notes)
         stop_pct = stop_pct or DEFAULT_STOP_PCT
@@ -327,6 +363,33 @@ def map_to_tactical(
         notes.append(reason)
         meta_jump = 1.0
 
+    # --- ADX(14) trend-strength gate on the drift ---------------------------
+    # A directional Monte-Carlo drift is only trustworthy when a real trend
+    # exists. ADX < ADX_TREND_MIN means the market is choppy/rangebound, so any
+    # bias-derived drift is likely noise — force the MC mean-neutral rather
+    # than betting on a trend that isn't there. ADX >= threshold leaves the
+    # drift intact. Computed from real OHLC bars on the bot side.
+    adx = (mcp.computed_indicators or {}).get("adx14") if mcp else None
+    adx_gated = False
+    if adx is not None:
+        try:
+            adx_f = float(adx)
+        except (TypeError, ValueError):
+            adx_f = None
+        if adx_f is not None:
+            if adx_f < ADX_TREND_MIN and tactical.annual_drift != 0.0:
+                tactical = replace(tactical, annual_drift=0.0)
+                adx_gated = True
+                notes.append(
+                    f"ADX {adx_f:.1f} < {ADX_TREND_MIN:.0f} (no trend) → drift "
+                    f"forced to 0 (mean-neutral MC; don't bet on noise)"
+                )
+            else:
+                notes.append(
+                    f"ADX {adx_f:.1f} ≥ {ADX_TREND_MIN:.0f} → trend confirmed, "
+                    f"drift retained ({tactical.annual_drift:+.2%}/yr)"
+                )
+
     # If side is None (flat), attach a no-op style rule that still validates
     if side is None:
         rule = replace(
@@ -352,6 +415,8 @@ def map_to_tactical(
         "validation_status": status.value if hasattr(status, "value") else str(status),
         "jump_multiplier": meta_jump,
         "vol_scale": vol_scale,
+        "adx": adx,
+        "adx_gated": adx_gated,
     }
     return tactical.validate(), rule.validate(), meta
 
